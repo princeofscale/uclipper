@@ -1,0 +1,15 @@
+.git
+.venv
+.env
+.pytest_cache
+.impeccable
+.playwright-cli
+__pycache__
+*.pyc
+.DS_Store
+workspace
+tests
+deploy
+*.md
+run.sh
+run.bat

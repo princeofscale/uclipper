@@ -19,6 +19,7 @@ from app.bot.handlers import banners, common, fallback, jobs, settings_screen, s
 from app.bot.runner import JobRunner
 from app.config import Settings
 from app.services.banner_manager import ensure_default_banner, ensure_presets, ensure_sfx, ensure_strip_presets
+from app.services.janitor import max_age_days_from_env, sweep_forever
 from app.services.jobs import JobManager
 from app.services.user_store import UserStore
 
@@ -174,9 +175,11 @@ async def run() -> None:
         f", доступ: {len(allowed)} чел." if allowed else ", доступ открыт для всех",
         ", через прокси" if proxy else "",
     )
+    sweeper = asyncio.create_task(sweep_forever(ctx.settings, max_age_days_from_env()))
     try:
         await dispatcher.start_polling(bot, allowed_updates=dispatcher.resolve_used_update_types())
     finally:
+        sweeper.cancel()
         await bot.session.close()
         manager.shutdown()
         ctx.store.save()
