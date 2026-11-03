@@ -1,4 +1,4 @@
-# ClipBanner Bot: Python + FFmpeg + Node (Node нужен yt-dlp, чтобы решать JS-челленджи YouTube).
+# TgRader Clipper: Python + FFmpeg + Node (Node нужен yt-dlp, чтобы решать JS-челленджи YouTube).
 # Debian 13 (trixie): в нём Node 20+, а yt-dlp-ejs не работает со старым Node.
 FROM python:3.13-slim-trixie
 

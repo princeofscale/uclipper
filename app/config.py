@@ -1,4 +1,4 @@
-"""Пути, лимиты и константы ClipBanner Bot."""
+"""Пути, лимиты и константы TgRader Clipper."""
 from __future__ import annotations
 
 from dataclasses import dataclass

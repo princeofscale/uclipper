@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Выкатка ClipBanner Bot на сервер по SSH-ключу: ровно то, что закоммичено в git (HEAD).
+# Выкатка TgRader Clipper на сервер по SSH-ключу: ровно то, что закоммичено в git (HEAD).
 #
 #   DEPLOY_HOST=root@1.2.3.4 DEPLOY_KEY=~/.ssh/key ./deploy/deploy.sh
 #

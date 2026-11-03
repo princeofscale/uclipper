@@ -1,5 +1,5 @@
 @echo off
-rem ClipBanner Bot: установка и запуск Telegram-бота одной командой (Windows).
+rem TgRader Clipper: установка и запуск Telegram-бота одной командой (Windows).
 rem   run.bat          — обычный запуск (нужен .env с токеном)
 rem   run.bat --check  — только проверить окружение
 chcp 65001 >nul
@@ -48,7 +48,7 @@ if /i "%~1"=="--check" (
   exit /b 0
 )
 
-echo ClipBanner Bot запускается. Остановить: Ctrl+C
+echo TgRader Clipper запускается. Остановить: Ctrl+C
 ".venv\Scripts\python.exe" -m app.bot
 goto :eof
 

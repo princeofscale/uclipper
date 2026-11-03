@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ClipBanner Bot: установка и запуск Telegram-бота одной командой.
+# TgRader Clipper: установка и запуск Telegram-бота одной командой.
 #   ./run.sh                    — обычный запуск
 #   PYTHON=python3.12 ./run.sh  — выбрать конкретный Python (нужен 3.11 или новее)
 #   ./run.sh --check            — только проверить окружение, без запуска бота
@@ -74,5 +74,5 @@ if [ "$CHECK_ONLY" = "1" ]; then
   exit 0
 fi
 
-echo "ClipBanner Bot запускается. Остановить: Ctrl+C"
+echo "TgRader Clipper запускается. Остановить: Ctrl+C"
 exec .venv/bin/python -m app.bot

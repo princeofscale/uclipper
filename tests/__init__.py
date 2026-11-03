@@ -1,1 +1,1 @@
-"""Тесты ClipBanner Studio."""
+"""Тесты TgRader Clipper."""
