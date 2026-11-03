@@ -6,23 +6,28 @@
 from __future__ import annotations
 
 import asyncio
-import io
+import re
 import time
 from pathlib import Path
 
 import pytest
-from aiogram.filters import Command, CommandStart
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.base import StorageKey
-from PIL import Image
 
 from app.bot import keyboards, texts
-from app.bot.context import get_draft, update_settings
-from app.models import FrameMode, SlicingMode
+from app.bot.context import get_draft
+from app.bot.handlers import modes as mode_handlers
 from app.bot.handlers import source as source_handlers
+from app.bot.handlers import trends as trend_handlers
+from app.bot.rich import plain_text
+from app.bot.states import Flow
 from app.config import Settings
-from tests.bot_fakes import Harness
+from app.models import CutMode, FrameMode, Goal, SlicingMode
+from tests.bot_fakes import Harness, _message
 from tests.media_utils import make_video
+from tests.rich_check import assert_valid_rich
 
 VIDEO = {
     "video_id": "dQw4w9WgXcQ",
@@ -34,13 +39,31 @@ VIDEO = {
     "resolutions": [1080, 720],
 }
 
+TRENDING = [
+    {
+        "video_id": f"trend{index:06d}",
+        "title": f"Подкаст номер {index}",
+        "duration": 3600.0 + index,
+        "uploader": f"Канал {index}",
+        "views": 1_500_000 // index,
+        "url": f"https://www.youtube.com/watch?v=trend{index:06d}",
+        "thumbnail": "https://i.ytimg.com/vi/x/hqdefault.jpg",
+    }
+    for index in range(1, 4)
+]
+
 WAIT = 120
+MENU_BUTTONS = ["ask:link", "ask:query", "ask:file", "screen:trends", "screen:banners", "screen:stats", "screen:help"]
 
 
 def _fsm(harness, user_id: int = 1) -> FSMContext:
     """Состояние диалога пользователя — чтобы проверять черновик и подкладывать состояния."""
     key = StorageKey(bot_id=harness.bot.id, chat_id=user_id, user_id=user_id)
     return FSMContext(storage=harness.dispatcher.storage, key=key)
+
+
+async def _draft(harness):
+    return await get_draft(_fsm(harness))
 
 
 # ---------- фикстуры ----------
@@ -53,6 +76,18 @@ def bot_settings(tmp_path):
     return settings
 
 
+@pytest.fixture(autouse=True)
+def no_youtube(monkeypatch):
+    """Любой выход в YouTube в этих тестах — ошибка, а не сюрприз: нужное подменяется точечно."""
+    import yt_dlp
+
+    class Forbidden:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("тест не должен ходить в YouTube")
+
+    monkeypatch.setattr(yt_dlp, "YoutubeDL", Forbidden)
+
+
 @pytest.fixture
 async def harness(bot_settings):
     fake = Harness(bot_settings)
@@ -60,361 +95,957 @@ async def harness(bot_settings):
     await fake.close()
 
 
-@pytest.fixture
-def no_network(monkeypatch):
-    """Любой выход в сеть через yt-dlp в тестах сценариев — ошибка, а не сюрприз."""
-
-    def boom(*args, **kwargs):
-        raise AssertionError("тест не должен ходить в YouTube")
-
-    monkeypatch.setattr(source_handlers, "fetch_video_info", boom)
-    monkeypatch.setattr(source_handlers, "search_videos", boom)
+async def _open_video(harness, monkeypatch, **overrides):
+    """Присылает ссылку и доходит до выбора режима."""
+    video = {**VIDEO, **overrides}
+    monkeypatch.setattr(source_handlers, "fetch_video_info", lambda url: dict(video))
+    await harness.send("/start")
+    await harness.send(video["url"])
+    return video
 
 
-# ---------- меню и справка (команд нет, только кнопки) ----------
+async def _open_manual(harness, monkeypatch, **overrides):
+    await _open_video(harness, monkeypatch, **overrides)
+    await harness.press("mode:manual")
 
 
-async def test_start_shows_the_main_menu(harness):
+async def _open_auto(harness, monkeypatch, **overrides):
+    await _open_video(harness, monkeypatch, **overrides)
+    await harness.press("mode:auto")
+
+
+# ---------- главное меню ----------
+
+
+async def test_start_shows_the_branded_menu_without_settings(harness):
     await harness.send("/start")  # скрытый вход: его шлёт сам Telegram по кнопке «Старт»
 
-    assert "ClipBanner" in harness.session.last_text()
-    markup = harness.session.requests[-1].reply_markup
-    assert markup is not None
-    pressed = [button.callback_data for row in markup.inline_keyboard for button in row]
-    assert pressed[:3] == ["ask:link", "ask:query", "ask:file"]
+    text = harness.session.last_text()
+    assert "TgRader Clipper" in text
+    assert "ClipBanner" not in text
+    assert harness.session.buttons() == MENU_BUTTONS
+    assert not any("Настройки" in label for label in harness.session.button_texts())
+    assert "screen:settings" not in harness.session.buttons()
 
 
-async def test_help_is_a_button_screen_and_explains_telegram_limits(harness):
+async def test_menu_is_a_rich_message(harness):
     await harness.send("/start")
+
+    assert harness.session.calls("sendRichMessage")
+    assert not harness.session.calls("sendMessage")
+
+
+async def test_every_menu_button_has_a_handler(harness):
+    await harness.send("/start")
+    for data in MENU_BUTTONS:
+        await harness.press(data)
+        assert texts.STALE not in harness.session.alerts(), data
+        await harness.send("/start")
+
+
+async def test_help_explains_modes_trends_and_limits(harness):
     await harness.press("screen:help")
 
     text = harness.session.last_text()
-    assert "20 МБ" in text and "50 МБ" in text
-    assert "Команды" not in text
+    assert "Авто" in text and "В тренде" in text and "50 МБ" in text and "20 МБ" in text
+    assert harness.session.buttons() == ["screen:menu"]
 
 
-async def test_unknown_text_is_offered_as_a_youtube_search(harness, monkeypatch):
-    """Название ролика, которое не похоже на ссылку, уходит в поиск."""
+async def test_stats_start_at_zero_and_show_the_user_id(harness):
+    await harness.send("/start", user_id=777)
+    await harness.press("screen:stats", user_id=777)
+
+    text = harness.session.last_text()
+    assert "Роликов нарезано" in text and "0" in text
+    assert "777" in text
+    assert "<code>777</code>" in harness.session.htmls()[-1]
+
+
+# ---------- FSM: команда и «назад» обновляют диалог ----------
+
+
+async def test_banners_back_returns_to_the_menu_not_to_the_cutting_settings(harness, monkeypatch):
+    """Ошибка из жизни: меню → «Баннеры» → «Назад» уводило в настройки нарезки старого ролика."""
+    await _open_manual(harness, monkeypatch)
+    assert await _draft(harness) is not None
+
+    await harness.press("screen:menu")
+    await harness.press("screen:banners")
+    back = harness.session.buttons()[-1]
+    assert back == "screen:menu"
+    await harness.press(back)
+
+    text = harness.session.last_text()
+    assert "TgRader Clipper" in text and "Ручная настройка" not in text
+    assert harness.session.buttons() == MENU_BUTTONS
+    assert await _draft(harness) is None
+
+
+async def test_opening_banners_from_a_draft_forgets_the_draft(harness, monkeypatch):
+    await _open_manual(harness, monkeypatch)
+
+    await harness.press("screen:banners")
+
+    assert await _draft(harness) is None
+    await harness.press("screen:menu")
+    assert "Ручная настройка" not in harness.session.last_text()
+
+
+@pytest.mark.parametrize("opener", ["screen:menu", "screen:trends", "screen:banners", "ask:link", "ask:query", "ask:file"])
+async def test_top_level_screens_reset_the_dialog(harness, monkeypatch, opener):
+    await _open_manual(harness, monkeypatch)
+    await harness.press("type:num_clips")
+    assert (await _fsm(harness).get_data()).get("input_field") == "num_clips"
+
+    await harness.press(opener)
+
+    data = await _fsm(harness).get_data()
+    assert not data.get("draft") and not data.get("input_field")
+    assert await _fsm(harness).get_state() in (
+        Flow.waiting_link.state, Flow.waiting_query.state, Flow.waiting_file.state
+    )
+
+
+@pytest.mark.parametrize("command", ["/start", "/whatever", "/menu@some_bot", "/help"])
+async def test_any_command_resets_the_dialog_and_shows_the_menu(harness, monkeypatch, command):
+    await _open_manual(harness, monkeypatch)
+    await harness.press("type:num_clips")
+
+    await harness.send(command)
+
+    data = await _fsm(harness).get_data()
+    assert not data.get("draft") and not data.get("input_field")
+    assert await _fsm(harness).get_state() == Flow.waiting_link.state
+    assert "TgRader Clipper" in harness.session.last_text()
+    assert harness.session.buttons() == MENU_BUTTONS
+
+
+async def test_text_after_a_command_is_not_taken_for_a_number(harness, monkeypatch):
     calls: list[str] = []
     monkeypatch.setattr(source_handlers, "search_videos", lambda query, limit=5: calls.append(query) or [])
-
-    await harness.send("/start")
-    await harness.send("интервью дурова")
-
-    assert calls == ["интервью дурова"]
-    assert "Ничего не нашлось" in harness.session.last_text()
-
-
-async def test_too_short_search_query_is_reported_in_russian(harness, monkeypatch):
-    from app.services.downloader import DownloadError
-
-    def fail(query, limit=5):
-        raise DownloadError("Слишком короткое название — напишите хотя бы пару слов.")
-
-    monkeypatch.setattr(source_handlers, "search_videos", fail)
-    await harness.send("/start")
-    await harness.send("ok")
-
-    assert "Слишком короткое название" in harness.session.last_text()
-
-
-async def test_bad_link_says_what_is_wrong(harness):
-    await harness.send("/start")
-    await harness.send("https://vimeo.com/123456")
-
-    text = harness.session.last_text()
-    assert "не похоже на ссылку" in text and "youtu.be" in text
-
-
-# ---------- карточка ролика и экран настроек ----------
-
-
-async def test_link_opens_the_settings_screen(harness, monkeypatch):
-    monkeypatch.setattr(source_handlers, "fetch_video_info", lambda url: dict(VIDEO))
-    await harness.send("/start")
-    await harness.send(VIDEO["url"])
-
-    text = harness.session.last_text()
-    assert "Тестовый ролик" in text and "Автор" in text and "2:00" in text
-    markup = harness.session.requests[-1].reply_markup
-    callbacks = [button.callback_data for row in markup.inline_keyboard for button in row]
-    assert "job:start" in callbacks and "screen:banners" in callbacks and "edit:num_clips" in callbacks
-
-
-async def test_picked_search_result_becomes_the_draft(harness, monkeypatch):
-    monkeypatch.setattr(source_handlers, "fetch_video_info", lambda url: dict(VIDEO))
-    monkeypatch.setattr(source_handlers, "search_videos", lambda query, limit=5: [dict(VIDEO)])
-    await harness.send("/start")
-    await harness.send("тестовый ролик")
-
-    assert "Нашёл такие ролики" in harness.session.last_text()
-    await harness.press("pick:0")
-
-    assert "Тестовый ролик" in harness.session.last_text()
-    assert harness.session.calls("sendMessage")
-
-
-async def test_accept_video_rejects_a_non_youtube_link(harness, monkeypatch):
-    """Ссылка, в которой нет id ролика, не должна доходить до сети."""
-    await harness.send("/start")
-    await harness.send("https://www.youtube.com/@channel")
-
-    assert "не похоже на ссылку" in harness.session.last_text()
-
-
-# ---------- настройки: кнопки, числа, границы ----------
-
-
-async def _open_settings(harness, monkeypatch) -> None:
-    monkeypatch.setattr(source_handlers, "fetch_video_info", lambda url: dict(VIDEO))
-    await harness.send("/start")
-    await harness.send(VIDEO["url"])
-
-
-async def test_number_button_opens_a_stepper_and_custom_input_works(harness, monkeypatch):
-    await _open_settings(harness, monkeypatch)
-    await harness.press("edit:num_clips")
-
-    assert "Количество клипов" in harness.session.last_text()
-    assert {"set:num_clips:5", "step:num_clips:1", "step:num_clips:-1", "type:num_clips"} <= set(harness.session.buttons())
-
+    await _open_manual(harness, monkeypatch)
     await harness.press("type:num_clips")
-    assert "Напишите число от 1 до 50" in harness.session.last_text()
+    await harness.send("/start")
 
     await harness.send("7")
-    assert "<b>7</b>" in harness.session.last_text()
-    assert harness.ctx is not None
+
+    assert calls == ["7"]  # «7» ушло в поиск, а не в число клипов
 
 
-async def test_stepper_presets_and_plus_minus_change_the_value(harness, monkeypatch):
-    await _open_settings(harness, monkeypatch)
-    await harness.press("edit:clip_duration")
+async def test_command_does_not_interrupt_a_running_job(harness, monkeypatch):
+    await _open_manual(harness, monkeypatch)
+    monkeypatch.setattr(harness.ctx.runner, "active_for_user", lambda user_id: "job-1")
 
-    await harness.press("set:clip_duration:45")
-    assert "<b>45 с</b>" in harness.session.last_text()
-    await harness.press("step:clip_duration:5")
-    assert "<b>50 с</b>" in harness.session.last_text()
-    await harness.press("step:clip_duration:-5")
-    await harness.press("step:clip_duration:-5")
-    assert "<b>40 с</b>" in harness.session.last_text()
+    await harness.send("/start")
+
+    assert await _fsm(harness).get_state() == Flow.running.state
+    assert "TgRader Clipper" in harness.session.last_text()
 
 
-async def test_stepper_never_leaves_its_range(harness, monkeypatch):
-    await _open_settings(harness, monkeypatch)
-    await harness.press("edit:num_clips")
+async def test_stale_button_returns_to_the_menu_and_resets(harness):
+    await harness.press("pick:3")
 
-    await harness.press("set:num_clips:1")
-    await harness.press("step:num_clips:-1")
-    assert "<b>1</b>" in harness.session.last_text()
-    await harness.press("set:num_clips:50")
-    await harness.press("step:num_clips:1")
-    assert "<b>50</b>" in harness.session.last_text()
+    assert harness.session.last_alert() == texts.STALE
+    assert "TgRader Clipper" in harness.session.last_text()
+    assert await _fsm(harness).get_state() == Flow.waiting_link.state
 
 
-@pytest.mark.parametrize("value", ["0", "51"])
-async def test_clip_count_out_of_range_is_rejected(harness, monkeypatch, value):
-    """Число вне диапазона не меняет настройку — бот просит другое."""
-    await _open_settings(harness, monkeypatch)
-    await harness.press("type:num_clips")
+async def test_noise_leads_to_the_menu(harness):
+    await harness.send("   ")
 
-    await harness.send(value)
-    assert "от 1 до 50" in harness.session.last_text()
+    assert "ask:link" in harness.session.buttons()
 
 
-async def test_fractional_clip_count_is_rejected(harness, monkeypatch):
-    """Дробное количество клипов не проходит: в чат не утекает английская ошибка pydantic."""
-    await _open_settings(harness, monkeypatch)
-    await harness.press("type:num_clips")
+async def test_text_on_the_cutting_screen_nudges_to_the_buttons(harness, monkeypatch):
+    await _open_manual(harness, monkeypatch)
 
-    await harness.send("3,5")
-    text = harness.session.last_text()
-    assert "целое число" in text
-    assert "validation error" not in text and "int_from_float" not in text
+    await harness.send("привет")
 
-
-async def test_garbage_instead_of_a_number_asks_for_a_number(harness, monkeypatch):
-    """На «abc» бот просит число и не меняет настройку."""
-    await _open_settings(harness, monkeypatch)
-    before = (await get_draft(_fsm(harness))).settings.num_clips
-    await harness.press("type:num_clips")
-
-    await harness.send("abc")
-    assert "Нужно число" in harness.session.last_text()
-    assert (await get_draft(_fsm(harness))).settings.num_clips == before
-
-
-async def test_cycles_change_every_enum_setting(harness, monkeypatch):
-    await _open_settings(harness, monkeypatch)
-    expected = {
-        "cycle:slicing_mode": "подряд",
-        "cycle:frame_mode": "9:16 кроп",
-        "cycle:banner_mode": "поверх",
-        "cycle:banner_position": "верх",
-    }
-    for callback, phrase in expected.items():
-        await harness.press(callback)
-        assert phrase in harness.session.last_text(), callback
-
-
-async def test_banner_count_zero_forces_a_banner_to_be_chosen(harness, monkeypatch):
-    """Счётчик показов доходит до нуля — и бот пишет, что баннер выключен."""
-    await _open_settings(harness, monkeypatch)
-    for _ in range(8):  # 2 → 3 → 4 → 5 → 0 → 1 …
-        await harness.press("cycle:banner_count")
-        if "всплывающий: выключен" in harness.session.last_text():
-            break
-    else:
-        raise AssertionError("не дошли до выключенного баннера")
-
-    await harness.press("cycle:banner_count")  # 0 → 1
-    assert "1 на клип" in harness.session.last_text()
-
-
-async def test_settings_survive_a_new_draft_for_the_same_user(harness, monkeypatch):
-    """Настройки запоминаются за пользователем в users.json и не теряются при перезапуске диалога."""
-    await _open_settings(harness, monkeypatch)
-    await harness.press("set:num_clips:4")
-
-    store = harness.ctx.store
-    store.remember_settings(1, update_settings(store.settings(1), frame_mode=FrameMode.CENTER_CROP, slicing_mode=SlicingMode.SEQUENTIAL))
-    store.save()
-
-    await harness.press("ask:link")
-    monkeypatch.setattr(source_handlers, "fetch_video_info", lambda url: dict(VIDEO))
-    await harness.send(VIDEO["url"])
-
-    text = harness.session.last_text()
-    assert "Кадр: 9:16 кроп" in text and "· подряд" in text
+    assert harness.session.last_text() == plain_text(texts.NUDGE)
+    assert "ask:link" in harness.session.buttons()
 
 
 # ---------- баннеры ----------
 
 
-async def test_default_tgrader_banner_is_offered_first(harness, monkeypatch):
-    await _open_settings(harness, monkeypatch)  # каталог баннеров открывается поверх черновика
+async def test_banners_screen_lists_only_the_tgrader_banner(harness):
     await harness.press("screen:banners")
 
     text = harness.session.last_text()
-    assert "TGrader (7 с, со звуком)" in text
-    banners = harness.ctx.banners()
-    assert banners[0].kind == "default"
-    buttons = harness.session.buttons()
-    # Первая кнопка выбора — именно главный баннер.
-    choose = [data for data in buttons if data.startswith("banner:")]
-    assert choose and choose[0] == f"banner:{banners[0].id}"
+    assert "Баннеры" in text and "TGrader" in text
+    assert "7" in text and "звук" in text.lower()
+    assert harness.session.buttons() == ["banner:select", "banner:preview", "screen:menu"]
+    labels = harness.session.button_texts()
+    assert any("TGrader" in label for label in labels) and len(labels) == 3
+    assert [banner.id for banner in harness.ctx.banners()] == ["TGrader-banner-7s.mp4"]
+    assert_valid_rich(harness.session.htmls()[-1])
 
 
-async def test_choosing_a_banner_keeps_the_settings_screen(harness, monkeypatch):
-    await _open_settings(harness, monkeypatch)
+async def test_only_one_banner_is_ever_offered_even_if_other_files_lie_around(harness, bot_settings):
+    from PIL import Image
+
+    Image.new("RGBA", (920, 360), (255, 0, 0, 255)).save(bot_settings.banners_dir / "old_preset.png")
+
     await harness.press("screen:banners")
-    banners = harness.ctx.banners()
-    await harness.press(f"banner:{banners[0].id}")
 
-    assert "Баннер" in harness.session.last_text()
-    assert harness.session.calls("answerCallbackQuery")
+    assert [banner.id for banner in harness.ctx.banners()] == ["TGrader-banner-7s.mp4"]
+    assert "old_preset" not in " ".join(harness.session.button_texts() + harness.session.texts())
 
 
-async def test_uploaded_banner_is_accepted_and_selected(harness, monkeypatch):
-    """Картинка, присланная в чат, сохраняется как свой баннер и подставляется в настройки."""
-    from app.bot.handlers import banners as banners_handler
+async def test_banner_select_button_only_confirms(harness):
+    await harness.press("banner:select")
 
-    buffer = io.BytesIO()
-    Image.new("RGB", (640, 240), (10, 120, 200)).save(buffer, "PNG")
-    harness.session.stream_bytes = buffer.getvalue()
-    # В тесте не гоняем настоящий Pillow-разбор из файла: подменяем сохранение на копию картинки.
-    saved = {}
-
-    def fake_save(filename, data, banners_dir):
-        from app.services.banner_manager import BannerInfo
-
-        target = banners_dir / "мой_баннер.png"
-        target.write_bytes(data)
-        saved["data"] = data
-        return BannerInfo(
-            id=target.name, name="мой баннер", kind="custom", path=target, width=640, height=240,
-            animated=False, media="image", duration=None, has_audio=False, role="strip", poster=None,
-        )  # fmt: skip
-
-    monkeypatch.setattr(banners_handler, "save_uploaded_banner", fake_save)
-    await harness.press("ask:banner")
-    await harness.send_photo(file_size=len(harness.session.stream_bytes))
-
-    assert saved["data"], "файл баннера не сохранился"
-    assert "Баннер сохранён" in " ".join(harness.session.texts())
+    assert "TGrader" in harness.session.last_alert()
 
 
-async def test_banner_file_over_the_limit_is_reported(harness, monkeypatch):
-    """Слишком большой/битый баннер не пропадает молча — бот пересказывает ошибку."""
-    from app.bot.handlers import banners as banners_handler
-    from app.services.banner_manager import BannerError
+async def test_banner_preview_sends_the_video_once_then_reuses_the_file_id(harness):
+    def with_video(method, bot):
+        return _message(
+            bot,
+            getattr(method, "chat_id", 1),
+            None,
+            video={"file_id": "FILE-ID-1", "file_unique_id": "u", "width": 720, "height": 1280, "duration": 7},
+        )
 
-    def fail(*args, **kwargs):
-        raise BannerError("Баннер больше 40 МБ — пришлите файл поменьше.")
+    harness.session.handlers["sendVideo"] = with_video
+    await harness.press("banner:preview")
+    await harness.press("banner:preview")
 
-    monkeypatch.setattr(banners_handler, "save_uploaded_banner", fail)
-    harness.session.stream_bytes = b"x" * 100
+    sent = harness.session.calls("sendVideo")
+    assert len(sent) == 2
+    assert sent[1].video == "FILE-ID-1"  # второй раз файл не грузим
+    assert "TGrader" in sent[0].caption
 
-    await harness.press("ask:banner")
-    await harness.send_video_file(file_name="большой.mp4")
 
-    assert "40 МБ" in harness.session.last_text()
+# ---------- приём источника ----------
+
+
+async def test_link_opens_the_mode_picker(harness, monkeypatch):
+    await _open_video(harness, monkeypatch)
+
+    text = harness.session.last_text()
+    assert "Тестовый ролик" in text and "Автор" in text and "2:00" in text
+    assert "Авто" in text and "Вручную" in text
+    assert harness.session.buttons() == ["mode:auto", "mode:manual", "screen:menu"]
+    draft = await _draft(harness)
+    assert draft is not None and draft.title == "Тестовый ролик" and draft.mode is None
+    assert await _fsm(harness).get_state() == Flow.editing.state
+
+
+async def test_search_result_opens_the_mode_picker(harness, monkeypatch):
+    results = [dict(VIDEO, video_id=f"abcdefghij{n}", url=f"https://www.youtube.com/watch?v=abcdefghij{n}") for n in "12"]
+    monkeypatch.setattr(source_handlers, "search_videos", lambda query, limit=5: results)
+
+    await harness.send("интервью дурова")
+    assert harness.session.buttons()[:2] == ["pick:0", "pick:1"]
+    assert await _fsm(harness).get_state() == Flow.choosing.state
+
+    await harness.press("pick:1")
+
+    assert harness.session.buttons() == ["mode:auto", "mode:manual", "screen:menu"]
+    assert (await _draft(harness)).url.endswith("abcdefghij2")
+
+
+async def test_picking_an_outdated_search_result_is_reported(harness, monkeypatch):
+    results = [dict(VIDEO)]
+    monkeypatch.setattr(source_handlers, "search_videos", lambda query, limit=5: results)
+    await harness.send("что-нибудь")
+
+    await harness.press("pick:7")
+
+    assert "устарел" in harness.session.last_alert()
+
+
+async def test_short_search_query_is_reported_in_russian(harness):
+    await harness.send("a")
+
+    assert "Слишком короткое" in harness.session.last_text()
+    assert harness.session.buttons() == ["screen:menu"]
+
+
+async def test_search_failure_is_reported_with_a_way_back(harness, monkeypatch):
+    def boom(query, limit=5):
+        raise RuntimeError("сеть упала")
+
+    monkeypatch.setattr(source_handlers, "search_videos", boom)
+    await harness.send("интервью")
+
+    assert "Поиск не удался" in harness.session.last_text()
+    assert harness.session.buttons() == ["screen:menu"]
+
+
+async def test_bad_link_says_what_is_wrong(harness):
+    await harness.send("https://example.com/video")
+
+    text = harness.session.last_text()
+    assert "не похоже на ссылку на YouTube" in text and "youtu.be" in text
+
+
+async def test_link_failure_is_reported_with_a_way_back(harness, monkeypatch):
+    from app.services.downloader import DownloadError
+
+    def boom(url):
+        raise DownloadError("Видео недоступно в вашей стране.")
+
+    monkeypatch.setattr(source_handlers, "fetch_video_info", boom)
+    await harness.send(VIDEO["url"])
+
+    assert "недоступно" in harness.session.last_text()
+    assert harness.session.buttons() == ["screen:menu"]
+
+
+async def test_fresh_user_can_just_send_a_title_without_start(harness, monkeypatch):
+    """После перезапуска бота состояние пустое — название всё равно уходит в поиск."""
+    calls: list[str] = []
+    monkeypatch.setattr(source_handlers, "search_videos", lambda query, limit=5: calls.append(query) or [])
+
+    await harness.send("интервью дурова")
+
+    assert calls == ["интервью дурова"]
+
+
+async def test_new_link_replaces_the_draft_and_forgets_pending_input(harness, monkeypatch):
+    await _open_manual(harness, monkeypatch)
+    await harness.press("type:num_clips")
+    monkeypatch.setattr(source_handlers, "fetch_video_info", lambda url: dict(VIDEO, title="Другой ролик"))
+
+    await harness.send("https://youtu.be/AAAAAAAAAAA")
+
+    assert (await _draft(harness)).title == "Другой ролик"
+    assert not (await _fsm(harness).get_data()).get("input_field")
+    assert harness.session.buttons() == ["mode:auto", "mode:manual", "screen:menu"]
+
+
+async def test_title_with_markup_characters_is_escaped(harness, monkeypatch):
+    await _open_video(harness, monkeypatch, title="a < b & <i>c</i>", uploader="Автор <b>")
+
+    html = harness.session.htmls()[-1]
+    assert "a &lt; b &amp; &lt;i&gt;c&lt;/i&gt;" in html
+    assert_valid_rich(html)
+
+
+async def test_uploaded_file_opens_the_mode_picker(harness, tmp_path):
+    source = make_video(tmp_path / "src.mp4", size="640x360", seconds=4)
+    harness.session.stream_bytes = source.read_bytes()
+
+    await harness.send_file(file_name="myvideo.mp4", file_size=source.stat().st_size)
+
+    assert "myvideo" in harness.session.last_text()
+    assert harness.session.buttons() == ["mode:auto", "mode:manual", "screen:menu"]
+    assert (await _draft(harness)).upload_id
+
+
+async def test_non_video_file_is_rejected(harness):
+    await harness.send_file(file_name="notes.pdf")
+
+    assert "не видеофайл" in harness.session.last_text()
+
+
+async def test_oversized_file_is_rejected(harness):
+    await harness.send_file(file_name="big.mp4", file_size=30 * 1024 * 1024)
+
+    assert "20 МБ" in harness.session.last_text()
+
+
+# ---------- режимы: авто и вручную ----------
+
+
+async def test_auto_mode_builds_a_tiktok_plan_with_goal_buttons(harness, monkeypatch):
+    monkeypatch.setattr(mode_handlers, "_can_follow_faces", lambda: True)
+    await _open_auto(harness, monkeypatch, duration=3600.0)
+
+    draft = await _draft(harness)
+    s = draft.settings
+    assert draft.mode is CutMode.AUTO and draft.goal is Goal.TIKTOK
+    assert (s.num_clips, s.clip_duration) == (10, 25.0)
+    assert s.slicing_mode is SlicingMode.HIGHLIGHTS and s.auto_trim
+    assert s.frame_mode is FrameMode.CENTER_CROP
+    assert s.banner_id == "TGrader-banner-7s.mp4" and s.banner_count == 1 and s.banner_sound
+
+    assert harness.session.buttons() == [
+        "goal:tiktok", "goal:shorts", "goal:universal", "job:start", "mode:manual", "screen:mode",
+    ]  # fmt: skip
+    assert "Нарезать 10 клипов" in " ".join(harness.session.button_texts())
+    text = harness.session.last_text()
+    assert "Авто-подбор" in text and "TikTok" in text and "Тестовый ролик" in text
+    assert_valid_rich(harness.session.htmls()[-1])
+
+
+async def test_auto_plan_is_honest_it_is_not_a_neural_network():
+    assert "не нейросеть" in plain_text(texts.HELP)
+
+
+async def test_changing_the_goal_rebuilds_the_plan(harness, monkeypatch):
+    monkeypatch.setattr(mode_handlers, "_can_follow_faces", lambda: False)
+    await _open_auto(harness, monkeypatch, duration=3600.0)
+
+    await harness.press("goal:shorts")
+    draft = await _draft(harness)
+    assert draft.goal is Goal.SHORTS
+    assert (draft.settings.num_clips, draft.settings.clip_duration) == (8, 40.0)
+    assert "YouTube Shorts" in harness.session.last_text()
+
+    await harness.press("goal:universal")
+    draft = await _draft(harness)
+    assert draft.goal is Goal.UNIVERSAL
+    assert (draft.settings.num_clips, draft.settings.clip_duration, draft.settings.banner_count) == (6, 30.0, 2)
+    assert draft.settings.frame_mode is FrameMode.BLUR_PAD
+
+    await harness.press("goal:nonsense")
+    assert "Такой цели нет" in harness.session.last_alert()
+
+
+async def test_auto_plan_keeps_every_clip_within_shorts_limits(harness, monkeypatch):
+    await _open_auto(harness, monkeypatch, duration=3600.0)
+    for goal in ("tiktok", "shorts", "universal"):
+        await harness.press(f"goal:{goal}")
+        s = (await _draft(harness)).settings
+        total = s.clip_duration + s.banner_count * (harness.ctx.banner_seconds() or 0)
+        assert total <= 59.0, goal
+
+
+async def test_auto_plan_for_a_short_video_takes_it_whole(harness, monkeypatch):
+    await _open_auto(harness, monkeypatch, duration=20.0)
+
+    s = (await _draft(harness)).settings
+    assert (s.num_clips, s.clip_duration) == (1, 20.0)
+    assert "короткий" in harness.session.last_text()
+
+
+async def test_auto_plan_for_a_very_long_video_downloads_less(harness, monkeypatch):
+    await _open_auto(harness, monkeypatch, duration=2 * 3600.0)
+
+    assert (await _draft(harness)).settings.max_height == 720
+
+
+async def test_auto_screen_back_goes_to_the_mode_picker(harness, monkeypatch):
+    await _open_auto(harness, monkeypatch)
+
+    await harness.press("screen:mode")
+
+    assert harness.session.buttons() == ["mode:auto", "mode:manual", "screen:menu"]
+    assert await _fsm(harness).get_state() == Flow.editing.state
+
+
+async def test_tweaking_the_auto_plan_by_hand_keeps_its_values(harness, monkeypatch):
+    monkeypatch.setattr(mode_handlers, "_can_follow_faces", lambda: False)
+    await _open_auto(harness, monkeypatch, duration=3600.0)
+    planned = (await _draft(harness)).settings
+
+    await harness.press("mode:manual")
+
+    draft = await _draft(harness)
+    assert draft.mode is CutMode.MANUAL
+    assert draft.settings == planned
+    assert "Ручная настройка" in harness.session.last_text()
+
+
+async def test_manual_mode_screen_explains_every_setting(harness, monkeypatch):
+    await _open_manual(harness, monkeypatch)
+
+    text = harness.session.last_text()
+    for part in ("Ручная настройка", "Клипов", "Откуда", "Кадр", "Края ролика", "Баннер TGrader"):
+        assert part in text, part
+    labels = harness.session.button_texts()
+    joined = " | ".join(labels)
+    for part in ("Клипов:", "Длина:", "Откуда:", "Кадр:", "Края ролика:", "Баннер TGrader:", "Дополнительно", "Начать нарезку", "Назад"):
+        assert part in joined, (part, joined)
+    assert_valid_rich(harness.session.htmls()[-1])
+
+
+async def test_manual_screen_back_goes_to_the_mode_picker(harness, monkeypatch):
+    await _open_manual(harness, monkeypatch)
+
+    assert harness.session.buttons()[-1] == "screen:mode"
+    await harness.press("screen:mode")
+
+    assert harness.session.buttons() == ["mode:auto", "mode:manual", "screen:menu"]
+
+
+async def test_going_back_to_auto_recomputes_the_plan(harness, monkeypatch):
+    monkeypatch.setattr(mode_handlers, "_can_follow_faces", lambda: False)
+    await _open_manual(harness, monkeypatch, duration=3600.0)
+    await harness.press("edit:num_clips")
+    await harness.press("set:num_clips:3")
+    assert (await _draft(harness)).settings.num_clips == 3
+
+    await harness.press("screen:mode")
+    await harness.press("mode:auto")
+
+    draft = await _draft(harness)
+    assert draft.mode is CutMode.AUTO and draft.settings.num_clips == 10
+
+
+async def test_screens_without_a_draft_ask_for_a_video(harness):
+    for data in ("mode:auto", "mode:manual", "screen:mode", "screen:more", "screen:trim", "choose:frame_mode", "edit:num_clips", "job:start"):
+        await harness.press(data)
+        assert harness.session.last_alert() == texts.LOST_DRAFT, data
+    await harness.press("screen:manual")
+    assert harness.session.last_alert() == texts.NEED_VIDEO
+
+
+# ---------- ручная настройка: числа ----------
+
+
+async def test_number_button_opens_a_stepper_and_custom_input_works(harness, monkeypatch):
+    await _open_manual(harness, monkeypatch)
+
+    await harness.press("edit:num_clips")
+    assert "Сколько клипов" in harness.session.last_text()
+    assert "set:num_clips:5" in harness.session.buttons()
+
+    await harness.press("type:num_clips")
+    assert harness.session.buttons() == ["edit:num_clips"]  # одна кнопка «Отмена»
+    await harness.send("7")
+
+    assert (await _draft(harness)).settings.num_clips == 7
+    assert "set:num_clips:5" in harness.session.buttons()  # вернулись на экран выбора числа
+
+
+async def test_stepper_presets_and_plus_minus_change_the_value(harness, monkeypatch):
+    await _open_manual(harness, monkeypatch)
+    await harness.press("edit:clip_duration")
+
+    await harness.press("set:clip_duration:45")
+    assert (await _draft(harness)).settings.clip_duration == 45
+    await harness.press("step:clip_duration:5")
+    assert (await _draft(harness)).settings.clip_duration == 50
+    await harness.press("step:clip_duration:-5")
+    await harness.press("step:clip_duration:-5")
+    assert (await _draft(harness)).settings.clip_duration == 40
+
+
+async def test_stepper_never_leaves_its_range(harness, monkeypatch):
+    await _open_manual(harness, monkeypatch)
+    await harness.press("edit:num_clips")
+
+    await harness.press("set:num_clips:50")
+    await harness.press("step:num_clips:1")
+    assert (await _draft(harness)).settings.num_clips == 50
+    await harness.press("set:num_clips:1")
+    await harness.press("step:num_clips:-1")
+    assert (await _draft(harness)).settings.num_clips == 1
+
+
+@pytest.mark.parametrize("value", ["0", "51", "-3", "1000"])
+async def test_clip_count_out_of_range_is_rejected(harness, monkeypatch, value):
+    await _open_manual(harness, monkeypatch)
+    await harness.press("type:num_clips")
+
+    await harness.send(value)
+
+    assert "от 1 до 50" in harness.session.last_text()
+    assert (await _draft(harness)).settings.num_clips == 5
+    assert (await _fsm(harness).get_data()).get("input_field") == "num_clips"  # ждём число дальше
+
+
+async def test_fractional_clip_count_is_rejected(harness, monkeypatch):
+    await _open_manual(harness, monkeypatch)
+    await harness.press("type:num_clips")
+
+    await harness.send("2.5")
+
+    assert "целое" in harness.session.last_text()
+    assert (await _draft(harness)).settings.num_clips == 5
+
+
+async def test_garbage_instead_of_a_number_asks_for_a_number(harness, monkeypatch):
+    await _open_manual(harness, monkeypatch)
+    await harness.press("type:clip_duration")
+
+    await harness.send("тридцать")
+
+    assert "Нужно число" in harness.session.last_text()
+    assert (await _draft(harness)).settings.clip_duration == 30
+
+
+async def test_cancelling_number_input_stops_waiting_for_a_number(harness, monkeypatch):
+    await _open_manual(harness, monkeypatch)
+    await harness.press("type:num_clips")
+    await harness.press("edit:num_clips")  # «Отмена»
+
+    assert not (await _fsm(harness).get_data()).get("input_field")
+    await harness.send("9")
+    assert (await _draft(harness)).settings.num_clips == 5
+    assert harness.session.last_text() == plain_text(texts.NUDGE)
+
+
+async def test_fractional_seconds_are_accepted_for_offsets_and_commas_work(harness, monkeypatch):
+    await _open_manual(harness, monkeypatch)
+    await harness.press("screen:trim")
+    await harness.press("type:start_offset")
+
+    await harness.send("12,5")
+
+    assert (await _draft(harness)).settings.start_offset == 12.5
+
+
+async def test_banner_steppers_exist_and_are_bounded(harness, monkeypatch):
+    await _open_manual(harness, monkeypatch)
+    await harness.press("edit:banner_count")
+    await harness.press("set:banner_count:3")
+    await harness.press("edit:banner_scale")
+    await harness.press("set:banner_scale:70")
+    await harness.press("step:banner_scale:100")
+
+    s = (await _draft(harness)).settings
+    assert s.banner_count == 3 and s.banner_scale == 95
+    assert "95%" in harness.session.last_text()
+
+
+# ---------- ручная настройка: варианты и переключатели ----------
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "check"),
+    [
+        ("frame_mode", "center_crop", lambda s: s.frame_mode is FrameMode.CENTER_CROP),
+        ("frame_mode", "original", lambda s: s.frame_mode is FrameMode.ORIGINAL),
+        ("slicing_mode", "highlights", lambda s: s.slicing_mode is SlicingMode.HIGHLIGHTS),
+        ("slicing_mode", "sequential", lambda s: s.slicing_mode is SlicingMode.SEQUENTIAL),
+        ("banner_mode", "overlay", lambda s: s.banner_mode.value == "overlay"),
+        ("banner_position", "top", lambda s: s.banner_position.value == "top"),
+    ],
+)
+async def test_choice_screens_apply_the_option_and_return_to_the_settings(harness, monkeypatch, field, value, check):
+    await _open_manual(harness, monkeypatch)
+
+    await harness.press(f"choose:{field}")
+    assert f"opt:{field}:{value}" in harness.session.buttons()
+    assert harness.session.buttons()[-1] == "screen:manual"
+    assert_valid_rich(harness.session.htmls()[-1])
+
+    await harness.press(f"opt:{field}:{value}")
+
+    assert check((await _draft(harness)).settings)
+    assert "Ручная настройка" in harness.session.last_text()
+
+
+async def test_choice_screen_explains_every_option_and_marks_the_current_one(harness, monkeypatch):
+    await _open_manual(harness, monkeypatch)
+
+    await harness.press("choose:frame_mode")
+
+    text = harness.session.last_text()
+    for part in ("9:16, размытый фон", "9:16, на весь экран", "16:9, как есть", "слежу за лицом"):
+        assert part in text, part
+    assert harness.session.button_texts()[0].startswith("✅")  # по умолчанию размытый фон
+
+
+async def test_quality_choice_returns_to_the_extra_screen(harness, monkeypatch):
+    await _open_manual(harness, monkeypatch)
+    await harness.press("screen:more")
+    assert "choose:max_height" in harness.session.buttons()
+
+    await harness.press("choose:max_height")
+    await harness.press("opt:max_height:720")
+
+    assert (await _draft(harness)).settings.max_height == 720
+    assert "Дополнительно" in harness.session.last_text()
+    assert harness.session.buttons()[-1] == "screen:manual"
+
+
+async def test_unknown_option_is_reported(harness, monkeypatch):
+    await _open_manual(harness, monkeypatch)
+
+    await harness.press("opt:frame_mode:sideways")
+    assert "больше нет" in harness.session.last_alert()
+    await harness.press("choose:nothing")
+    assert "нельзя изменить" in harness.session.last_alert()
+
+
+async def test_banner_can_be_switched_off_and_on(harness, monkeypatch):
+    await _open_manual(harness, monkeypatch)
+    assert (await _draft(harness)).settings.banner_count == 2
+    assert "edit:banner_count" in harness.session.buttons()
+
+    await harness.press("toggle:banner")
+    assert (await _draft(harness)).settings.banner_count == 0
+    assert "edit:banner_count" not in harness.session.buttons()  # настройки баннера спрятаны
+    assert "Выключен" in harness.session.last_text()
+
+    await harness.press("toggle:banner")
+    assert (await _draft(harness)).settings.banner_count == 1
+    assert "edit:banner_count" in harness.session.buttons()
+
+
+async def test_sound_and_trim_and_sfx_toggles(harness, monkeypatch):
+    await _open_manual(harness, monkeypatch)
+
+    await harness.press("toggle:banner_sound")
+    assert not (await _draft(harness)).settings.banner_sound
+
+    await harness.press("screen:trim")
+    await harness.press("toggle:auto_trim:trim")
+    assert (await _draft(harness)).settings.auto_trim
+    assert "Автообрезка" in harness.session.last_text()
+
+    await harness.press("screen:manual")
+    await harness.press("screen:more")
+    await harness.press("toggle:enable_sfx:more")
+    assert (await _draft(harness)).settings.enable_sfx
+    assert "Дополнительно" in harness.session.last_text()
+
+
+async def test_trim_screen_buttons_say_what_they_do(harness, monkeypatch):
+    await _open_manual(harness, monkeypatch)
+
+    await harness.press("screen:trim")
+
+    joined = " | ".join(harness.session.button_texts())
+    assert "Убрать заставку и титры" in joined and "Пропустить начало" in joined and "Пропустить конец" in joined
+
+
+async def test_settings_survive_a_new_draft_for_the_same_user(harness, monkeypatch):
+    await _open_manual(harness, monkeypatch)
+    await harness.press("choose:frame_mode")
+    await harness.press("opt:frame_mode:original")
+    harness.ctx.store.remember_settings(1, (await _draft(harness)).to_request())
+
+    monkeypatch.setattr(source_handlers, "fetch_video_info", lambda url: dict(VIDEO, title="Второй"))
+    await harness.send("https://youtu.be/AAAAAAAAAAA")
+    await harness.press("mode:manual")
+
+    assert (await _draft(harness)).settings.frame_mode is FrameMode.ORIGINAL
+
+
+async def test_stored_settings_with_an_old_banner_are_replaced_by_tgrader(harness, monkeypatch):
+    from app.bot.context import update_settings
+
+    stored = update_settings(
+        harness.ctx.store.settings(1), banner_id="preset_gone.png", static_banner_id="strip_gone.png", banner_count=3
+    )
+    harness.ctx.store.settings = lambda user_id: stored  # старый сохранённый выбор из прошлой версии бота
+    await _open_manual(harness, monkeypatch)
+
+    s = (await _draft(harness)).settings
+    assert s.banner_id == "TGrader-banner-7s.mp4" and s.static_banner_id is None and s.banner_count == 3
+
+
+async def test_without_the_banner_file_clips_go_without_a_banner(harness, monkeypatch, bot_settings):
+    (bot_settings.banners_dir / "TGrader-banner-7s.mp4").unlink()
+    await _open_manual(harness, monkeypatch)
+
+    s = (await _draft(harness)).settings
+    assert s.banner_count == 0 and s.banner_id is None
+    assert "toggle:banner" not in harness.session.buttons()
+    await harness.press("mode:auto")
+    assert (await _draft(harness)).settings.banner_count == 0
+    await harness.press("screen:banners")
+    assert "Баннера пока нет" in harness.session.last_text()
+
+
+# ---------- тренды ----------
+
+
+async def test_trends_home_lists_genres_and_goes_back(harness):
+    await harness.press("screen:trends")
+
+    text = harness.session.last_text()
+    assert "В тренде" in text and "TikTok" in text
+    buttons = harness.session.buttons()
+    assert buttons[-1] == "screen:menu" and "trend:podcast" in buttons
+    assert_valid_rich(harness.session.htmls()[-1])
+
+
+async def test_trend_genre_lists_videos_and_is_cached(harness, monkeypatch):
+    calls: list[str] = []
+
+    def fake(category, limit=8):
+        calls.append(category.id)
+        return [dict(video) for video in TRENDING]
+
+    monkeypatch.setattr(trend_handlers, "fetch_category", fake)
+
+    await harness.press("trend:podcast")
+
+    text = harness.session.last_text()
+    assert "Подкаст номер 1" in text and "1,5 млн" in text and "Канал 2" in text
+    assert harness.session.buttons() == ["pick:0", "pick:1", "pick:2", "screen:trends", "screen:menu"]
+    assert any("Загляните" not in line for line in harness.session.texts())
+    assert_valid_rich(harness.session.htmls()[-1])
+    assert await _fsm(harness).get_state() == Flow.choosing.state
+
+    await harness.press("screen:trends")
+    await harness.press("trend:podcast")
+    assert calls == ["podcast"]  # второй раз — из кеша
+
+
+async def test_cold_trend_request_shows_a_loading_screen_first(harness, monkeypatch):
+    monkeypatch.setattr(trend_handlers, "fetch_category", lambda category, limit=8: [dict(v) for v in TRENDING])
+
+    await harness.press("trend:humor")
+
+    shown = [plain_text(html) for html in harness.session.htmls()]
+    assert any("Смотрю, что сейчас в тренде" in text for text in shown)
+    assert "Подкаст номер 1" in shown[-1]
+
+
+async def test_picking_a_trending_video_goes_straight_to_the_tiktok_plan(harness, monkeypatch):
+    monkeypatch.setattr(mode_handlers, "_can_follow_faces", lambda: False)
+    monkeypatch.setattr(trend_handlers, "fetch_category", lambda category, limit=8: [dict(v) for v in TRENDING])
+    await harness.press("trend:podcast")
+
+    await harness.press("pick:1")
+
+    draft = await _draft(harness)
+    assert draft.title == "Подкаст номер 2" and draft.mode is CutMode.AUTO and draft.goal is Goal.TIKTOK
+    assert "job:start" in harness.session.buttons() and "goal:shorts" in harness.session.buttons()
+    assert "Авто-подбор" in harness.session.last_text()
+
+
+async def test_trend_error_offers_a_retry(harness, monkeypatch):
+    from app.services.trends import TrendsError
+
+    attempts = []
+
+    def flaky(category, limit=8):
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise TrendsError("YouTube сейчас не отвечает — попробуйте через пару минут.")
+        return [dict(v) for v in TRENDING]
+
+    monkeypatch.setattr(trend_handlers, "fetch_category", flaky)
+    await harness.press("trend:games")
+
+    assert "не отвечает" in harness.session.last_text()
+    assert harness.session.buttons() == ["trend:games", "screen:trends"]
+
+
+async def test_unexpected_trend_failure_is_reported_politely(harness, monkeypatch):
+    def broken(category, limit=8):
+        raise ValueError("внезапно")
+
+    monkeypatch.setattr(trend_handlers, "fetch_category", broken)
+    await harness.press("trend:money")
+
+    assert "Попробуйте ещё раз" in harness.session.last_text()
+    assert "внезапно" not in harness.session.last_text()
+    assert harness.session.buttons()[0] == "trend:money"
+
+
+async def test_empty_trend_list_is_not_cached(harness, monkeypatch):
+    calls = []
+
+    def empty_then_full(category, limit=8):
+        calls.append(1)
+        return [] if len(calls) == 1 else [dict(v) for v in TRENDING]
+
+    monkeypatch.setattr(trend_handlers, "fetch_category", empty_then_full)
+    await harness.press("trend:sport")
+    assert "ничего подходящего" in harness.session.last_text()
+
+    await harness.press("trend:sport")
+    assert "Подкаст номер 1" in harness.session.last_text()
+
+
+async def test_unknown_trend_genre_is_reported(harness):
+    await harness.press("trend:nothing")
+
+    assert "Такого жанра нет" in harness.session.last_alert()
 
 
 # ---------- запуск задачи и доставка ----------
 
 
-async def _draft_and_job(harness, monkeypatch, tmp_path, *, clips=2, seconds=3) -> None:
+async def _prepare_job(harness, tmp_path, *, clips=2, seconds=3) -> None:
     source = make_video(tmp_path / "src.mp4", size="640x360", seconds=8)
     harness.session.stream_bytes = source.read_bytes()
     await harness.send("/start")
     await harness.send_file(file_name="myvideo.mp4", file_size=Path(source).stat().st_size)
-    await harness.press("cycle:banner_count")
-    await harness.press("cycle:banner_count")
-    await harness.press("cycle:banner_count")
-    await harness.press("cycle:banner_count")
-    await harness.press("cycle:banner_count")
-    await harness.press("cycle:banner_count")  # 2 → … → 0 показов
+    await harness.press("mode:manual")
+    await harness.press("toggle:banner")  # без баннера: задача считается быстро
     await harness.press("type:num_clips")
     await harness.send(str(clips))
     await harness.press("type:clip_duration")
     await harness.send(str(seconds))
 
 
-def _wait_job(harness, timeout=WAIT):
+async def _wait_finished(harness, timeout=WAIT):
     deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        active = [job for job in harness.ctx.runner._jobs.values() if not job.finished]  # noqa: SLF001
-        if not active:
-            return
-        time.sleep(0.2)
-    raise AssertionError("задача не завершилась за отведённое время")
-
-
-async def test_uploaded_file_runs_a_full_job_and_sends_clips(harness, monkeypatch, tmp_path):
-    await _draft_and_job(harness, monkeypatch, tmp_path, clips=2, seconds=3)
-    await harness.press("job:start")
-
-    deadline = time.monotonic() + WAIT
     while time.monotonic() < deadline:
         await asyncio.sleep(0.3)
         if not harness.ctx.runner._jobs:  # noqa: SLF001
-            break
+            return
+    raise AssertionError("задача не завершилась за отведённое время")
+
+
+async def test_manual_job_runs_and_sends_clips(harness, tmp_path):
+    await _prepare_job(harness, tmp_path, clips=2, seconds=3)
+    await harness.press("job:start")
+    await _wait_finished(harness)
 
     videos = harness.session.calls("sendVideo")
     assert len(videos) == 2, [request.__api_method__ for request in harness.session.requests]
+    assert "Клип 1 из 2" in videos[0].caption
     final = harness.session.last_text()
-    assert "Готово!" in final and "Роликов: <b>2</b>" in final
+    assert "Готово" in final and "Клипов — 2" in final
     assert harness.session.calls("sendDocument")  # ZIP
+    assert harness.session.buttons() == ["ask:link", "screen:mode", "screen:trends", "screen:menu"]
+    for html in harness.session.htmls():
+        if html.startswith("<"):
+            assert_valid_rich(html)
 
 
-async def test_start_requires_a_draft(harness):
+async def test_job_start_requires_a_draft(harness):
     await harness.press("job:start")
 
-    assert "Черновик потерялся" in harness.session.last_text() or harness.session.calls("answerCallbackQuery")
+    assert harness.session.last_alert() == texts.LOST_DRAFT
 
 
-async def test_job_can_be_cancelled(harness, monkeypatch, tmp_path):
-    await _draft_and_job(harness, monkeypatch, tmp_path, clips=5, seconds=6)
+async def test_second_start_is_refused_while_a_job_runs(harness, monkeypatch):
+    await _open_manual(harness, monkeypatch)
+    monkeypatch.setattr(harness.ctx.runner, "active_for_user", lambda user_id: "job-1")
+
+    await harness.press("job:start")
+
+    assert "ещё идёт" in harness.session.last_alert()
+
+
+async def test_messages_during_a_job_get_a_hint(harness, monkeypatch):
+    monkeypatch.setattr(harness.ctx.runner, "active_for_user", lambda user_id: "job-1")
+    await _fsm(harness).set_state(Flow.running)
+
+    await harness.send("привет")
+
+    assert "Сейчас идёт нарезка" in harness.session.last_text()
+
+
+async def test_auto_plan_converts_into_a_valid_job_request(harness, monkeypatch):
+    started = []
+
+    async def capture(chat_id, user_id, request, message):
+        started.append(request)
+        return "job-1"
+
+    monkeypatch.setattr(harness.ctx.runner, "start", capture)
+    await _open_auto(harness, monkeypatch, duration=1800.0)
+
+    await harness.press("job:start")
+
+    assert len(started) == 1
+    request = started[0]
+    assert request.banner_id == "TGrader-banner-7s.mp4" and request.banner_count == 1
+    assert request.slicing_mode is SlicingMode.HIGHLIGHTS and request.auto_trim
+    assert request.url == VIDEO["url"]
+    assert await _fsm(harness).get_state() == Flow.running.state
+
+
+async def test_start_failure_is_reported_and_the_dialog_stays_editable(harness, monkeypatch):
+    async def broken(*args, **kwargs):
+        raise RuntimeError("очередь сломалась")
+
+    monkeypatch.setattr(harness.ctx.runner, "start", broken)
+    await _open_auto(harness, monkeypatch)
+
+    await harness.press("job:start")
+
+    assert "Не получилось запустить" in harness.session.last_text()
+    assert await _fsm(harness).get_state() == Flow.editing.state
+
+
+async def test_job_can_be_cancelled(harness, tmp_path):
+    await _prepare_job(harness, tmp_path, clips=5, seconds=6)
     await harness.press("job:start")
 
     deadline = time.monotonic() + 30
@@ -434,45 +1065,90 @@ async def test_job_can_be_cancelled(harness, monkeypatch, tmp_path):
     else:
         raise AssertionError("задача не завершилась после отмены")
     final = " ".join(harness.session.texts()[-3:])
-    assert "Отмен" in final or "остановил" in final.lower()
+    assert "остановил" in final.lower() or "Отмен" in final
 
 
-# ---------- статистика ----------
+async def test_link_is_accepted_right_after_a_finished_job(harness, monkeypatch):
+    """Состояние «идёт нарезка» не сбрасывалось само — следующая ссылка терялась без ответа."""
+    monkeypatch.setattr(source_handlers, "fetch_video_info", lambda url: dict(VIDEO))
+    await _fsm(harness).set_state(Flow.running)
+
+    await harness.send(VIDEO["url"])
+
+    assert "Тестовый ролик" in harness.session.last_text()
 
 
-async def test_stats_start_at_zero_and_show_the_user_id(harness):
-    await harness.send("/start", user_id=777)
-    await harness.press("screen:stats", user_id=777)
-
-    text = harness.session.last_text()
-    assert "Роликов нарезано: <b>0</b>" in text
-    assert "<code>777</code>" in text
+# ---------- обычный HTML вместо rich ----------
 
 
-# ---------- тексты и клавиатуры как отдельные единицы ----------
+async def test_everything_works_when_telegram_refuses_rich_messages(harness, monkeypatch):
+    """Старый сервер или неподдержанный тег: тот же экран уходит классическим HTML, кнопки остаются."""
+    harness.session.reject_rich = True
+
+    await harness.send("/start")
+
+    sent = harness.session.calls("sendMessage")
+    assert sent and "TgRader Clipper" in sent[-1].text
+    assert "<h1>" not in sent[-1].text and "<blockquote>" in sent[-1].text
+    assert harness.session.buttons() == MENU_BUTTONS
+
+    await _open_manual(harness, monkeypatch)
+    assert "Ручная настройка" in harness.session.last_text()
+    assert "edit:num_clips" in harness.session.buttons()
+    await harness.press("edit:num_clips")  # правка тоже идёт классическим editMessageText
+    edits = harness.session.calls("editMessageText")
+    assert edits and edits[-1].text and edits[-1].rich_message is None
 
 
-def test_duration_text_is_human_readable():
-    assert texts.duration_text(95) == "1:35"
-    assert texts.duration_text(3725) == "1:02:05"
-    assert texts.duration_text(0) == "0:00"
+async def test_unchanged_screen_is_not_sent_twice(harness, monkeypatch):
+    """«message is not modified» — не повод слать копию экрана новым сообщением."""
+    await _open_manual(harness, monkeypatch)
+    await harness.press("edit:num_clips")
+    sent_before = len(harness.session.calls("sendRichMessage")) + len(harness.session.calls("sendMessage"))
+
+    def not_modified(method, bot):
+        raise TelegramBadRequest(method=method, message="Bad Request: message is not modified")
+
+    harness.session.handlers["editMessageText"] = not_modified
+    await harness.press("set:num_clips:5")
+
+    assert len(harness.session.calls("sendRichMessage")) + len(harness.session.calls("sendMessage")) == sent_before
 
 
-def test_html_is_escaped_in_video_titles():
-    """Название ролика с угловыми скобками не должно ломать HTML-разметку Telegram."""
-    card = texts.video_card("a < b & c", "Автор <b>", 10)
-    assert "<b>a &lt; b &amp; c</b>" in card
-    assert "Автор &lt;b&gt;" in card
+async def test_edit_failure_sends_a_fresh_screen(harness, monkeypatch):
+    await _open_manual(harness, monkeypatch)
+
+    def gone(method, bot):
+        raise TelegramBadRequest(method=method, message="Bad Request: message to edit not found")
+
+    harness.session.handlers["editMessageText"] = gone
+    before = len(harness.session.calls("sendRichMessage"))
+    await harness.press("edit:num_clips")
+
+    assert len(harness.session.calls("sendRichMessage")) > before
+    assert "Сколько клипов" in harness.session.last_text()
 
 
-def test_settings_keyboard_has_a_start_button_after_a_draft():
-    from app.models import Draft
+async def test_a_full_tour_only_uses_valid_rich_markup(harness, monkeypatch):
+    """Все основные экраны подряд: ни один не нарушает правил rich-разметки."""
+    monkeypatch.setattr(mode_handlers, "_can_follow_faces", lambda: True)
+    monkeypatch.setattr(trend_handlers, "fetch_category", lambda category, limit=8: [dict(v) for v in TRENDING])
+    await harness.send("/start")
+    for data in ("screen:help", "screen:stats", "screen:banners", "screen:trends", "trend:podcast", "pick:0"):
+        await harness.press(data)
+    await harness.press("mode:manual")
+    for data in (
+        "screen:more", "choose:max_height", "screen:more", "screen:manual", "screen:trim", "edit:start_offset",
+        "type:start_offset", "screen:manual", "choose:slicing_mode", "choose:frame_mode", "choose:banner_mode",
+        "choose:banner_position", "edit:banner_count", "edit:banner_scale", "edit:clip_duration", "screen:mode",
+        "mode:auto", "goal:shorts", "goal:universal",
+    ):  # fmt: skip
+        await harness.press(data)
 
-    draft = Draft(title="Тест", duration=60)
-    markup = keyboards.settings_screen(draft, "TGrader (7 с, со звуком)", None)
-    callbacks = [button.callback_data for row in markup.inline_keyboard for button in row if button.callback_data]
-    assert "job:start" in callbacks
-    assert any(data.startswith("edit:") for data in callbacks), "кнопки числовых настроек пропали"
+    rich = [request.rich_message.html for request in harness.session.rich_requests()]
+    assert len(rich) > 20
+    for html in rich:
+        assert_valid_rich(html)
 
 
 # ---------- только кнопки: команд в боте нет ----------
@@ -484,8 +1160,8 @@ def _walk_routers(router):
         yield from _walk_routers(child)
 
 
-def test_no_slash_command_handlers_except_the_hidden_start(bot_settings):
-    """Единственная команда — скрытый `/start`: его шлёт Telegram по кнопке «Старт», обойти нельзя."""
+def test_no_command_filters_at_all(bot_settings):
+    """Команд нет совсем: `/start` и любое «/…» обрабатывает один хэндлер по началу текста."""
     from app.bot.app import build_app
 
     _, _, dispatcher = build_app(bot_settings)
@@ -494,208 +1170,118 @@ def test_no_slash_command_handlers_except_the_hidden_start(bot_settings):
         for handler in router.message.handlers:
             for flt in handler.filters:
                 if isinstance(flt.callback, Command):
-                    found.append(type(flt.callback))
-    assert found == [CommandStart]
+                    found.append(flt.callback)
+    assert found == []
 
 
 def test_bot_texts_never_point_to_commands():
-    import re
-
     command = re.compile(r"(?<![\w/:.…])/[a-z]{3,}(?![\w/])")
     screens = [
         texts.START, texts.HELP, texts.NUDGE, texts.REQUEST_LINK, texts.REQUEST_QUERY, texts.REQUEST_FILE,
-        texts.REQUEST_BANNER, texts.BAD_LINK, texts.STALE, texts.NOT_ALLOWED, texts.stats_text(1, 2, 3),
-        texts.more_screen(__import__("app.models", fromlist=["ClipSettings"]).ClipSettings()),
+        texts.BAD_LINK, texts.STALE, texts.NOT_ALLOWED, texts.stats_text(1, 2, 3), texts.trends_home(),
+        texts.BUSY, texts.CANCELLED, texts.FILE_TOO_BIG, texts.NOT_A_VIDEO,
     ]  # fmt: skip
     for screen in screens:
         plain = re.sub(r"<[^>]+>", "", screen)  # теги вроде </blockquote> — не команды
         assert not command.search(plain), screen
 
 
-async def test_unknown_command_and_noise_lead_to_the_menu(harness):
-    await harness.send("/whatever")
-
-    assert "ClipBanner" in harness.session.last_text()
-    assert "ask:link" in harness.session.buttons()
-
-
-async def test_text_on_the_settings_screen_nudges_to_the_buttons(harness, monkeypatch):
-    await _open_settings(harness, monkeypatch)
-    await harness.send("привет")
-
-    assert harness.session.last_text() == texts.NUDGE
-    assert "ask:link" in harness.session.buttons()
+def test_main_menu_texts_use_only_documented_rich_tags():
+    for screen in (texts.START, texts.HELP, texts.REQUEST_LINK, texts.REQUEST_QUERY, texts.REQUEST_FILE, texts.BAD_LINK,
+                   texts.QUEUED_TEXT, texts.NUDGE, texts.BUSY, texts.CANCELLED, texts.stats_text(1, 2, 3), texts.trends_home()):  # fmt: skip
+        assert_valid_rich(screen)
 
 
-async def test_fresh_user_can_just_send_a_title_without_start(harness, monkeypatch):
-    """После перезапуска бота состояние пустое — название всё равно уходит в поиск."""
-    calls: list[str] = []
-    monkeypatch.setattr(source_handlers, "search_videos", lambda query, limit=5: calls.append(query) or [])
-
-    await harness.send("интервью дурова")
-
-    assert calls == ["интервью дурова"]
-
-
-async def test_menu_settings_without_a_video_asks_for_one(harness):
-    await harness.send("/start")
-    await harness.press("screen:settings")
-
-    assert harness.session.last_alert() == texts.NEED_VIDEO
-
-
-async def test_stale_button_returns_to_the_menu(harness):
-    await harness.press("pick:3")
-
-    assert harness.session.last_alert() == texts.STALE
-    assert harness.session.last_text() == texts.START
-
-
-async def test_every_menu_button_has_a_handler(harness):
-    await harness.send("/start")
-    for data in list(harness.session.buttons()):
-        await harness.press(data)
-        assert texts.STALE not in harness.session.alerts(), data
-        await harness.send("/start")
-
-
-async def test_every_settings_button_has_a_handler(harness, monkeypatch):
-    await _open_settings(harness, monkeypatch)
-    for data in list(harness.session.buttons()):
-        if data == "job:start":
-            continue  # запуск настоящей нарезки проверяют отдельные тесты
-        await harness.press(data)
-        assert texts.STALE not in harness.session.alerts(), data
-        await harness.press("screen:settings")
+def test_the_brand_is_renamed_everywhere_in_the_user_interface():
+    assert texts.NAME == "TgRader Clipper"
+    for screen in (texts.START, texts.HELP):
+        assert "ClipBanner" not in screen
 
 
 # ---------- цвета и размеры кнопок ----------
 
 
-def _all_keyboards(banners):
+def _all_keyboards(harness):
+    from app.bot.steppers import STEPPERS
     from app.models import Draft
 
     draft = Draft(title="Тест", duration=60)
-    settings = draft.settings
+    banner = harness.ctx.banner()
     yield keyboards.main_menu()
     yield keyboards.back_to_menu()
     yield keyboards.cancel_only()
     yield keyboards.search_results([dict(VIDEO), dict(VIDEO)])
-    yield keyboards.settings_screen(draft, "TGrader", None)
-    yield keyboards.more_settings(settings)
-    yield keyboards.trim_screen(settings)
-    yield keyboards.banner_picker(banners, (banners[0].id,))
-    yield keyboards.banner_picker(banners, (), with_draft=False)
+    yield keyboards.mode_picker()
+    for goal in Goal:
+        yield keyboards.auto_screen(goal, 7)
+    yield keyboards.manual_screen(draft, banner_available=True)
+    yield keyboards.manual_screen(draft, banner_available=False)
+    yield keyboards.more_settings(draft.settings)
+    yield keyboards.trim_screen(draft.settings)
+    yield keyboards.banners_screen(banner.name)
+    yield keyboards.banners_screen(None)
+    yield keyboards.trends_home()
+    yield keyboards.trend_results(TRENDING)
+    yield keyboards.trends_retry("podcast")
     yield keyboards.running("abc123")
     yield keyboards.done()
-    from app.bot.steppers import STEPPERS
-
     for stepper in STEPPERS.values():
         yield keyboards.stepper_screen(stepper, stepper.presets[0])
+    from app.bot.options import CHOICES
+
+    for field in CHOICES:
+        yield keyboards.choice_screen(field, getattr(draft.settings, field))
 
 
 def test_button_styles_and_callback_sizes_are_valid(harness):
-    banners = harness.ctx.banners()
-    for markup in _all_keyboards(banners):
+    for markup in _all_keyboards(harness):
         for row in markup.inline_keyboard:
             assert 1 <= len(row) <= 8
             for button in row:
                 assert button.style in (None, "primary", "success", "danger"), button
                 assert len(button.callback_data.encode()) <= 64, button.callback_data
+                assert 0 < len(button.text) <= 64, button.text
 
 
-def test_button_colors_follow_their_meaning():
+def test_button_colors_follow_their_meaning(harness):
     from app.models import Draft
 
     def styles(markup):
         return {button.callback_data: button.style for row in markup.inline_keyboard for button in row}
 
-    assert styles(keyboards.settings_screen(Draft(title="t", duration=60), "b", None))["job:start"] == "success"
+    manual = styles(keyboards.manual_screen(Draft(title="t", duration=60), banner_available=True))
+    assert manual["job:start"] == "success"
+    assert styles(keyboards.auto_screen(Goal.TIKTOK, 3))["job:start"] == "success"
+    assert styles(keyboards.auto_screen(Goal.TIKTOK, 3))["goal:tiktok"] == "primary"
     assert styles(keyboards.running("x"))["job:cancel:x"] == "danger"
     assert styles(keyboards.main_menu())["ask:link"] == "primary"
+    assert styles(keyboards.mode_picker())["mode:auto"] == "primary"
 
 
-# ---------- регрессии: найденные при переделке ошибки ----------
+def test_clip_counts_are_declined_in_russian():
+    words = {n: keyboards._clips_word(n) for n in (1, 2, 4, 5, 11, 12, 21, 22, 25, 101, 111)}  # noqa: SLF001
+    assert words == {1: "клип", 2: "клипа", 4: "клипа", 5: "клипов", 11: "клипов", 12: "клипов", 21: "клип",
+                     22: "клипа", 25: "клипов", 101: "клип", 111: "клипов"}  # fmt: skip
 
 
-async def test_static_banner_can_be_switched_on_from_settings(harness, monkeypatch):
-    """Раньше `static:on` перехватывал соседний хэндлер выбора баннера, и кнопка молчала."""
-    await _open_settings(harness, monkeypatch)
-    assert "постоянный: выключен" in harness.session.last_text()
-
-    await harness.press("static:on")
-
-    assert "постоянный: выключен" not in harness.session.last_text()
-    assert (await get_draft(_fsm(harness))).settings.static_banner_id
-    await harness.press("static:off")
-    assert (await get_draft(_fsm(harness))).settings.static_banner_id is None
+async def test_every_manual_button_has_a_handler(harness, monkeypatch):
+    await _open_manual(harness, monkeypatch)
+    for data in list(harness.session.buttons()):
+        if data in ("job:start", "screen:menu"):
+            continue  # запуск настоящей нарезки проверяют отдельные тесты
+        await harness.press(data)
+        assert texts.STALE not in harness.session.alerts(), data
+        await harness.press("screen:manual")
 
 
-async def test_choosing_a_strip_in_the_catalog_sets_the_static_banner(harness, monkeypatch):
-    await _open_settings(harness, monkeypatch)
-    strip = next(banner for banner in harness.ctx.banners() if banner.role == "strip")
-
-    await harness.press(f"banner:{strip.id}")
-
-    settings = (await get_draft(_fsm(harness))).settings
-    assert settings.static_banner_id == strip.id
-
-
-async def test_banner_catalog_works_without_a_video_and_remembers_the_choice(harness):
-    popup = next(banner for banner in harness.ctx.banners() if banner.role == "popup" and banner.kind != "default")
-    await harness.send("/start")
-    await harness.press("screen:banners")
-    assert f"banner:{popup.id}" in harness.session.buttons()
-
-    await harness.press(f"banner:{popup.id}")
-
-    assert harness.ctx.store.settings(1).banner_id == popup.id
-    assert "Баннеры" in harness.session.last_text()  # остались в каталоге
-
-
-async def test_link_is_accepted_right_after_a_finished_job(harness, monkeypatch):
-    """Состояние «идёт нарезка» не сбрасывалось само — следующая ссылка терялась без ответа."""
-    monkeypatch.setattr(source_handlers, "fetch_video_info", lambda url: dict(VIDEO))
-    await _fsm(harness).set_state("Flow:running")
-
-    await harness.send(VIDEO["url"])
-
-    assert "Тестовый ролик" in harness.session.last_text()
-
-
-async def test_unchanged_screen_is_not_sent_twice(harness, monkeypatch):
-    """«message is not modified» — не повод слать копию экрана новым сообщением."""
-    from aiogram.exceptions import TelegramBadRequest
-
-    await _open_settings(harness, monkeypatch)
-    await harness.press("edit:num_clips")
-    sent_before = len(harness.session.calls("sendMessage"))
-
-    def not_modified(method, bot):
-        raise TelegramBadRequest(method=method, message="Bad Request: message is not modified")
-
-    harness.session.handlers["editMessageText"] = not_modified
-    await harness.press("set:num_clips:5")
-
-    assert len(harness.session.calls("sendMessage")) == sent_before
-
-
-async def test_banner_video_without_a_file_name_is_accepted():
-    from app.bot.handlers.banners import _banner_media
-
-    class Video:
-        file_unique_id = "abc"
-        file_name = None
-
-    class Msg:
-        photo = None
-        document = None
-        animation = None
-        video = Video()
-
-    media, name = _banner_media(Msg())
-    assert media is not None
-    assert name.endswith(".mp4")
+async def test_every_auto_button_has_a_handler(harness, monkeypatch):
+    await _open_auto(harness, monkeypatch)
+    for data in list(harness.session.buttons()):
+        if data == "job:start":
+            continue
+        await harness.press(data)
+        assert texts.STALE not in harness.session.alerts(), data
+        await harness.press("mode:auto")
 
 
 # ---------- доступ, профиль бота ----------
@@ -720,16 +1306,40 @@ async def test_private_bot_turns_strangers_away_and_tells_them_their_id(bot_sett
         assert fake.session.last_alert() == "Закрытый бот"
 
         await fake.send("/start", user_id=42)
-        assert "ClipBanner" in fake.session.last_text()
+        assert "TgRader Clipper" in fake.session.last_text()
     finally:
         await fake.close()
 
 
-async def test_prepare_bot_removes_the_command_menu(harness):
+async def test_prepare_bot_removes_the_command_menu_and_names_the_bot(harness):
     from app.bot.app import prepare_bot
 
     await prepare_bot(harness.bot)
 
     assert harness.session.calls("deleteMyCommands")
     assert not harness.session.calls("setMyCommands")
+    description = harness.session.calls("setMyDescription")[-1].description
+    assert "TgRader Clipper" in description and "ClipBanner" not in description
+
+
+async def test_bot_is_renamed_once_and_left_alone_when_the_name_is_right(harness):
+    from app.bot.app import prepare_bot
+
+    await prepare_bot(harness.bot)
+    assert harness.session.bot_name == "TgRader Clipper"
+    assert len(harness.session.calls("setMyName")) == 1
+
+    await prepare_bot(harness.bot)  # имя уже верное — Telegram лишний раз не беспокоим
+    assert len(harness.session.calls("setMyName")) == 1
+
+
+async def test_a_failed_rename_does_not_stop_the_rest_of_the_profile_setup(harness):
+    from app.bot.app import prepare_bot
+
+    def refuse(method, bot):
+        raise TelegramBadRequest(method=method, message="Bad Request: too many name changes")
+
+    harness.session.handlers["setMyName"] = refuse
+    await prepare_bot(harness.bot)
+
     assert harness.session.calls("setMyDescription")

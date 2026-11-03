@@ -15,10 +15,19 @@ from aiogram.types import BotCommandScopeAllPrivateChats, ErrorEvent, MenuButton
 from app.bot import texts
 from app.bot.access import AccessMiddleware, allowed_users_from_env
 from app.bot.context import AppContext
-from app.bot.handlers import banners, common, fallback, jobs, settings_screen, source
+from app.bot.handlers import (
+    banners,
+    common,
+    fallback,
+    jobs,
+    modes,
+    settings_screen,
+    source,
+    trends,
+)
 from app.bot.runner import JobRunner
 from app.config import Settings
-from app.services.banner_manager import ensure_default_banner, ensure_presets, ensure_sfx, ensure_strip_presets
+from app.services.banner_manager import ensure_default_banner, ensure_sfx
 from app.services.janitor import max_age_days_from_env, sweep_forever
 from app.services.jobs import JobManager
 from app.services.user_store import UserStore
@@ -30,10 +39,11 @@ PROXY_ENV = "TELEGRAM_PROXY"
 
 # Что видно в пустом чате до первого нажатия «Старт» (команд у бота нет — только кнопки).
 BOT_DESCRIPTION = (
-    "Нарезаю YouTube-ролики на вертикальные клипы 9:16 и вклеиваю рекламный баннер.\n"
+    "TgRader Clipper нарезает YouTube-ролики на вертикальные клипы 9:16 для TikTok и Shorts "
+    "и вклеивает рекламный баннер.\n"
     "Нажмите «Старт» и пришлите ссылку — всё остальное кнопками."
 )
-BOT_SHORT_DESCRIPTION = "Нарезка YouTube на вертикальные клипы с баннером"
+BOT_SHORT_DESCRIPTION = "Нарезка YouTube на клипы для TikTok и Shorts"
 
 
 def token_from_env() -> str:
@@ -105,12 +115,14 @@ def build_dispatcher(ctx: AppContext | None = None, allowed_users: frozenset[int
         dispatcher.message.outer_middleware(access)
         dispatcher.callback_query.outer_middleware(access)
     dispatcher.errors.register(_on_error)
-    # Порядок важен: баннеры идут раньше приёма видео, иначе «пришлите свой баннер» перехватит
-    # общий обработчик видеофайлов и сохранит картинку как источник клипа. Запасной роутер — последний.
+    # Порядок важен: общий роутер первым — он ловит «/…» и «В начало» и сбрасывает диалог раньше всех;
+    # приём источника — раньше настроек (ссылка важнее числа); запасной роутер — самым последним.
     for router in (
         common.router,
         banners.router,
+        trends.router,
         source.router,
+        modes.router,
         settings_screen.router,
         jobs.router,
         fallback.router,
@@ -128,8 +140,6 @@ def build_app(
     """
     settings = settings or Settings.default()
     settings.ensure_dirs()
-    ensure_presets(settings.banners_dir)
-    ensure_strip_presets(settings.banners_dir)  # без полос «постоянный баннер» нечем включить
     ensure_default_banner(settings.banners_dir)
     ensure_sfx(settings.sfx_dir)
 
@@ -140,7 +150,13 @@ def build_app(
 
 
 async def prepare_bot(bot: Bot) -> None:
-    """Убирает меню команд (интерфейс — только кнопки) и задаёт описание пустого чата."""
+    """Задаёт имя бота, убирает меню команд (интерфейс — только кнопки) и пишет описание пустого чата."""
+    try:
+        # Имя меняем только если оно другое: лишние запросы Telegram считает за частые правки.
+        if (await bot.get_my_name()).name != texts.NAME:
+            await bot.set_my_name(texts.NAME)
+    except Exception:  # noqa: BLE001 — косметика: бот работает и с прежним именем
+        log.warning("Не удалось обновить имя бота", exc_info=True)
     try:
         await bot.delete_my_commands()
         await bot.delete_my_commands(scope=BotCommandScopeAllPrivateChats())

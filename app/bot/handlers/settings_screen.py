@@ -1,11 +1,9 @@
-"""Экран настроек: кнопки-значения, «Ещё», обрезка и выбор чисел (пресеты, «−/+», свой ввод)."""
+"""Ручная настройка: экран со сводкой, выбор из вариантов, края ролика и ввод чисел (пресеты, «−/+», свой ввод)."""
 from __future__ import annotations
 
 import logging
 import re
 from collections.abc import Callable
-from enum import Enum
-from typing import Any
 
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
@@ -23,102 +21,93 @@ from app.bot.context import (
     safe_answer,
     update_settings,
 )
+from app.bot.options import CHOICES
 from app.bot.states import Flow
 from app.bot.steppers import STEPPERS
-from app.models import BannerMode, BannerPosition, FrameMode, SlicingMode, StaticPosition
 
 log = logging.getLogger(__name__)
 router = Router(name="settings")
-
-BANNER_COUNT_STEPS = (0, 1, 2, 3, 4, 5)
-BANNER_DURATION_STEPS = (1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 7.0, 10.0, 15.0, 20.0)
-BANNER_SCALE_STEPS = (50, 60, 70, 75, 80, 85, 90, 95)
-STATIC_SCALE_STEPS = (40, 50, 60, 70, 80, 85, 90, 95, 100)
-MAX_HEIGHT_STEPS = (360, 480, 720, 1080, 1440, 2160)
-
-
-def next_value(steps: tuple, current: Any) -> Any:
-    """Следующее значение по кругу. Если текущего в списке нет — ближайшее большее (или первое)."""
-    try:
-        index = steps.index(current)
-    except ValueError:
-        greater = [value for value in steps if value > current]
-        return greater[0] if greater else steps[0]
-    return steps[(index + 1) % len(steps)]
-
-
-def next_member(enum_type: type[Enum], current: Enum) -> Enum:
-    values = list(enum_type)
-    return values[(values.index(current) + 1) % len(values)]
 
 
 # ---------- отрисовка экранов ----------
 
 
-async def render_settings(event: Message | CallbackQuery, state: FSMContext, ctx: AppContext) -> None:
+async def _back_to_menu(event: Message | CallbackQuery, state: FSMContext, ctx: AppContext) -> None:
+    from app.bot.handlers.common import open_menu
+
+    await open_menu(event, state, ctx)
+
+
+async def render_manual(event: Message | CallbackQuery, state: FSMContext, ctx: AppContext) -> None:
     draft = await get_draft(state)
     if draft is None:
-        from app.bot.handlers.common import open_menu
-
-        await open_menu(event, state, ctx)
+        await _back_to_menu(event, state, ctx)
         return
     await clear_input(state)
     await state.set_state(Flow.editing)
-    banner_name = ctx.banner_name(draft.settings.banner_id)
-    static_name = ctx.banner_name(draft.settings.static_banner_id)
     await edit_or_send(
         event,
-        texts.settings_screen(draft, banner_name, static_name),
-        keyboards.settings_screen(draft, banner_name, static_name),
+        texts.manual_screen(draft, ctx.banner_seconds()),
+        keyboards.manual_screen(draft, banner_available=ctx.banner() is not None),
     )
 
 
 async def render_more(event: CallbackQuery | Message, state: FSMContext, ctx: AppContext) -> None:
     draft = await get_draft(state)
     if draft is None:
-        return await render_settings(event, state, ctx)
+        return await _back_to_menu(event, state, ctx)
     await edit_or_send(event, texts.more_screen(draft.settings), keyboards.more_settings(draft.settings))
 
 
 async def render_trim(event: CallbackQuery | Message, state: FSMContext, ctx: AppContext) -> None:
     draft = await get_draft(state)
     if draft is None:
-        return await render_settings(event, state, ctx)
+        return await _back_to_menu(event, state, ctx)
     await edit_or_send(event, texts.trim_screen(draft.settings), keyboards.trim_screen(draft.settings))
 
 
 async def render_stepper(event: CallbackQuery | Message, state: FSMContext, ctx: AppContext, field: str) -> None:
     draft = await get_draft(state)
     if draft is None:
-        return await render_settings(event, state, ctx)
+        return await _back_to_menu(event, state, ctx)
     stepper = STEPPERS[field]
     value = getattr(draft.settings, field)
     await edit_or_send(event, texts.stepper_screen(stepper, value), keyboards.stepper_screen(stepper, value))
 
 
+async def render_choice(event: CallbackQuery | Message, state: FSMContext, ctx: AppContext, field: str) -> None:
+    draft = await get_draft(state)
+    if draft is None:
+        return await _back_to_menu(event, state, ctx)
+    current = getattr(draft.settings, field)
+    await edit_or_send(event, texts.choice_screen(field, current), keyboards.choice_screen(field, current))
+
+
 _RENDERERS: dict[str, Callable] = {
-    "settings": render_settings,
+    "manual": render_manual,
     "more": render_more,
     "trim": render_trim,
 }
 
 
 async def render_screen(event, state: FSMContext, ctx: AppContext, name: str) -> None:
-    """Экран по короткому имени из callback_data (`settings`, `more`, `trim`)."""
-    await _RENDERERS.get(name, render_settings)(event, state, ctx)
+    """Экран по короткому имени из callback_data (`manual`, `more`, `trim`)."""
+    await _RENDERERS.get(name, render_manual)(event, state, ctx)
 
 
-@router.callback_query(F.data == "screen:settings")
-async def cb_settings(callback: CallbackQuery, state: FSMContext, ctx: AppContext) -> None:
+@router.callback_query(F.data == "screen:manual")
+async def cb_manual(callback: CallbackQuery, state: FSMContext, ctx: AppContext) -> None:
     if await get_draft(state) is None:
         await safe_answer(callback, texts.NEED_VIDEO, alert=True)
         return
     await safe_answer(callback)
-    await render_settings(callback, state, ctx)
+    await render_manual(callback, state, ctx)
 
 
 @router.callback_query(F.data == "screen:more")
 async def cb_more(callback: CallbackQuery, state: FSMContext, ctx: AppContext) -> None:
+    if await need_draft(callback, state) is None:
+        return
     await safe_answer(callback)
     await clear_input(state)
     await render_more(callback, state, ctx)
@@ -126,73 +115,54 @@ async def cb_more(callback: CallbackQuery, state: FSMContext, ctx: AppContext) -
 
 @router.callback_query(F.data == "screen:trim")
 async def cb_trim(callback: CallbackQuery, state: FSMContext, ctx: AppContext) -> None:
+    if await need_draft(callback, state) is None:
+        return
     await safe_answer(callback)
     await clear_input(state)
     await render_trim(callback, state, ctx)
 
 
-# ---------- значения «по кругу» ----------
-
-_ENUM_CYCLES: dict[str, tuple[type[Enum], Callable[[Any], str]]] = {
-    "slicing_mode": (
-        SlicingMode,
-        lambda v: "Раскладка: " + {SlicingMode.EVENLY_SPACED: "равномерно по всему ролику", SlicingMode.SEQUENTIAL: "подряд с самого начала"}[v],
-    ),
-    "frame_mode": (
-        FrameMode,
-        lambda v: "Кадр: " + {
-            FrameMode.BLUR_PAD: "вертикальный, на размытом фоне",
-            FrameMode.CENTER_CROP: "вертикальный кроп по центру",
-            FrameMode.ORIGINAL: "горизонтальный 16:9 без обрезки",
-        }[v],
-    ),
-    "banner_mode": (
-        BannerMode,
-        lambda v: "Видео замирает, поверх баннер" if v is BannerMode.FREEZE else "Баннер поверх идущего видео",
-    ),
-    "banner_position": (BannerPosition, lambda v: f"Позиция: {texts.POSITION_LABELS[v]}"),
-    "static_position": (StaticPosition, lambda v: f"Постоянный баннер: {texts.STATIC_POSITION_LABELS[v]}"),
-}
-
-_STEP_CYCLES: dict[str, tuple[tuple, Callable[[Any], str]]] = {
-    "banner_count": (BANNER_COUNT_STEPS, lambda v: "Баннер выключен" if v == 0 else f"Показов на клип: {v}"),
-    "banner_duration": (BANNER_DURATION_STEPS, lambda v: f"Пауза под баннер: {v:g} с"),
-    "banner_scale": (BANNER_SCALE_STEPS, lambda v: f"Масштаб баннера: {v}% ширины кадра"),
-    "static_scale": (STATIC_SCALE_STEPS, lambda v: f"Масштаб полосы: {v}%"),
-    "max_height": (MAX_HEIGHT_STEPS, lambda v: f"Качество: до {v}p"),
-}
+# ---------- выбор из вариантов ----------
 
 
-@router.callback_query(F.data.startswith("cycle:"))
-async def cb_cycle(callback: CallbackQuery, state: FSMContext, ctx: AppContext) -> None:
-    field = (callback.data or "cycle:").split(":", 1)[1]
+@router.callback_query(F.data.startswith("choose:"))
+async def cb_choose(callback: CallbackQuery, state: FSMContext, ctx: AppContext) -> None:
+    field = (callback.data or "choose:").split(":", 1)[1]
+    if field not in CHOICES:
+        await safe_answer(callback, "Эту настройку пока нельзя изменить", alert=True)
+        return
+    if await need_draft(callback, state) is None:
+        return
+    await safe_answer(callback)
+    await clear_input(state)
+    await state.set_state(Flow.editing)
+    await render_choice(callback, state, ctx, field)
+
+
+@router.callback_query(F.data.startswith("opt:"))
+async def cb_option(callback: CallbackQuery, state: FSMContext, ctx: AppContext) -> None:
+    """`opt:<поле>:<значение>` — применяет выбранный вариант и возвращает на экран, откуда пришли."""
+    parts = (callback.data or "").split(":", 2)
+    choice = CHOICES.get(parts[1]) if len(parts) == 3 else None
+    if choice is None or not choice.has(parts[2]):
+        await safe_answer(callback, "Этого варианта больше нет — выберите из кнопок", alert=True)
+        return
     draft = await need_draft(callback, state)
     if draft is None:
         return
-    settings = draft.settings
-    if field == "banner_state":  # баннер выключен → включаем с одним показом на клип
-        changes, toast = {"banner_count": 1}, "Баннер включён"
-    elif field in _ENUM_CYCLES:
-        enum_type, describe = _ENUM_CYCLES[field]
-        value = next_member(enum_type, getattr(settings, field))
-        changes, toast = {field: value}, describe(value)
-    elif field in _STEP_CYCLES:
-        steps, describe = _STEP_CYCLES[field]
-        value = next_value(steps, getattr(settings, field))
-        changes, toast = {field: value}, describe(value)
-    else:
-        await safe_answer(callback)
-        return
-    draft.settings = update_settings(settings, **changes)
+    value: object = int(parts[2]) if parts[2].isdigit() else parts[2]
+    draft.settings = update_settings(draft.settings, **{choice.field: value})
     await put_draft(state, draft)
-    await safe_answer(callback, toast)
-    await render_screen(callback, state, ctx, "more" if field == "max_height" else "settings")
+    await safe_answer(callback, f"{choice.option(parts[2]).label}")
+    await render_screen(callback, state, ctx, "more" if choice.back == "screen:more" else "manual")
 
+
+# ---------- переключатели ----------
 
 _TOGGLES = {
     "auto_trim": ("Автообрезка включена", "Автообрезка выключена"),
     "banner_sound": ("Звук баннера включён", "Звук баннера выключен"),
-    "enable_sfx": ("Звук появления включён", "Звук появления выключен"),
+    "enable_sfx": ("Сигнал перед баннером включён", "Сигнал перед баннером выключен"),
 }
 
 
@@ -201,48 +171,27 @@ async def cb_toggle(callback: CallbackQuery, state: FSMContext, ctx: AppContext)
     """`toggle:<поле>[:<экран>]` — экран подсказывает, куда вернуться после переключения."""
     parts = (callback.data or "").split(":")
     field = parts[1] if len(parts) > 1 else ""
-    screen = parts[2] if len(parts) > 2 else "settings"
-    if field not in _TOGGLES:
+    screen = parts[2] if len(parts) > 2 else "manual"
+    if field != "banner" and field not in _TOGGLES:
         await safe_answer(callback)
         return
     draft = await need_draft(callback, state)
     if draft is None:
         return
-    value = not getattr(draft.settings, field)
-    draft.settings = update_settings(draft.settings, **{field: value})
+    if field == "banner":  # баннер — это «ноль показов» или больше; включаем с одним показом на клип
+        if ctx.banner() is None:
+            await safe_answer(callback, "Файла баннера нет", alert=True)
+            return
+        enable = draft.settings.banner_count == 0
+        draft.settings = update_settings(draft.settings, banner_count=1 if enable else 0)
+        toast = "Баннер включён" if enable else "Баннер выключен"
+    else:
+        value = not getattr(draft.settings, field)
+        draft.settings = update_settings(draft.settings, **{field: value})
+        toast = _TOGGLES[field][0 if value else 1]
     await put_draft(state, draft)
-    await safe_answer(callback, _TOGGLES[field][0 if value else 1])
+    await safe_answer(callback, toast)
     await render_screen(callback, state, ctx, screen)
-
-
-# ---------- постоянный баннер ----------
-
-
-@router.callback_query(F.data == "static:on")
-async def cb_static_on(callback: CallbackQuery, state: FSMContext, ctx: AppContext) -> None:
-    """Включает постоянный баннер первой найденной полосой; другую можно выбрать в «Баннерах»."""
-    draft = await need_draft(callback, state)
-    if draft is None:
-        return
-    strips = [banner for banner in ctx.banners() if banner.role == "strip"]
-    if not strips:
-        await safe_answer(callback, "Полос для постоянного баннера нет — загрузите свою картинку", alert=True)
-        return
-    draft.settings = update_settings(draft.settings, static_banner_id=strips[0].id)
-    await put_draft(state, draft)
-    await safe_answer(callback, f"Постоянный баннер: {strips[0].name}")
-    await render_settings(callback, state, ctx)
-
-
-@router.callback_query(F.data == "static:off")
-async def cb_static_off(callback: CallbackQuery, state: FSMContext, ctx: AppContext) -> None:
-    draft = await need_draft(callback, state)
-    if draft is None:
-        return
-    draft.settings = update_settings(draft.settings, static_banner_id=None)
-    await put_draft(state, draft)
-    await safe_answer(callback, "Постоянный баннер убран")
-    await render_settings(callback, state, ctx)
 
 
 # ---------- числа: пресеты, «−/+», свой ввод ----------
@@ -323,30 +272,30 @@ async def _has_pending_input(message: Message, state: FSMContext) -> bool:
 @router.message(_has_pending_input, F.text)
 async def on_number(message: Message, state: FSMContext, ctx: AppContext) -> None:
     """Принимает число для поля, выбранного кнопкой «Ввести своё число»."""
+    from app.bot.context import show
+
     field = (await state.get_data()).get(INPUT_KEY)
     stepper = STEPPERS.get(field)
     draft = await get_draft(state)
     if stepper is None or draft is None:
         await clear_input(state)
-        from app.bot.handlers.common import open_menu
-
-        await open_menu(message, state, ctx)
+        await _back_to_menu(message, state, ctx)
         return
     cancel = keyboards.cancel_only(f"edit:{field}")
     text = (message.text or "").strip()
     if not _NUMBER.match(text):
-        await message.answer(texts.stepper_invalid(stepper), reply_markup=cancel)
+        await show(message, texts.stepper_invalid(stepper), cancel)
         return
     value = float(text.replace(",", "."))
     if not stepper.valid(value):
-        await message.answer(texts.stepper_invalid(stepper, value), reply_markup=cancel)
+        await show(message, texts.stepper_invalid(stepper, value), cancel)
         return
     try:
         draft.settings = update_settings(draft.settings, **{field: value})
     except ValueError:
         # Сообщение pydantic пользователю не показываем: там английский текст и служебные детали.
         log.warning("Настройка %s не приняла значение %r", field, value)
-        await message.answer(texts.stepper_invalid(stepper, value), reply_markup=cancel)
+        await show(message, texts.stepper_invalid(stepper, value), cancel)
         return
     await put_draft(state, draft)
     await clear_input(state)

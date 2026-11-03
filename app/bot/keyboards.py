@@ -6,6 +6,9 @@
 • красный (`danger`)  — остановить или убрать.
 Остальное остаётся нейтральным — так цветные кнопки действительно бросаются в глаза.
 
+Правило подписей: кнопка настройки показывает её название и текущее значение («🖼 Кадр: 9:16, размытый фон»),
+а нажатие открывает выбор — так видно и что меняется, и на что.
+
 callback_data короче 64 байт — это требование Telegram.
 """
 from __future__ import annotations
@@ -15,19 +18,21 @@ from aiogram.types import InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from app.bot import texts
+from app.bot.options import CHOICES
 from app.bot.steppers import Stepper
+from app.models import ClipSettings, Draft, Goal
+from app.services.autoplan import GOALS
+from app.services.trends import CATEGORIES
 
 PRIMARY = ButtonStyle.PRIMARY.value
 SUCCESS = ButtonStyle.SUCCESS.value
 DANGER = ButtonStyle.DANGER.value
 
+MENU = "screen:menu"
+
 
 def _add(builder: InlineKeyboardBuilder, text: str, data: str, style: str | None = None) -> None:
     builder.button(text=text, callback_data=data, style=style)
-
-
-def _mark(on: bool) -> str:
-    return "✅" if on else "⬜"
 
 
 # ---------- главное меню и навигация ----------
@@ -38,8 +43,8 @@ def main_menu() -> InlineKeyboardMarkup:
     _add(builder, "🔗 Прислать ссылку", "ask:link", PRIMARY)
     _add(builder, "🔍 Найти по названию", "ask:query")
     _add(builder, "📁 Загрузить файл", "ask:file")
+    _add(builder, "🔥 В тренде", "screen:trends")
     _add(builder, "🎬 Баннеры", "screen:banners")
-    _add(builder, "⚙️ Настройки", "screen:settings")
     _add(builder, "📊 Статистика", "screen:stats")
     _add(builder, "❓ Справка", "screen:help")
     builder.adjust(1, 2, 2, 2)
@@ -48,86 +53,122 @@ def main_menu() -> InlineKeyboardMarkup:
 
 def back_to_menu() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    _add(builder, "🏠 В начало", "screen:menu")
+    _add(builder, "🏠 В начало", MENU)
     return builder.as_markup()
 
 
-def cancel_only(back: str = "screen:settings") -> InlineKeyboardMarkup:
+def cancel_only(back: str = "screen:manual") -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     _add(builder, "✖️ Отмена", back, DANGER)
     return builder.as_markup()
 
 
-def search_results(entries: list[dict]) -> InlineKeyboardMarkup:
-    """Список найденных роликов: по кнопке на строку."""
+def search_results(
+    entries: list[dict],
+    *,
+    again: tuple[str, str] = ("🔄 Искать другое", "ask:query"),
+    back: tuple[str, str] = ("🏠 В начало", MENU),
+) -> InlineKeyboardMarkup:
+    """Список найденных роликов: по кнопке на строку и два пути назад."""
     builder = InlineKeyboardBuilder()
     for index, entry in enumerate(entries):
         title = entry.get("title") or "Без названия"
-        if len(title) > 44:
-            title = title[:43] + "…"
+        if len(title) > 40:
+            title = title[:39] + "…"
         minutes = texts.duration_text(entry.get("duration") or 0)
         _add(builder, f"{index + 1}. {title} · {minutes}", f"pick:{index}", PRIMARY if index == 0 else None)
-    _add(builder, "🔄 Искать другое", "ask:query")
-    _add(builder, "🏠 В начало", "screen:menu")
+    _add(builder, *again)
+    _add(builder, *back)
     builder.adjust(*([1] * len(entries)), 2)
     return builder.as_markup()
 
 
-# ---------- экран настроек ----------
+# ---------- режим нарезки ----------
 
 
-def _trim_label(s) -> str:
+def mode_picker() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    _add(builder, "🤖 Авто — подберу сам", "mode:auto", PRIMARY)
+    _add(builder, "🛠 Вручную — настрою сам", "mode:manual")
+    _add(builder, "🏠 В начало", MENU)
+    builder.adjust(1, 1, 1)
+    return builder.as_markup()
+
+
+def auto_screen(goal: Goal, clips: int) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    for candidate, spec in GOALS.items():
+        selected = candidate is goal
+        name = {"tiktok": "TikTok", "shorts": "Shorts", "universal": "Универсально"}[candidate.value]
+        _add(builder, f"{'● ' if selected else ''}{spec.emoji} {name}", f"goal:{candidate.value}", PRIMARY if selected else None)
+    _add(builder, f"🚀 Нарезать {clips} {_clips_word(clips)}", "job:start", SUCCESS)
+    _add(builder, "🛠 Подправить вручную", "mode:manual")
+    _add(builder, "⬅️ Назад", "screen:mode")
+    builder.adjust(2, 1, 1, 1, 1)
+    return builder.as_markup()
+
+
+def _clips_word(count: int) -> str:
+    """1 клип, 2–4 клипа, 5+ клипов."""
+    if count % 100 in range(11, 15):
+        return "клипов"
+    return {1: "клип", 2: "клипа", 3: "клипа", 4: "клипа"}.get(count % 10, "клипов")
+
+
+# ---------- ручная настройка ----------
+
+
+def _trim_caption(s: ClipSettings) -> str:
     if s.auto_trim:
-        return "✂️ Обрезка: авто"
+        return "✂️ Края ролика: авто"
     if s.start_offset or s.end_offset:
-        return f"✂️ Обрезка: −{s.start_offset:g}/−{s.end_offset:g} с"
-    return "✂️ Обрезка: нет"
+        return f"✂️ Края ролика: −{s.start_offset:g} / −{s.end_offset:g} с"
+    return "✂️ Края ролика: целиком"
 
 
-def settings_screen(draft, banner_name: str | None, static_name: str | None) -> InlineKeyboardMarkup:
-    """Экран настроек: каждая кнопка показывает текущее значение; нажатие меняет его или открывает выбор."""
+def manual_screen(draft: Draft, *, banner_available: bool) -> InlineKeyboardMarkup:
+    """Ручная настройка: каждая кнопка называет настройку и показывает её значение; нажатие открывает выбор."""
     s = draft.settings
     builder = InlineKeyboardBuilder()
     rows: list[int] = []
 
     _add(builder, f"🔢 Клипов: {s.num_clips}", "edit:num_clips")
-    _add(builder, f"⏱ Длительность: {s.clip_duration:g} с", "edit:clip_duration")
-    _add(builder, f"📐 {texts.SLICING_LABELS[s.slicing_mode].capitalize()}", "cycle:slicing_mode")
-    _add(builder, f"🖼 {texts.FRAME_LABELS[s.frame_mode]}", "cycle:frame_mode")
-    _add(builder, _trim_label(s), "screen:trim")
-    rows += [2, 2, 1]
+    _add(builder, f"⏱ Длина: {s.clip_duration:g} с", "edit:clip_duration")
+    _add(builder, CHOICES["slicing_mode"].caption(s.slicing_mode), "choose:slicing_mode")
+    _add(builder, CHOICES["frame_mode"].caption(s.frame_mode), "choose:frame_mode")
+    _add(builder, _trim_caption(s), "screen:trim")
+    rows += [2, 1, 1, 1]
 
-    if s.banner_count == 0:
-        _add(builder, "🎬 Баннер: выключен", "cycle:banner_state")
-        rows += [1]
-    else:
-        _add(builder, f"🎬 {banner_name or s.banner_id}", "screen:banners", PRIMARY)
-        _add(builder, f"👁 Показов: {s.banner_count}", "cycle:banner_count")
-        _add(builder, f"⏱ Пауза: {s.banner_duration:g} с", "cycle:banner_duration")
-        _add(builder, f"🎞 {texts.BANNER_MODE_LABELS[s.banner_mode].capitalize()}", "cycle:banner_mode")
-        _add(builder, f"📍 {texts.POSITION_LABELS[s.banner_position].capitalize()}", "cycle:banner_position")
-        _add(builder, f"📏 Масштаб: {s.banner_scale}%", "cycle:banner_scale")
-        _add(builder, f"{'🔊' if s.banner_sound else '🔇'} Звук баннера", "toggle:banner_sound")
-        rows += [1, 2, 2, 2]
-    _add(builder, f"🔔 Звук появления: {'вкл' if s.enable_sfx else 'выкл'}", "toggle:enable_sfx")
-    rows += [1]
+    if banner_available:
+        enabled = s.banner_count > 0
+        _add(builder, f"{'✅' if enabled else '⬜'} Баннер TGrader: {'вкл' if enabled else 'выкл'}", "toggle:banner", SUCCESS if enabled else None)
+        rows.append(1)
+        if enabled:
+            _add(builder, f"🔁 Показов: {s.banner_count}", "edit:banner_count")
+            _add(builder, f"{'🔊' if s.banner_sound else '🔇'} Звук: {'вкл' if s.banner_sound else 'выкл'}", "toggle:banner_sound")
+            _add(builder, CHOICES["banner_mode"].caption(s.banner_mode), "choose:banner_mode")
+            _add(builder, CHOICES["banner_position"].caption(s.banner_position), "choose:banner_position")
+            _add(builder, f"📏 Размер: {s.banner_scale}%", "edit:banner_scale")
+            rows += [2, 2, 1]
 
-    if s.static_banner_id:
-        _add(builder, f"📌 {static_name or s.static_banner_id}", "screen:banners", PRIMARY)
-        _add(builder, f"📌 {texts.STATIC_POSITION_LABELS[s.static_position].capitalize()}", "cycle:static_position")
-        _add(builder, f"📌 Масштаб: {s.static_scale}%", "cycle:static_scale")
-        _add(builder, "🗑 Убрать", "static:off", DANGER)
-        rows += [1, 2, 1]
-    else:
-        _add(builder, "📌 Постоянный баннер: выкл", "static:on")
-        rows += [1]
-
-    _add(builder, "🧩 Ещё настройки", "screen:more")
-    _add(builder, "🚀 Нарезать", "job:start", SUCCESS)
-    _add(builder, "🏠 В начало", "screen:menu")
+    _add(builder, "⚙️ Дополнительно", "screen:more")
+    _add(builder, "🚀 Начать нарезку", "job:start", SUCCESS)
+    _add(builder, "⬅️ Назад", "screen:mode")
     rows += [1, 1, 1]
-
     builder.adjust(*rows)
+    return builder.as_markup()
+
+
+def choice_screen(field: str, current: object) -> InlineKeyboardMarkup:
+    """Выбор из вариантов: текущий отмечен ✅ и выделен цветом."""
+    choice = CHOICES[field]
+    selected = choice.option(current).value
+    builder = InlineKeyboardBuilder()
+    for option in choice.options:
+        mine = option.value == selected
+        _add(builder, f"{'✅' if mine else option.icon} {option.label}", f"opt:{field}:{option.value}", PRIMARY if mine else None)
+    _add(builder, "⬅️ Назад", choice.back)
+    builder.adjust(*([1] * (len(choice.options) + 1)))
     return builder.as_markup()
 
 
@@ -136,7 +177,7 @@ def stepper_screen(stepper: Stepper, value: float) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     for preset in stepper.presets:
         selected = preset == value
-        label = f"{preset:g}" + (f" {stepper.unit}" if stepper.unit else "")
+        label = stepper.show(preset)
         _add(builder, f"● {label}" if selected else label, f"set:{stepper.field}:{preset:g}", PRIMARY if selected else None)
     step = f"{stepper.step:g}"
     _add(builder, f"−{step}", f"step:{stepper.field}:-{step}")
@@ -152,51 +193,66 @@ def stepper_screen(stepper: Stepper, value: float) -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
-def more_settings(s) -> InlineKeyboardMarkup:
-    """«Ещё»: автообрезка, ручная обрезка, качество скачивания."""
+def more_settings(s: ClipSettings) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    _add(builder, f"{_mark(s.auto_trim)} Автообрезка", "toggle:auto_trim:more", SUCCESS if s.auto_trim else None)
-    _add(builder, f"✂️ Начало: −{s.start_offset:g} с", "edit:start_offset")
-    _add(builder, f"✂️ Конец: −{s.end_offset:g} с", "edit:end_offset")
-    _add(builder, f"📥 Качество: до {s.max_height}p", "cycle:max_height")
-    _add(builder, "⬅️ Назад", "screen:settings")
-    builder.adjust(1, 2, 1, 1)
+    _add(builder, CHOICES["max_height"].caption(s.max_height), "choose:max_height")
+    _add(builder, f"🔔 Сигнал перед баннером: {'вкл' if s.enable_sfx else 'выкл'}", "toggle:enable_sfx:more", SUCCESS if s.enable_sfx else None)
+    _add(builder, "⬅️ Назад", "screen:manual")
+    builder.adjust(1, 1, 1)
     return builder.as_markup()
 
 
-def trim_screen(s) -> InlineKeyboardMarkup:
+def trim_screen(s: ClipSettings) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    _add(builder, f"{_mark(s.auto_trim)} Автообрезка", "toggle:auto_trim:trim", SUCCESS if s.auto_trim else None)
-    _add(builder, f"➖ Начало: {s.start_offset:g} с", "edit:start_offset")
-    _add(builder, f"➖ Конец: {s.end_offset:g} с", "edit:end_offset")
-    _add(builder, "⬅️ Назад", "screen:settings")
-    builder.adjust(1, 2, 1)
+    _add(
+        builder,
+        f"{'✅' if s.auto_trim else '⬜'} Убрать заставку и титры (авто)",
+        "toggle:auto_trim:trim",
+        SUCCESS if s.auto_trim else None,
+    )
+    _add(builder, f"⏩ Пропустить начало: {s.start_offset:g} с", "edit:start_offset")
+    _add(builder, f"⏪ Пропустить конец: {s.end_offset:g} с", "edit:end_offset")
+    _add(builder, "⬅️ Назад", "screen:manual")
+    builder.adjust(1, 1, 1, 1)
     return builder.as_markup()
 
 
-# ---------- баннеры ----------
+# ---------- баннеры и тренды ----------
 
 
-def _banner_icon(banner) -> str:
-    if banner.media == "video":
-        return "🎞"
-    if banner.role == "strip":
-        return "▬"
-    if banner.media == "gif":
-        return "🌀"
-    return "🖼"
-
-
-def banner_picker(banners: list, selected: tuple[str | None, ...] = (), *, with_draft: bool = True) -> InlineKeyboardMarkup:
-    """Выбор баннера. 🎞 — видео со звуком, ▬ — полоса под постоянный баннер, 🌀 — анимация."""
+def banners_screen(banner_name: str | None) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    for banner in banners:
-        name = banner.name if len(banner.name) <= 32 else banner.name[:31] + "…"
-        current = banner.id in selected
-        _add(builder, f"{'✅ ' if current else ''}{_banner_icon(banner)} {name}", f"banner:{banner.id}", PRIMARY if current else None)
-    _add(builder, "📤 Загрузить свой", "ask:banner", SUCCESS)
-    _add(builder, "⬅️ Назад" if with_draft else "🏠 В начало", "screen:settings" if with_draft else "screen:menu")
-    builder.adjust(*([1] * (len(banners) + 2)))
+    rows: list[int] = []
+    if banner_name:
+        _add(builder, f"✅ {banner_name}", "banner:select", PRIMARY)
+        _add(builder, "▶️ Посмотреть баннер", "banner:preview")
+        rows += [1, 1]
+    _add(builder, "⬅️ Назад", MENU)
+    rows.append(1)
+    builder.adjust(*rows)
+    return builder.as_markup()
+
+
+def trends_home() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    for category in CATEGORIES:
+        _add(builder, f"{category.emoji} {category.title}", f"trend:{category.id}")
+    _add(builder, "🏠 В начало", MENU)
+    builder.adjust(*([2] * (len(CATEGORIES) // 2)), 1)
+    return builder.as_markup()
+
+
+def trend_results(videos: list[dict]) -> InlineKeyboardMarkup:
+    """Ролики жанра: выбрать один или вернуться к жанрам."""
+    return search_results(videos, again=("⬅️ К жанрам", "screen:trends"))
+
+
+def trends_retry(category_id: str) -> InlineKeyboardMarkup:
+    """Не получилось загрузить тренды: повторить или вернуться."""
+    builder = InlineKeyboardBuilder()
+    _add(builder, "🔄 Повторить", f"trend:{category_id}", PRIMARY)
+    _add(builder, "⬅️ К жанрам", "screen:trends")
+    builder.adjust(1, 1)
     return builder.as_markup()
 
 
@@ -212,8 +268,8 @@ def running(job_id: str) -> InlineKeyboardMarkup:
 def done() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     _add(builder, "🎬 Ещё ролик", "ask:link", PRIMARY)
-    _add(builder, "⚙️ Настройки", "screen:settings")
-    _add(builder, "🏠 В начало", "screen:menu")
-    builder.adjust(1, 2)
+    _add(builder, "🔁 Нарезать иначе", "screen:mode")
+    _add(builder, "🔥 В тренде", "screen:trends")
+    _add(builder, "🏠 В начало", MENU)
+    builder.adjust(1, 2, 1)
     return builder.as_markup()
-

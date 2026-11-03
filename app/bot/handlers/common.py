@@ -1,20 +1,20 @@
 """Общие экраны: главное меню, справка, статистика и запросы источника.
 
 Команд в боте нет. Единственное исключение — `/start`: его шлёт сам Telegram, когда человек нажимает
-«Старт» у пустого чата, и обойти это нельзя. Он нигде не показывается и не упоминается: тот же экран
-открывает кнопка «🏠 В начало» и любое сообщение, которое бот не понял.
+«Старт» у пустого чата, и обойти это нельзя. Он нигде не показывается и не упоминается. Любая
+«команда» (сообщение, которое начинается с «/») и кнопка «🏠 В начало» делают одно и то же: сбрасывают
+диалог (черновик, ожидание ввода, списки) и открывают главное меню.
 """
 from __future__ import annotations
 
 import logging
 
 from aiogram import F, Router
-from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 
 from app.bot import keyboards, texts
-from app.bot.context import AppContext, clear_input, edit_or_send, safe_answer, show
+from app.bot.context import AppContext, edit_or_send, reset_dialog, safe_answer
 from app.bot.states import Flow
 
 log = logging.getLogger(__name__)
@@ -22,19 +22,14 @@ router = Router(name="common")
 
 
 async def open_menu(event: Message | CallbackQuery, state: FSMContext, ctx: AppContext) -> None:
-    """Главное меню. Черновик не теряется; во время нарезки диалог остаётся заблокированным."""
-    await clear_input(state)
-    if await state.get_state() != Flow.running.state or not ctx.runner.active_for_user(event.from_user.id):
-        await state.set_state(Flow.waiting_link)
-    if isinstance(event, CallbackQuery):
-        await edit_or_send(event, texts.START, keyboards.main_menu())
-    else:
-        await show(event, texts.START, keyboards.main_menu())
+    """Главное меню с чистого листа. Идущая нарезка не прерывается."""
+    await reset_dialog(state, ctx, event.from_user.id)
+    await edit_or_send(event, texts.START, keyboards.main_menu())
 
 
-@router.message(CommandStart())
-async def on_start(message: Message, state: FSMContext, ctx: AppContext) -> None:
-    """Скрытый вход для кнопки «Старт» в Telegram."""
+@router.message(F.text.startswith("/"))
+async def on_command(message: Message, state: FSMContext, ctx: AppContext) -> None:
+    """`/start` и любая другая «команда»: диалог обновляется, человек видит меню."""
     await open_menu(message, state, ctx)
 
 
@@ -57,26 +52,26 @@ async def cb_stats(callback: CallbackQuery, ctx: AppContext) -> None:
     await edit_or_send(callback, texts.stats_text(clips, jobs, callback.from_user.id), keyboards.back_to_menu())
 
 
-async def _ask(callback: CallbackQuery, state: FSMContext, flow, text: str) -> None:
+async def _ask(callback: CallbackQuery, state: FSMContext, ctx: AppContext, flow, html: str) -> None:
     await safe_answer(callback)
-    await clear_input(state)
+    await reset_dialog(state, ctx, callback.from_user.id)
     await state.set_state(flow)
-    await edit_or_send(callback, text, keyboards.back_to_menu())
+    await edit_or_send(callback, html, keyboards.back_to_menu())
 
 
 @router.callback_query(F.data == "ask:link")
-async def cb_ask_link(callback: CallbackQuery, state: FSMContext) -> None:
-    await _ask(callback, state, Flow.waiting_link, texts.REQUEST_LINK)
+async def cb_ask_link(callback: CallbackQuery, state: FSMContext, ctx: AppContext) -> None:
+    await _ask(callback, state, ctx, Flow.waiting_link, texts.REQUEST_LINK)
 
 
 @router.callback_query(F.data == "ask:query")
-async def cb_ask_query(callback: CallbackQuery, state: FSMContext) -> None:
-    await _ask(callback, state, Flow.waiting_query, texts.REQUEST_QUERY)
+async def cb_ask_query(callback: CallbackQuery, state: FSMContext, ctx: AppContext) -> None:
+    await _ask(callback, state, ctx, Flow.waiting_query, texts.REQUEST_QUERY)
 
 
 @router.callback_query(F.data == "ask:file")
-async def cb_ask_file(callback: CallbackQuery, state: FSMContext) -> None:
-    await _ask(callback, state, Flow.waiting_file, texts.REQUEST_FILE)
+async def cb_ask_file(callback: CallbackQuery, state: FSMContext, ctx: AppContext) -> None:
+    await _ask(callback, state, ctx, Flow.waiting_file, texts.REQUEST_FILE)
 
 
 @router.callback_query(F.data == "noop")

@@ -1,4 +1,8 @@
-"""Приём источника: ссылка на YouTube, поиск по названию, присланный файл."""
+"""Приём источника: ссылка на YouTube, поиск по названию, присланный файл и выбор из найденного.
+
+Любой принятый ролик начинает диалог заново: прежний черновик, ожидание ввода и списки результатов
+забываются, а человек видит выбор режима (или сразу автоплан, если ролик выбран в «В тренде»).
+"""
 from __future__ import annotations
 
 import asyncio
@@ -8,15 +12,34 @@ from pathlib import Path
 
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
 
 from app.bot import keyboards, texts
-from app.bot.context import INPUT_KEY, AppContext, put_draft, safe_answer, update_settings
+from app.bot.context import (
+    ORIGIN_KEY,
+    ORIGIN_SEARCH,
+    ORIGIN_TREND,
+    SEARCH_KEY,
+    AppContext,
+    edit_or_send,
+    put_draft,
+    replace,
+    safe_answer,
+    show,
+    update_settings,
+)
+from app.bot.handlers.modes import auto_view, mode_view
+from app.bot.rich import esc
 from app.bot.states import Flow
 from app.config import TELEGRAM_MAX_UPLOAD_MB, VIDEO_EXTS
 from app.models import ClipSettings, Draft, VideoInfo
-from app.services.banner_manager import list_banners
-from app.services.downloader import DownloadError, extract_video_id, fetch_video_info, save_local_upload, search_videos
+from app.services.downloader import (
+    DownloadError,
+    extract_video_id,
+    fetch_video_info,
+    save_local_upload,
+    search_videos,
+)
 from app.services.video_processor import MediaError, probe_media
 
 log = logging.getLogger(__name__)
@@ -27,21 +50,34 @@ _YOUTUBE_HINT = re.compile(r"(youtu\.?\s?be|youtube\.com|youtube-nocookie\.com)"
 _URL_HINT = re.compile(r"^(https?://|www\.)|\.[a-z]{2,}/", re.IGNORECASE)
 
 
-async def _default_settings(ctx: AppContext, user_id: int) -> ClipSettings:
-    """Настройки пользователя; если баннер ещё не выбран — подставляем главный баннер проекта."""
+def _base_settings(ctx: AppContext, user_id: int) -> ClipSettings:
+    """Прежние настройки человека. Баннер в боте один (TGrader), постоянного баннера нет совсем.
+
+    Если в сохранённых настройках остался баннер из старой версии, он заменяется главным; если файла
+    главного баннера нет, клипы идут без вставки — иначе задача не запустилась бы.
+    """
     settings = ctx.store.settings(user_id)
-    if settings.banner_id is None and settings.banner_count > 0:
-        banners = list_banners(ctx.settings.banners_dir)
-        if banners:
-            settings = update_settings(settings, banner_id=banners[0].id)
-    return settings
+    banner = ctx.banner()
+    if banner is None:
+        return update_settings(settings, banner_id=None, banner_count=0, static_banner_id=None)
+    return update_settings(settings, banner_id=banner.id, static_banner_id=None)
 
 
-async def accept_video(
-    bot, chat_id: int, user_id: int, state: FSMContext, ctx: AppContext, info: dict
-) -> None:
-    """Показывает карточку найденного ролика и переводит диалог к настройкам."""
-    settings = await _default_settings(ctx, user_id)
+async def open_draft(
+    state: FSMContext, ctx: AppContext, draft: Draft, *, auto: bool = False
+) -> tuple[str, InlineKeyboardMarkup]:
+    """Начинает диалог с этим роликом и возвращает первый экран: выбор режима или (`auto`) готовый план."""
+    html, markup = auto_view(draft, ctx) if auto else mode_view(draft)
+    await state.set_data({})  # всё прежнее в этом диалоге — черновик, ввод, списки — больше не нужно
+    await put_draft(state, draft)
+    await state.set_state(Flow.editing)
+    return html, markup
+
+
+async def open_video(
+    state: FSMContext, ctx: AppContext, user_id: int, info: dict, *, auto: bool = False
+) -> tuple[str, InlineKeyboardMarkup]:
+    """Ролик с YouTube (сведения `info`) → первый экран диалога."""
     video = VideoInfo(
         video_id=info["video_id"],
         url=info["url"],
@@ -51,17 +87,7 @@ async def accept_video(
         thumbnail=info.get("thumbnail") or None,
         resolutions=info.get("resolutions") or [],
     )
-    draft = Draft.from_video(video, settings)
-    await put_draft(state, draft)
-    await state.set_state(Flow.editing)
-    banner_name = ctx.banner_name(draft.settings.banner_id)
-    static_name = ctx.banner_name(draft.settings.static_banner_id)
-    # Одно сообщение: карточка ролика + все настройки + кнопка запуска. Так проще не потеряться в чате.
-    await bot.send_message(
-        chat_id,
-        texts.settings_screen(draft, banner_name, static_name),
-        reply_markup=keyboards.settings_screen(draft, banner_name, static_name),
-    )
+    return await open_draft(state, ctx, Draft.from_video(video, _base_settings(ctx, user_id)), auto=auto)
 
 
 # ---------- ссылка или название ----------
@@ -71,7 +97,8 @@ async def _accepts_source(message: Message, state: FSMContext, ctx: AppContext) 
     """Текст, который надо принять как источник: ссылка или название.
 
     В меню-состояниях (и в пустом, после перезапуска бота) подходит любой текст. С экрана настроек
-    и из списка результатов — только ссылка, и только если бот не ждёт число.
+    и из списка результатов — только ссылка: она важнее ожидаемого числа (числом ссылка быть не может),
+    поэтому новый ролик заменяет прежний, даже если бот как раз просил ввести число.
     """
     text = (message.text or "").strip()
     if not text or text.startswith("/"):
@@ -83,8 +110,7 @@ async def _accepts_source(message: Message, state: FSMContext, ctx: AppContext) 
     if current in (None, Flow.waiting_link.state, Flow.waiting_query.state, Flow.waiting_file.state):
         return True
     if current in (Flow.editing.state, Flow.choosing.state):
-        pending = (await state.get_data()).get(INPUT_KEY)
-        return not pending and bool(extract_video_id(text))
+        return bool(extract_video_id(text))
     return False
 
 
@@ -102,49 +128,55 @@ async def on_text(message: Message, state: FSMContext, ctx: AppContext) -> None:
     current = await state.get_state()
     looks_like_link = _YOUTUBE_HINT.search(text) or _URL_HINT.search(text)
     if looks_like_link and current != Flow.waiting_query.state:
-        await message.answer(texts.BAD_LINK, reply_markup=keyboards.back_to_menu())
+        await show(message, texts.BAD_LINK, keyboards.back_to_menu())
         return
     # Не ссылка — считаем, что это название для поиска.
     await _search(message, state, ctx, text)
 
 
 async def _from_url(message: Message, state: FSMContext, ctx: AppContext, url: str) -> None:
-    status = await message.answer(texts.FETCHING)
+    status = await show(message, texts.FETCHING)
     try:
         info = await asyncio.to_thread(fetch_video_info, url)
     except DownloadError as error:
-        await status.edit_text(texts.error_text(str(error)), reply_markup=keyboards.back_to_menu())
+        await replace(status, texts.error_text(str(error)), keyboards.back_to_menu())
         return
     except Exception:  # noqa: BLE001 — сеть/yt-dlp могут упасть нестандартно
         log.exception("Не удалось получить сведения о ролике")
-        await status.edit_text(texts.error_text("Не получилось получить сведения о ролике. Попробуйте ещё раз."))
+        await replace(
+            status,
+            texts.error_text("Не получилось получить сведения о ролике. Попробуйте ещё раз."),
+            keyboards.back_to_menu(),
+        )
         return
-    await status.delete()
-    await accept_video(message.bot, message.chat.id, message.from_user.id, state, ctx, info)
+    html, markup = await open_video(state, ctx, message.from_user.id, info)
+    await replace(status, html, markup)
 
 
 # ---------- поиск по названию ----------
 
 
 async def _search(message: Message, state: FSMContext, ctx: AppContext, query: str) -> None:
-    status = await message.answer(texts.SEARCHING.format(query=texts._escape(query)))
+    status = await show(message, texts.SEARCHING.format(query=esc(query)))
     try:
         results = await asyncio.to_thread(search_videos, query)
     except DownloadError as error:
-        await status.edit_text(texts.error_text(str(error)), reply_markup=keyboards.back_to_menu())
+        await replace(status, texts.error_text(str(error)), keyboards.back_to_menu())
         return
     except Exception:  # noqa: BLE001
         log.exception("Поиск на YouTube упал")
-        await status.edit_text(texts.error_text("Поиск не удался. Попробуйте ещё раз или пришлите ссылку."))
-        return
-    if not results:
-        await status.edit_text(
-            texts.SEARCH_NOTHING.format(query=texts._escape(query)), reply_markup=keyboards.back_to_menu()
+        await replace(
+            status,
+            texts.error_text("Поиск не удался. Попробуйте ещё раз или пришлите ссылку."),
+            keyboards.back_to_menu(),
         )
         return
-    await status.edit_text(texts.search_cards(results), reply_markup=keyboards.search_results(results))
-    await state.update_data(search=results)
+    if not results:
+        await replace(status, texts.SEARCH_NOTHING.format(query=esc(query)), keyboards.back_to_menu())
+        return
+    await state.set_data({SEARCH_KEY: results, ORIGIN_KEY: ORIGIN_SEARCH})
     await state.set_state(Flow.choosing)
+    await replace(status, texts.search_cards(results), keyboards.search_results(results))
 
 
 # ---------- выбор найденного ----------
@@ -152,8 +184,9 @@ async def _search(message: Message, state: FSMContext, ctx: AppContext, query: s
 
 @router.callback_query(Flow.choosing, F.data.startswith("pick:"))
 async def on_pick(callback: CallbackQuery, state: FSMContext, ctx: AppContext) -> None:
+    """Ролик из поиска или из «В тренде». Из трендов сразу показываем автоплан под TikTok."""
     data = await state.get_data()
-    results = data.get("search") or []
+    results = data.get(SEARCH_KEY) or []
     try:
         index = int((callback.data or "pick:-1").split(":", 1)[1])
         entry = results[index]
@@ -161,11 +194,6 @@ async def on_pick(callback: CallbackQuery, state: FSMContext, ctx: AppContext) -
         await safe_answer(callback, "Вариант устарел — поищите ещё раз", alert=True)
         return
     await safe_answer(callback)
-    if callback.message is not None:
-        try:
-            await callback.message.delete()
-        except Exception:  # noqa: BLE001
-            pass
     info = {
         "video_id": entry["video_id"],
         "url": entry["url"],
@@ -174,7 +202,10 @@ async def on_pick(callback: CallbackQuery, state: FSMContext, ctx: AppContext) -
         "uploader": entry.get("uploader"),
         "thumbnail": entry.get("thumbnail"),
     }
-    await accept_video(callback.bot, callback.from_user.id, callback.from_user.id, state, ctx, info)
+    html, markup = await open_video(
+        state, ctx, callback.from_user.id, info, auto=data.get(ORIGIN_KEY) == ORIGIN_TREND
+    )
+    await edit_or_send(callback, html, markup)
 
 
 # ---------- видеофайл ----------
@@ -189,13 +220,13 @@ async def on_file(message: Message, state: FSMContext, ctx: AppContext) -> None:
     name = getattr(message.video, "file_name", None) or getattr(media, "file_name", None) or "video.mp4"
     suffix = Path(name).suffix.lower()
     if suffix not in VIDEO_EXTS:
-        await message.answer(texts.NOT_A_VIDEO, reply_markup=keyboards.back_to_menu())
+        await show(message, texts.NOT_A_VIDEO, keyboards.back_to_menu())
         return
     if media.file_size and media.file_size > TELEGRAM_MAX_UPLOAD_MB * 1024 * 1024:
-        await message.answer(texts.FILE_TOO_BIG, reply_markup=keyboards.back_to_menu())
+        await show(message, texts.FILE_TOO_BIG, keyboards.back_to_menu())
         return
 
-    status = await message.answer(texts.DOWNLOADING_FILE)
+    status = await show(message, texts.DOWNLOADING_FILE)
     uploads_dir = ctx.settings.uploads_dir
     try:
         temp = uploads_dir / f"incoming_{message.from_user.id}_{media.file_unique_id}{suffix}"
@@ -203,30 +234,25 @@ async def on_file(message: Message, state: FSMContext, ctx: AppContext) -> None:
         upload_id, path = await asyncio.to_thread(_store_upload, temp, name, uploads_dir)
         info = await asyncio.to_thread(probe_media, path)
     except DownloadError as error:
-        await status.edit_text(texts.error_text(str(error)), reply_markup=keyboards.back_to_menu())
+        await replace(status, texts.error_text(str(error)), keyboards.back_to_menu())
         return
     except MediaError:
-        await status.edit_text(
-            texts.FILE_BAD.format(error="файл не читается как видео"),
-            reply_markup=keyboards.back_to_menu(),
-        )
+        await replace(status, texts.FILE_BAD.format(error="файл не читается как видео"), keyboards.back_to_menu())
         return
     except Exception:  # noqa: BLE001
         log.exception("Не удалось принять видеофайл")
-        await status.edit_text(
-            texts.error_text("Не получилось принять файл. Попробуйте ещё раз или пришлите ссылку на YouTube.")
+        await replace(
+            status,
+            texts.error_text("Не получилось принять файл. Попробуйте ещё раз или пришлите ссылку на YouTube."),
+            keyboards.back_to_menu(),
         )
         return
 
-    settings = await _default_settings(ctx, message.from_user.id)
-    draft = Draft.from_upload(upload_id, Path(name).stem or "Видео", info.duration, settings)
-    await put_draft(state, draft)
-    await state.set_state(Flow.editing)
-    await status.delete()
-    await message.answer(
-        texts.settings_screen(draft, ctx.banner_name(draft.settings.banner_id), None),
-        reply_markup=keyboards.settings_screen(draft, ctx.banner_name(draft.settings.banner_id), None),
+    draft = Draft.from_upload(
+        upload_id, Path(name).stem or "Видео", info.duration, _base_settings(ctx, message.from_user.id)
     )
+    html, markup = await open_draft(state, ctx, draft)
+    await replace(status, html, markup)
 
 
 def _store_upload(temp: Path, original_name: str, uploads_dir: Path) -> tuple[str, Path]:

@@ -1,53 +1,82 @@
-"""Общие вещи для хэндлеров: контекст приложения, черновик в FSM, показ экранов."""
+"""Общие вещи для хэндлеров: контекст приложения, черновик в FSM, показ экранов.
+
+Показ экранов (rich-сообщения с запасным HTML) живёт в `app/bot/render.py`; здесь его имена
+реэкспортируются, чтобы хэндлерам хватало одного импорта.
+"""
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
-from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.context import FSMContext
-from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
+from aiogram.types import CallbackQuery
 
 from app.bot import texts
+from app.bot.render import (  # noqa: F401 — реэкспорт
+    edit_html,
+    edit_or_send,
+    replace,
+    safe_answer,
+    send_html,
+    show,
+)
 from app.bot.runner import JobRunner
+from app.bot.states import Flow
 from app.config import Settings
 from app.models import ClipSettings, Draft
-from app.services.banner_manager import BannerInfo, list_banners
+from app.services.banner_manager import BannerInfo, default_banner
 from app.services.jobs import JobManager
+from app.services.trends import TrendCache
 from app.services.user_store import UserStore
 
 log = logging.getLogger(__name__)
 
 DRAFT_KEY = "draft"
 INPUT_KEY = "input_field"  # какое числовое поле сейчас ждёт текстовый ввод
+SEARCH_KEY = "search"  # найденные ролики (поиск или тренды), из которых пользователь выбирает
+ORIGIN_KEY = "search_origin"  # откуда список: поиск или тренды — от этого зависит, что покажем после выбора
+ORIGIN_SEARCH = "search"  # ролики найдены по названию → дальше выбор режима
+ORIGIN_TREND = "trend"  # ролики из «В тренде» → сразу автоплан под TikTok
 
 
 @dataclass
 class AppContext:
-    """Всё, что нужно хэндлерам: настройки, очередь задач, баннеры, мост к Telegram."""
+    """Всё, что нужно хэндлерам: настройки, очередь задач, баннер, тренды, мост к Telegram."""
 
     settings: Settings
     manager: JobManager
     store: UserStore
     runner: JobRunner
+    trends: TrendCache = field(default_factory=TrendCache)
+    banner_preview_id: str | None = None  # file_id уже отправленного превью баннера: повторно файл не грузим
 
     @property
     def workspace_dir(self) -> Path:
         return self.settings.workspace_dir
 
+    def banner(self) -> BannerInfo | None:
+        """Главный баннер проекта — единственный, который показывает бот (`None`, если файла нет)."""
+        return default_banner(self.settings.banners_dir)
+
+    def banner_seconds(self) -> float | None:
+        """Сколько играет баннер (`None`, если баннера нет)."""
+        banner = self.banner()
+        return banner.duration if banner is not None and banner.duration else None
+
     def banners(self) -> list[BannerInfo]:
-        """Все баннеры: главный, пресеты и свои — в стабильном порядке."""
-        return list_banners(self.settings.banners_dir)
+        banner = self.banner()
+        return [banner] if banner is not None else []
 
     def banner_name(self, banner_id: str | None) -> str | None:
         """Человеческое имя баннера по id (или сам id, если файла уже нет)."""
         if not banner_id:
             return None
-        return next((banner.name for banner in self.banners() if banner.id == banner_id), banner_id)
+        banner = self.banner()
+        return banner.name if banner is not None and banner.id == banner_id else banner_id
 
 
-# ---------- черновик ----------
+# ---------- черновик и диалог ----------
 
 
 async def get_draft(state: FSMContext) -> Draft | None:
@@ -71,6 +100,17 @@ async def clear_input(state: FSMContext) -> None:
     await state.update_data({INPUT_KEY: None})
 
 
+async def reset_dialog(state: FSMContext, ctx: AppContext, user_id: int) -> None:
+    """Чистый лист: черновик, ожидание ввода и списки результатов забываются.
+
+    Так делают «🏠 В начало», `/start` и любая другая команда. Идущая нарезка не прерывается:
+    пока она работает, диалог остаётся в состоянии «занят».
+    """
+    busy = ctx.runner is not None and ctx.runner.active_for_user(user_id)
+    await state.clear()
+    await state.set_state(Flow.running if busy else Flow.waiting_link)
+
+
 async def need_draft(callback: CallbackQuery, state: FSMContext) -> Draft | None:
     """Черновик или `None` — тогда пользователь уже получил понятное объяснение."""
     draft = await get_draft(state)
@@ -82,39 +122,3 @@ async def need_draft(callback: CallbackQuery, state: FSMContext) -> Draft | None
 def update_settings(settings: ClipSettings, **changes) -> ClipSettings:
     """Меняет настройки с полной валидацией (model_copy(update=…) её пропускает)."""
     return ClipSettings(**{**settings.model_dump(), **changes})
-
-
-# ---------- удобные обёртки ----------
-
-
-async def show(message: Message, text: str, markup: InlineKeyboardMarkup | None = None) -> Message:
-    return await message.answer(text, reply_markup=markup)
-
-
-async def edit_or_send(
-    event: Message | CallbackQuery, text: str, markup: InlineKeyboardMarkup | None = None
-) -> None:
-    """Правит сообщение, если это callback, иначе отправляет новое. Падение правки не роняет хэндлер."""
-    if isinstance(event, CallbackQuery) and event.message is not None:
-        target = event.message
-        try:
-            if target.text is not None:
-                await target.edit_text(text, reply_markup=markup)
-            else:
-                await target.edit_caption(caption=text, reply_markup=markup)
-            return
-        except TelegramBadRequest as error:
-            if "message is not modified" in str(error):
-                return  # экран уже такой, как надо — второй копии не нужно
-            log.debug("Не удалось поправить сообщение — отправлю новое", exc_info=True)
-        except Exception:  # noqa: BLE001 — сообщение удалено/слишком старое и прочие мелочи Telegram
-            log.debug("Не удалось поправить сообщение — отправлю новое", exc_info=True)
-    await event.answer(text, reply_markup=markup)
-
-
-async def safe_answer(event: CallbackQuery, text: str | None = None, *, alert: bool = False) -> None:
-    """Отвечает на callback: без этого Telegram крутит часики на кнопке."""
-    try:
-        await event.answer(text, show_alert=alert)
-    except Exception:  # noqa: BLE001 — callback мог устареть, это не ошибка
-        log.debug("Callback уже неактуален", exc_info=True)

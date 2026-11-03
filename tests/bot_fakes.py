@@ -14,8 +14,10 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.base import BaseSession
 from aiogram.client.telegram import TelegramAPIServer
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.methods import TelegramMethod
 from aiogram.types import (
+    BotName,
     CallbackQuery,
     Chat,
     File,
@@ -26,11 +28,12 @@ from aiogram.types import (
 )
 
 from app.bot.app import build_app
+from app.bot.rich import plain_text
 from app.bot.runner import JobRunner
 from app.config import Settings
 
 FAKE_TOKEN = "42:TEST-TOKEN"
-ME = {"id": 42, "is_bot": True, "first_name": "ClipBanner", "username": "clipbanner_test_bot", "can_join_groups": True}
+ME = {"id": 42, "is_bot": True, "first_name": "TgRader Clipper", "username": "tgrader_clipper_test_bot", "can_join_groups": True}
 
 _counter = {"message": 100, "update": 1}
 
@@ -71,12 +74,16 @@ class FakeSession(BaseSession):
         self.handlers: dict[str, Any] = {}
         self.stream_bytes: bytes = b""
         self.closed = False
+        self.reject_rich = False  # True: «Telegram» не принимает rich-сообщения, как старый сервер
+        self.bot_name = "ClipBanner"  # прежнее имя бота: проверяем, что при запуске оно меняется
 
     # ---------- Bot API ----------
 
     async def make_request(self, bot: Bot, method: TelegramMethod, timeout: int | None = None):
         self.requests.append(method)
         name = method.__api_method__
+        if self.reject_rich and getattr(method, "rich_message", None) is not None:
+            raise TelegramBadRequest(method=method, message="Bad Request: rich messages are not supported")
         handler = self.handlers.get(name)
         if handler is not None:
             return handler(method, bot)
@@ -87,6 +94,14 @@ class FakeSession(BaseSession):
         chat_id = getattr(method, "chat_id", None)
         if name == "getMe":
             return User.model_validate(ME)
+        if name == "getMyName":
+            return BotName(name=self.bot_name)
+        if name == "setMyName":
+            self.bot_name = method.name or ""
+            return True
+        if name == "sendRichMessage" or (name == "editMessageText" and getattr(method, "rich_message", None)):
+            # Настоящий Telegram возвращает rich-сообщение без поля text — повторяем это.
+            return _message(bot, chat_id, None, rich_message={"blocks": []})
         if name in ("sendMessage", "editMessageText", "sendPhoto", "sendDocument", "sendVideo"):
             return _message(bot, chat_id, getattr(method, "text", None) or getattr(method, "caption", None))
         if name == "getFile":
@@ -114,14 +129,31 @@ class FakeSession(BaseSession):
     def calls(self, api_method: str) -> list[TelegramMethod]:
         return [request for request in self.requests if request.__api_method__ == api_method]
 
+    @staticmethod
+    def _html(request) -> str | None:
+        """Исходная разметка запроса: rich-HTML, обычный текст или подпись."""
+        rich = getattr(request, "rich_message", None)
+        if rich is not None:
+            return rich.html
+        return getattr(request, "text", None) or getattr(request, "caption", None)
+
+    def htmls(self) -> list[str]:
+        """Разметка всех экранов, которые бот отправил или вписал в сообщения."""
+        return [html for html in map(self._html, self.requests) if html]
+
     def texts(self) -> list[str]:
-        """Все тексты, которые бот отправил или вписал в сообщения (без HTML-разметки проверяем сами)."""
+        """Те же экраны, но чистым текстом: теги убраны, как их увидит человек."""
         found = []
         for request in self.requests:
-            text = getattr(request, "text", None) or getattr(request, "caption", None)
-            if text:
-                found.append(text)
+            html = self._html(request)
+            if not html:
+                continue
+            found.append(plain_text(html) if getattr(request, "rich_message", None) is not None else html)
         return found
+
+    def rich_requests(self) -> list[TelegramMethod]:
+        """Запросы, в которых экран ушёл rich-сообщением."""
+        return [request for request in self.requests if getattr(request, "rich_message", None) is not None]
 
     def last_text(self) -> str:
         texts = self.texts()
@@ -140,20 +172,22 @@ class FakeSession(BaseSession):
         alerts = self.alerts()
         return alerts[-1] if alerts else ""
 
-    def buttons(self) -> list[str]:
-        """callback_data всех кнопок из последней отправленной/отредактированной клавиатуры."""
-        data: list[str] = []
+    def keyboard(self) -> list[list]:
+        """Строки кнопок последней отправленной или отредактированной клавиатуры."""
         for request in reversed(self.requests):
             markup = getattr(request, "reply_markup", None)
-            if markup is None:
-                continue
-            for row in getattr(markup, "inline_keyboard", []):
-                for button in row:
-                    if getattr(button, "callback_data", None):
-                        data.append(button.callback_data)
-            if data:
-                return data
-        return data
+            rows = getattr(markup, "inline_keyboard", None)
+            if rows:
+                return rows
+        return []
+
+    def buttons(self) -> list[str]:
+        """callback_data всех кнопок из последней отправленной/отредактированной клавиатуры."""
+        return [button.callback_data for row in self.keyboard() for button in row if getattr(button, "callback_data", None)]
+
+    def button_texts(self) -> list[str]:
+        """Подписи тех же кнопок — как их видит человек."""
+        return [button.text for row in self.keyboard() for button in row]
 
 
 class Harness:

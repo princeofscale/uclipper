@@ -11,8 +11,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from aiogram import Bot
-from aiogram.types import FSInputFile
 from aiogram.exceptions import TelegramBadRequest, TelegramEntityTooLarge
+from aiogram.types import FSInputFile
 
 from app.bot import texts
 from app.config import (
@@ -91,7 +91,7 @@ async def send_clip(
 ) -> bool:
     """Отправляет один ролик. `False` — не получилось даже после сжатия."""
     file, shrunk = prepare_for_telegram(path, work_dir)
-    caption = f"<b>Клип {clip.index} из {total}</b> · {texts.duration_text(clip.duration)}"
+    caption = f"🎬 <b>Клип {clip.index} из {total}</b> · ⏱ {texts.duration_text(clip.duration)}"
     if shrunk:
         caption += "\n<i>Сжал до 720p, чтобы влез в лимит Telegram.</i>"
     caption = caption[:TELEGRAM_CAPTION_LIMIT]
@@ -125,7 +125,7 @@ async def send_archive(bot: Bot, chat_id: int, archive: Path) -> bool:
         await bot.send_document(
             chat_id=chat_id,
             document=FSInputFile(archive, filename=archive.name),
-            caption=f"<b>Все ролики одной папкой</b> · {archive.stat().st_size / 1024 / 1024:.1f} МБ",
+            caption=f"📦 <b>Все клипы одним архивом</b> · {archive.stat().st_size / 1024 / 1024:.1f} МБ",
         )
         return True
     except (TelegramBadRequest, TelegramEntityTooLarge) as error:
@@ -148,7 +148,7 @@ async def deliver_results(
     """
     job_dir = manager.job_dir(state.id)
     sent = failed = 0
-    total = len(state.clips)
+    total = max(state.total_clips, len(state.clips))
     skip = already_sent or set()
     for clip in state.clips:
         if clip.index in skip:

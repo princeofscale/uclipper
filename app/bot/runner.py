@@ -15,6 +15,7 @@ from aiogram.types import Message
 
 from app.bot import keyboards, texts
 from app.bot.delivery import cleanup_job, deliver_results, send_clip
+from app.bot.render import edit_html, send_html
 from app.models import JobRequest, JobState, JobStatus
 from app.services.jobs import JobManager
 from app.services.user_store import UserStore
@@ -135,7 +136,12 @@ class JobRunner:
             if path is None:
                 continue
             ok = await send_clip(
-                self._bot, running.chat_id, clip, path, self._manager.job_dir(state.id), total=len(state.clips)
+                self._bot,
+                running.chat_id,
+                clip,
+                path,
+                self._manager.job_dir(state.id),
+                total=max(state.total_clips, len(state.clips)),
             )
             if ok:
                 running.sent_clips.add(clip.index)
@@ -148,9 +154,16 @@ class JobRunner:
         running.last_progress_text = text
         markup = keyboards.running(state.id) if state.status is JobStatus.RUNNING else None
         try:
-            await running.message.edit_text(text, reply_markup=markup)
+            await edit_html(running.message, text, markup)
         except Exception:  # noqa: BLE001 — сообщение могли удалить или текст не изменился
             log.debug("Не удалось обновить прогресс задачи %s", state.id, exc_info=True)
+
+    async def _show_final(self, running: RunningJob, html: str, markup) -> None:
+        """Финальный текст в сообщении-прогрессе; не получилось поправить — присылаем новым."""
+        try:
+            await edit_html(running.message, html, markup)
+        except Exception:  # noqa: BLE001
+            await send_html(self._bot, running.chat_id, html, markup)
 
     async def _finish(self, running: RunningJob, request: JobRequest) -> None:
         """Финальный экран, досылка оставшихся клипов и архив, уборка за собой."""
@@ -162,19 +175,13 @@ class JobRunner:
         self._latest.pop(job_id, None)
         try:
             if state.status is JobStatus.ERROR:
-                text = texts.error_text(state.error or "Не удалось выполнить задачу.")
-                try:
-                    await running.message.edit_text(text, reply_markup=keyboards.back_to_menu(), parse_mode=None)
-                except Exception:  # noqa: BLE001
-                    await self._bot.send_message(running.chat_id, text, reply_markup=keyboards.back_to_menu())
+                await self._show_final(
+                    running, texts.error_text(state.error or "Не удалось выполнить задачу."), keyboards.back_to_menu()
+                )
                 return
 
             if state.status is JobStatus.CANCELLED:
-                text = texts.CANCELLED
-                try:
-                    await running.message.edit_text(text, reply_markup=keyboards.back_to_menu())
-                except Exception:  # noqa: BLE001
-                    await self._bot.send_message(running.chat_id, text, reply_markup=keyboards.back_to_menu())
+                await self._show_final(running, texts.CANCELLED, keyboards.back_to_menu())
                 return
 
             # Досылаем только те клипы, которые не ушли во время рендера: уже отправленные не дублируем.
@@ -190,11 +197,8 @@ class JobRunner:
                 )
             summary = texts.results_summary(state)
             if not report.archive_sent and len(state.clips) > 1:
-                summary += "\n<i>ZIP не отправлял: не влезает в лимит или ролики уже выше.</i>"
-            try:
-                await running.message.edit_text(summary, reply_markup=keyboards.done())
-            except Exception:  # noqa: BLE001
-                await self._bot.send_message(running.chat_id, summary, reply_markup=keyboards.done())
+                summary += "<p><i>ZIP не отправлял: не влезает в лимит или ролики уже выше.</i></p>"
+            await self._show_final(running, summary, keyboards.done())
 
             self._store.count_job(running.user_id, len(state.clips))
             self._store.remember_settings(running.user_id, request)
