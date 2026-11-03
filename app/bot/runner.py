@@ -96,9 +96,6 @@ class JobRunner:
                 return job_id
         return None
 
-    def has(self, job_id: str) -> bool:
-        return job_id in self._jobs
-
     # ---------- слежение ----------
 
     async def _watch(self, running: RunningJob, request: JobRequest) -> None:

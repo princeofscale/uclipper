@@ -11,7 +11,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 
 from app.bot import keyboards, texts
-from app.bot.context import AppContext, put_draft, safe_answer, update_settings
+from app.bot.context import INPUT_KEY, AppContext, put_draft, safe_answer, update_settings
 from app.bot.states import Flow
 from app.config import TELEGRAM_MAX_UPLOAD_MB, VIDEO_EXTS
 from app.models import ClipSettings, Draft, VideoInfo
@@ -35,17 +35,6 @@ async def _default_settings(ctx: AppContext, user_id: int) -> ClipSettings:
         if banners:
             settings = update_settings(settings, banner_id=banners[0].id)
     return settings
-
-
-def _search_cards(entries: list[dict]) -> str:
-    lines = ["<b>Нашёл такие ролики</b> — выберите нужный кнопкой ниже:"]
-    for index, entry in enumerate(entries, start=1):
-        title = texts._escape(entry.get("title") or "Без названия")
-        uploader = texts._escape(entry.get("uploader") or "")
-        minutes = texts.duration_text(entry.get("duration") or 0)
-        meta = " · ".join(part for part in (uploader, minutes) if part)
-        lines.append(f"\n<b>{index}.</b> {title}\n<i>{meta}</i>")
-    return "\n".join(lines)
 
 
 async def accept_video(
@@ -75,18 +64,44 @@ async def accept_video(
     )
 
 
-# ---------- ссылка ----------
+# ---------- ссылка или название ----------
 
 
-@router.message(Flow.waiting_link, F.text)
-async def on_link(message: Message, state: FSMContext, ctx: AppContext) -> None:
+async def _accepts_source(message: Message, state: FSMContext, ctx: AppContext) -> bool:
+    """Текст, который надо принять как источник: ссылка или название.
+
+    В меню-состояниях (и в пустом, после перезапуска бота) подходит любой текст. С экрана настроек
+    и из списка результатов — только ссылка, и только если бот не ждёт число.
+    """
     text = (message.text or "").strip()
-    if text.startswith("/"):
-        return  # команду обработает свой хэндлер
+    if not text or text.startswith("/"):
+        return False
+    current = await state.get_state()
+    if current == Flow.running.state:
+        # Состояние «идёт нарезка» само не сбрасывается: считаем занятым только пока задача реально идёт.
+        return not ctx.runner.active_for_user(message.from_user.id)
+    if current in (None, Flow.waiting_link.state, Flow.waiting_query.state, Flow.waiting_file.state):
+        return True
+    if current in (Flow.editing.state, Flow.choosing.state):
+        pending = (await state.get_data()).get(INPUT_KEY)
+        return not pending and bool(extract_video_id(text))
+    return False
+
+
+async def _not_busy(message: Message, ctx: AppContext) -> bool:
+    """Файл принимаем, если у пользователя не идёт нарезка."""
+    return not ctx.runner.active_for_user(message.from_user.id)
+
+
+@router.message(_accepts_source, F.text)
+async def on_text(message: Message, state: FSMContext, ctx: AppContext) -> None:
+    text = (message.text or "").strip()
     if extract_video_id(text):
         await _from_url(message, state, ctx, text)
         return
-    if _YOUTUBE_HINT.search(text) or _URL_HINT.search(text):
+    current = await state.get_state()
+    looks_like_link = _YOUTUBE_HINT.search(text) or _URL_HINT.search(text)
+    if looks_like_link and current != Flow.waiting_query.state:
         await message.answer(texts.BAD_LINK, reply_markup=keyboards.back_to_menu())
         return
     # Не ссылка — считаем, что это название для поиска.
@@ -111,17 +126,6 @@ async def _from_url(message: Message, state: FSMContext, ctx: AppContext, url: s
 # ---------- поиск по названию ----------
 
 
-@router.message(Flow.waiting_query, F.text)
-async def on_query(message: Message, state: FSMContext, ctx: AppContext) -> None:
-    text = (message.text or "").strip()
-    if text.startswith("/"):
-        return
-    if extract_video_id(text):
-        await _from_url(message, state, ctx, text)
-        return
-    await _search(message, state, ctx, text)
-
-
 async def _search(message: Message, state: FSMContext, ctx: AppContext, query: str) -> None:
     status = await message.answer(texts.SEARCHING.format(query=texts._escape(query)))
     try:
@@ -135,12 +139,10 @@ async def _search(message: Message, state: FSMContext, ctx: AppContext, query: s
         return
     if not results:
         await status.edit_text(
-            f"Ничего не нашлось по запросу «{texts._escape(query)}».\n"
-            "Попробуйте другое название или пришлите ссылку на YouTube.",
-            reply_markup=keyboards.back_to_menu(),
+            texts.SEARCH_NOTHING.format(query=texts._escape(query)), reply_markup=keyboards.back_to_menu()
         )
         return
-    await status.edit_text(_search_cards(results), reply_markup=keyboards.search_results(results))
+    await status.edit_text(texts.search_cards(results), reply_markup=keyboards.search_results(results))
     await state.update_data(search=results)
     await state.set_state(Flow.choosing)
 
@@ -178,7 +180,7 @@ async def on_pick(callback: CallbackQuery, state: FSMContext, ctx: AppContext) -
 # ---------- видеофайл ----------
 
 
-@router.message(F.video | F.document | F.animation)
+@router.message(_not_busy, F.video | F.document | F.animation)
 async def on_file(message: Message, state: FSMContext, ctx: AppContext) -> None:
     """Приём видеофайла: до 20 МБ (лимит облачного Bot API)."""
     media = message.video or message.document or message.animation
@@ -187,10 +189,7 @@ async def on_file(message: Message, state: FSMContext, ctx: AppContext) -> None:
     name = getattr(message.video, "file_name", None) or getattr(media, "file_name", None) or "video.mp4"
     suffix = Path(name).suffix.lower()
     if suffix not in VIDEO_EXTS:
-        await message.answer(
-            "Это не видеофайл. Подойдут .mp4, .mov и .mkv — или пришлите ссылку на YouTube.",
-            reply_markup=keyboards.back_to_menu(),
-        )
+        await message.answer(texts.NOT_A_VIDEO, reply_markup=keyboards.back_to_menu())
         return
     if media.file_size and media.file_size > TELEGRAM_MAX_UPLOAD_MB * 1024 * 1024:
         await message.answer(texts.FILE_TOO_BIG, reply_markup=keyboards.back_to_menu())

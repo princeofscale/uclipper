@@ -6,16 +6,15 @@
 from __future__ import annotations
 
 import logging
-import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
 from aiogram import Bot
-from aiogram.types import FSInputFile, Message
+from aiogram.types import FSInputFile
 from aiogram.exceptions import TelegramBadRequest, TelegramEntityTooLarge
 
-from app.bot import keyboards, texts
+from app.bot import texts
 from app.config import (
     REENCODE_AUDIO_BITRATE,
     REENCODE_CRF,
@@ -134,10 +133,6 @@ async def send_archive(bot: Bot, chat_id: int, archive: Path) -> bool:
         return False
 
 
-def archive_fits(archive: Path | None) -> bool:
-    return archive is not None and _fits(archive)
-
-
 async def deliver_results(
     bot: Bot,
     chat_id: int,
@@ -145,7 +140,6 @@ async def deliver_results(
     manager,
     *,
     already_sent: set[int] | None = None,
-    on_status=None,
 ) -> DeliveryReport:
     """Отправляет клипы задачи и архив. Возвращает отчёт; на диске ничего не удаляет сам.
 

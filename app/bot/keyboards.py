@@ -1,31 +1,60 @@
-"""Клавиатуры бота: карточка ролика, экран настроек, «ещё», результаты поиска."""
+"""Клавиатуры бота. Весь интерфейс — inline-кнопки, команд (/…) в боте нет.
+
+Цвета кнопок (Bot API 9.4, поле `style`) используются по смыслу, а не для украшения:
+• синий (`primary`)  — главное действие экрана и текущий выбор;
+• зелёный (`success`) — «сделать»: запустить нарезку, подтвердить;
+• красный (`danger`)  — остановить или убрать.
+Остальное остаётся нейтральным — так цветные кнопки действительно бросаются в глаза.
+
+callback_data короче 64 байт — это требование Telegram.
+"""
 from __future__ import annotations
 
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.enums import ButtonStyle
+from aiogram.types import InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from app.bot import texts
-from app.models import BannerMode, BannerPosition, FrameMode, SlicingMode, StaticPosition
+from app.bot.steppers import Stepper
 
-# callback_data короче 64 байт — это требование Telegram.
-START = "start"
+PRIMARY = ButtonStyle.PRIMARY.value
+SUCCESS = ButtonStyle.SUCCESS.value
+DANGER = ButtonStyle.DANGER.value
+
+
+def _add(builder: InlineKeyboardBuilder, text: str, data: str, style: str | None = None) -> None:
+    builder.button(text=text, callback_data=data, style=style)
+
+
+def _mark(on: bool) -> str:
+    return "✅" if on else "⬜"
+
+
+# ---------- главное меню и навигация ----------
 
 
 def main_menu() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    builder.button(text="🔗 Новая ссылка", callback_data="ask:link")
-    builder.button(text="🔍 Поиск по названию", callback_data="ask:query")
-    builder.button(text="📁 Видеофайл", callback_data="ask:file")
-    builder.button(text="⚙️ Настройки", callback_data="screen:settings")
-    builder.button(text="🎬 Баннеры", callback_data="screen:banners")
-    builder.button(text="📊 Статистика", callback_data="screen:stats")
-    builder.adjust(2, 2, 1, 1)
+    _add(builder, "🔗 Прислать ссылку", "ask:link", PRIMARY)
+    _add(builder, "🔍 Найти по названию", "ask:query")
+    _add(builder, "📁 Загрузить файл", "ask:file")
+    _add(builder, "🎬 Баннеры", "screen:banners")
+    _add(builder, "⚙️ Настройки", "screen:settings")
+    _add(builder, "📊 Статистика", "screen:stats")
+    _add(builder, "❓ Справка", "screen:help")
+    builder.adjust(1, 2, 2, 2)
     return builder.as_markup()
 
 
 def back_to_menu() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    builder.button(text="🏠 В начало", callback_data="screen:menu")
+    _add(builder, "🏠 В начало", "screen:menu")
+    return builder.as_markup()
+
+
+def cancel_only(back: str = "screen:settings") -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    _add(builder, "✖️ Отмена", back, DANGER)
     return builder.as_markup()
 
 
@@ -34,161 +63,157 @@ def search_results(entries: list[dict]) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     for index, entry in enumerate(entries):
         title = entry.get("title") or "Без названия"
-        if len(title) > 48:
-            title = title[:47] + "…"
+        if len(title) > 44:
+            title = title[:43] + "…"
         minutes = texts.duration_text(entry.get("duration") or 0)
-        builder.button(text=f"{index + 1}. {title} · {minutes}", callback_data=f"pick:{index}")
-    builder.button(text="🔄 Искать другое", callback_data="ask:query")
-    builder.adjust(*([1] * len(entries)), 1)
+        _add(builder, f"{index + 1}. {title} · {minutes}", f"pick:{index}", PRIMARY if index == 0 else None)
+    _add(builder, "🔄 Искать другое", "ask:query")
+    _add(builder, "🏠 В начало", "screen:menu")
+    builder.adjust(*([1] * len(entries)), 2)
     return builder.as_markup()
 
 
+# ---------- экран настроек ----------
+
+
+def _trim_label(s) -> str:
+    if s.auto_trim:
+        return "✂️ Обрезка: авто"
+    if s.start_offset or s.end_offset:
+        return f"✂️ Обрезка: −{s.start_offset:g}/−{s.end_offset:g} с"
+    return "✂️ Обрезка: нет"
+
+
 def settings_screen(draft, banner_name: str | None, static_name: str | None) -> InlineKeyboardMarkup:
-    """Кнопки-значения экрана настроек: каждое нажатие сразу меняет значение."""
+    """Экран настроек: каждая кнопка показывает текущее значение; нажатие меняет его или открывает выбор."""
     s = draft.settings
     builder = InlineKeyboardBuilder()
+    rows: list[int] = []
 
-    builder.button(text=f"🔢 Клипов: {s.num_clips}", callback_data="edit:num_clips")
-    builder.button(text=f"⏱ Длительность: {s.clip_duration:g} с", callback_data="edit:clip_duration")
-    builder.button(
-        text=f"📐 Раскладка: {texts.SLICING_LABELS[s.slicing_mode]}",
-        callback_data="cycle:slicing_mode",
-    )
-    builder.button(text=f"🖼 Кадр: {texts.FRAME_LABELS[s.frame_mode]}", callback_data="cycle:frame_mode")
-    if s.auto_trim:
-        trim = "✂️ Обрезка: авто"
-    elif s.start_offset or s.end_offset:
-        trim = f"✂️ Обрезка: −{s.start_offset:g}/−{s.end_offset:g} с"
-    else:
-        trim = "✂️ Обрезка: нет"
-    builder.button(text=trim, callback_data="screen:trim")
+    _add(builder, f"🔢 Клипов: {s.num_clips}", "edit:num_clips")
+    _add(builder, f"⏱ Длительность: {s.clip_duration:g} с", "edit:clip_duration")
+    _add(builder, f"📐 {texts.SLICING_LABELS[s.slicing_mode].capitalize()}", "cycle:slicing_mode")
+    _add(builder, f"🖼 {texts.FRAME_LABELS[s.frame_mode]}", "cycle:frame_mode")
+    _add(builder, _trim_label(s), "screen:trim")
+    rows += [2, 2, 1]
 
     if s.banner_count == 0:
-        builder.button(text="🎬 Баннер: выключен", callback_data="cycle:banner_state")
+        _add(builder, "🎬 Баннер: выключен", "cycle:banner_state")
+        rows += [1]
     else:
-        builder.button(text=f"🎬 Баннер: {banner_name or s.banner_id}", callback_data="screen:banners")
-        builder.button(text=f"👁 Показов: {s.banner_count}", callback_data="cycle:banner_count")
-        builder.button(text=f"⏱ Пауза: {s.banner_duration:g} с", callback_data="cycle:banner_duration")
-        builder.button(
-            text=f"🎞 Режим: {texts.BANNER_MODE_LABELS[s.banner_mode]}",
-            callback_data="cycle:banner_mode",
-        )
-        builder.button(
-            text=f"📍 Позиция: {texts.POSITION_LABELS[s.banner_position]}",
-            callback_data="cycle:banner_position",
-        )
-        builder.button(text=f"📏 Масштаб: {s.banner_scale}%", callback_data="cycle:banner_scale")
-        builder.button(
-            text=f"{'🔊' if s.banner_sound else '🔇'} Звук баннера: {'вкл' if s.banner_sound else 'выкл'}",
-            callback_data="toggle:banner_sound",
-        )
-    builder.button(text="🔔 SFX появления: " + ("вкл" if s.enable_sfx else "выкл"), callback_data="toggle:enable_sfx")
+        _add(builder, f"🎬 {banner_name or s.banner_id}", "screen:banners", PRIMARY)
+        _add(builder, f"👁 Показов: {s.banner_count}", "cycle:banner_count")
+        _add(builder, f"⏱ Пауза: {s.banner_duration:g} с", "cycle:banner_duration")
+        _add(builder, f"🎞 {texts.BANNER_MODE_LABELS[s.banner_mode].capitalize()}", "cycle:banner_mode")
+        _add(builder, f"📍 {texts.POSITION_LABELS[s.banner_position].capitalize()}", "cycle:banner_position")
+        _add(builder, f"📏 Масштаб: {s.banner_scale}%", "cycle:banner_scale")
+        _add(builder, f"{'🔊' if s.banner_sound else '🔇'} Звук баннера", "toggle:banner_sound")
+        rows += [1, 2, 2, 2]
+    _add(builder, f"🔔 Звук появления: {'вкл' if s.enable_sfx else 'выкл'}", "toggle:enable_sfx")
+    rows += [1]
 
     if s.static_banner_id:
-        builder.button(text=f"📌 Постоянный: {static_name or s.static_banner_id}", callback_data="screen:banners")
-        builder.button(
-            text=f"📌 Позиция: {texts.STATIC_POSITION_LABELS[s.static_position]}",
-            callback_data="cycle:static_position",
-        )
-        builder.button(text=f"📌 Масштаб: {s.static_scale}%", callback_data="cycle:static_scale")
-        builder.button(text="📌 Убрать постоянный", callback_data="static:off")
+        _add(builder, f"📌 {static_name or s.static_banner_id}", "screen:banners", PRIMARY)
+        _add(builder, f"📌 {texts.STATIC_POSITION_LABELS[s.static_position].capitalize()}", "cycle:static_position")
+        _add(builder, f"📌 Масштаб: {s.static_scale}%", "cycle:static_scale")
+        _add(builder, "🗑 Убрать", "static:off", DANGER)
+        rows += [1, 2, 1]
     else:
-        builder.button(text="📌 Постоянный баннер: выкл", callback_data="static:on")
+        _add(builder, "📌 Постоянный баннер: выкл", "static:on")
+        rows += [1]
 
-    builder.button(text="🧩 Ещё настройки", callback_data="screen:more")
-    builder.button(text="🚀 Нарезать", callback_data="job:start")
-    builder.button(text="🏠 В начало", callback_data="screen:menu")
+    _add(builder, "🧩 Ещё настройки", "screen:more")
+    _add(builder, "🚀 Нарезать", "job:start", SUCCESS)
+    _add(builder, "🏠 В начало", "screen:menu")
+    rows += [1, 1, 1]
 
-    # по две кнопки в ряд; одиночные — отдельной строкой
-    rows = [
-        2, 2, 2, 1,
-        1 if s.banner_count == 0 else 2,
-        *([2, 2, 1] if s.banner_count else []),
-        1,
-        *([2, 1] if s.static_banner_id else [1]),
-        1, 1, 1,
-    ]
     builder.adjust(*rows)
     return builder.as_markup()
 
 
-def more_settings(s) -> InlineKeyboardMarkup:
-    """"Ещё": автообрезка, ручная обрезка, частота нарезки, качество."""
+def stepper_screen(stepper: Stepper, value: float) -> InlineKeyboardMarkup:
+    """Выбор числа: пресеты, «−/+» и ввод своего значения."""
     builder = InlineKeyboardBuilder()
-    builder.button(
-        text=("✂️ Автообрезка: вкл" if s.auto_trim else "✂️ Автообрезка: выкл"), callback_data="toggle:auto_trim"
+    for preset in stepper.presets:
+        selected = preset == value
+        label = f"{preset:g}" + (f" {stepper.unit}" if stepper.unit else "")
+        _add(builder, f"● {label}" if selected else label, f"set:{stepper.field}:{preset:g}", PRIMARY if selected else None)
+    step = f"{stepper.step:g}"
+    _add(builder, f"−{step}", f"step:{stepper.field}:-{step}")
+    _add(builder, stepper.show(value), "noop")
+    _add(builder, f"+{step}", f"step:{stepper.field}:{step}")
+    _add(builder, "✍️ Ввести своё число", f"type:{stepper.field}")
+    _add(builder, "✅ Готово", stepper.back, SUCCESS)
+    columns = 3 if len(stepper.presets) % 3 == 0 else 2
+    rows = [columns] * (len(stepper.presets) // columns) + [len(stepper.presets) % columns] * (
+        1 if len(stepper.presets) % columns else 0
     )
-    builder.button(text=f"✂️ Обрезать начало: {s.start_offset:g} с", callback_data="edit:start_offset")
-    builder.button(text=f"✂️ Обрезать конец: {s.end_offset:g} с", callback_data="edit:end_offset")
-    builder.button(text=f"📥 Качество: до {s.max_height}p", callback_data="cycle:max_height")
-    builder.button(text="⬅️ Назад", callback_data="screen:settings")
+    builder.adjust(*rows, 3, 1, 1)
+    return builder.as_markup()
+
+
+def more_settings(s) -> InlineKeyboardMarkup:
+    """«Ещё»: автообрезка, ручная обрезка, качество скачивания."""
+    builder = InlineKeyboardBuilder()
+    _add(builder, f"{_mark(s.auto_trim)} Автообрезка", "toggle:auto_trim:more", SUCCESS if s.auto_trim else None)
+    _add(builder, f"✂️ Начало: −{s.start_offset:g} с", "edit:start_offset")
+    _add(builder, f"✂️ Конец: −{s.end_offset:g} с", "edit:end_offset")
+    _add(builder, f"📥 Качество: до {s.max_height}p", "cycle:max_height")
+    _add(builder, "⬅️ Назад", "screen:settings")
     builder.adjust(1, 2, 1, 1)
     return builder.as_markup()
 
 
 def trim_screen(s) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    builder.button(
-        text=("✅ Автообрезка включена" if s.auto_trim else "⏺ Автообрезка выключена"), callback_data="toggle:auto_trim"
-    )
-    builder.button(text=f"➖ Начало: {s.start_offset:g} с", callback_data="edit:start_offset")
-    builder.button(text=f"➖ Конец: {s.end_offset:g} с", callback_data="edit:end_offset")
-    builder.button(text="⬅️ Назад", callback_data="screen:settings")
+    _add(builder, f"{_mark(s.auto_trim)} Автообрезка", "toggle:auto_trim:trim", SUCCESS if s.auto_trim else None)
+    _add(builder, f"➖ Начало: {s.start_offset:g} с", "edit:start_offset")
+    _add(builder, f"➖ Конец: {s.end_offset:g} с", "edit:end_offset")
+    _add(builder, "⬅️ Назад", "screen:settings")
     builder.adjust(1, 2, 1)
     return builder.as_markup()
 
 
-def banner_picker(banners: list, selected: str | None, *, for_static: bool = False) -> InlineKeyboardMarkup:
-    """Выбор баннера из списка: 🎞 — видео (со звуком), ▬ — широкая полоса."""
+# ---------- баннеры ----------
+
+
+def _banner_icon(banner) -> str:
+    if banner.media == "video":
+        return "🎞"
+    if banner.role == "strip":
+        return "▬"
+    if banner.media == "gif":
+        return "🌀"
+    return "🖼"
+
+
+def banner_picker(banners: list, selected: tuple[str | None, ...] = (), *, with_draft: bool = True) -> InlineKeyboardMarkup:
+    """Выбор баннера. 🎞 — видео со звуком, ▬ — полоса под постоянный баннер, 🌀 — анимация."""
     builder = InlineKeyboardBuilder()
     for banner in banners:
-        mark = "✅ " if banner.id == selected else ""
-        if banner.media == "video":
-            icon = "🎞"
-        elif banner.role == "strip":
-            icon = "▬"
-        elif banner.media == "gif":
-            icon = "🌀"
-        else:
-            icon = "🖼"
-        name = banner.name
-        if len(name) > 34:
-            name = name[:33] + "…"
-        prefix = "static:" if for_static else "banner:"
-        builder.button(text=f"{mark}{icon} {name}", callback_data=f"{prefix}{banner.id}")
-    builder.button(text="📤 Загрузить свой баннер", callback_data="ask:banner" if not for_static else "ask:banner")
-    builder.button(text="⬅️ Назад", callback_data="screen:settings")
-    # длинные id не должны ломать лимит 64 байта — проверяем и обрезаем имя файла в callback
+        name = banner.name if len(banner.name) <= 32 else banner.name[:31] + "…"
+        current = banner.id in selected
+        _add(builder, f"{'✅ ' if current else ''}{_banner_icon(banner)} {name}", f"banner:{banner.id}", PRIMARY if current else None)
+    _add(builder, "📤 Загрузить свой", "ask:banner", SUCCESS)
+    _add(builder, "⬅️ Назад" if with_draft else "🏠 В начало", "screen:settings" if with_draft else "screen:menu")
     builder.adjust(*([1] * (len(banners) + 2)))
     return builder.as_markup()
 
 
-def banner_confirm(name: str) -> InlineKeyboardMarkup:
-    builder = InlineKeyboardBuilder()
-    builder.button(text="✅ Оставить", callback_data="screen:settings")
-    builder.button(text="🔄 Выбрать другой", callback_data="screen:banners")
-    builder.adjust(2)
-    return builder.as_markup()
+# ---------- нарезка ----------
 
 
-def running(state_id: str) -> InlineKeyboardMarkup:
+def running(job_id: str) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    builder.button(text="⏹ Остановить", callback_data=f"job:cancel:{state_id}")
-    builder.adjust(1)
+    _add(builder, "⏹ Остановить", f"job:cancel:{job_id}", DANGER)
     return builder.as_markup()
 
 
 def done() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    builder.button(text="🎬 Ещё ролик", callback_data="ask:link")
-    builder.button(text="⚙️ Настройки", callback_data="screen:settings")
-    builder.button(text="🏠 В начало", callback_data="screen:menu")
-    builder.adjust(2, 1)
+    _add(builder, "🎬 Ещё ролик", "ask:link", PRIMARY)
+    _add(builder, "⚙️ Настройки", "screen:settings")
+    _add(builder, "🏠 В начало", "screen:menu")
+    builder.adjust(1, 2)
     return builder.as_markup()
 
-
-def cancel_only() -> InlineKeyboardMarkup:
-    builder = InlineKeyboardBuilder()
-    builder.button(text="⬅️ Отмена", callback_data="screen:settings")
-    builder.adjust(1)
-    return builder.as_markup()

@@ -9,7 +9,7 @@ import datetime as dt
 import json
 from typing import Any
 
-from aiogram import Bot, Dispatcher
+from aiogram import Bot
 from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.base import BaseSession
 from aiogram.client.telegram import TelegramAPIServer
@@ -26,7 +26,6 @@ from aiogram.types import (
 )
 
 from app.bot.app import build_app
-from app.bot.context import AppContext
 from app.bot.runner import JobRunner
 from app.config import Settings
 
@@ -92,7 +91,10 @@ class FakeSession(BaseSession):
             return _message(bot, chat_id, getattr(method, "text", None) or getattr(method, "caption", None))
         if name == "getFile":
             return File(file_id=method.file_id, file_unique_id="uniq", file_size=1024, file_path="videos/file.mp4")
-        if name in ("deleteMessage", "setMyCommands", "answerCallbackQuery", "editMessageReplyMarkup"):
+        if name in (
+            "deleteMessage", "setMyCommands", "deleteMyCommands", "setChatMenuButton", "setMyDescription",
+            "setMyShortDescription", "answerCallbackQuery", "editMessageReplyMarkup",
+        ):  # fmt: skip
             return True
         if name == "editMessageMedia":
             return _message(bot, chat_id)
@@ -157,14 +159,14 @@ class FakeSession(BaseSession):
 class Harness:
     """Готовая связка: настройки во временной папке, бот с фейковой сессией и диспетчер."""
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, allowed_users: frozenset[int] = frozenset()) -> None:
         self.session = FakeSession()
         self.bot = Bot(
             token=FAKE_TOKEN,
             session=self.session,
             default=DefaultBotProperties(parse_mode=ParseMode.HTML),
         )
-        self.ctx, self.manager, self.dispatcher = build_app(settings)
+        self.ctx, self.manager, self.dispatcher = build_app(settings, allowed_users)
         self.ctx.runner = JobRunner(self.bot, self.manager, self.ctx.store)
         self.dispatcher["ctx"] = self.ctx
 
