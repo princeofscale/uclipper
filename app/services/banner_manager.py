@@ -11,13 +11,28 @@ import subprocess
 import uuid
 import wave
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from PIL import Image, ImageChops, ImageDraw, ImageFont, ImageOps, UnidentifiedImageError
+from PIL import (
+    Image,
+    ImageChops,
+    ImageDraw,
+    ImageFont,
+    ImageOps,
+    UnidentifiedImageError,
+)
 
 from app.config import (
-    BANNER_EXTS, BANNER_SIZE, BANNER_VIDEO_EXTS, DEFAULT_BANNER_FILE, DEFAULT_BANNER_LABEL, PRESETS, STRIP_SIZE, PresetSpec,
+    BANNER_EXTS,
+    BANNER_SIZE,
+    BANNER_VIDEO_EXTS,
+    DEFAULT_BANNER_FILE,
+    DEFAULT_BANNER_LABEL,
+    PRESETS,
+    STRIP_SIZE,
+    PresetSpec,
 )
 from app.services.video_processor import MediaError, probe_media
 
@@ -389,6 +404,24 @@ def list_banners(banners_dir: Path) -> list[BannerInfo]:
     ]
     files.sort(key=lambda path: (order.get(path.name, len(order)), -path.stat().st_mtime, path.name))
     return [info for info in (_describe(path) for path in files) if info is not None]
+
+
+@lru_cache(maxsize=4)
+def _describe_cached(path_text: str, mtime_ns: int, size: int) -> BannerInfo | None:
+    return _describe(Path(path_text))
+
+
+def default_banner(banners_dir: Path) -> BannerInfo | None:
+    """Главный баннер проекта (TGrader) или `None`, если файла нет.
+
+    Описание берётся из кеша: бот спрашивает его на каждом экране, а ffprobe файла, который не меняется, дорог.
+    """
+    path = banners_dir / DEFAULT_BANNER_FILE
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return _describe_cached(str(path), stat.st_mtime_ns, stat.st_size)
 
 
 def _slug(stem: str) -> str:

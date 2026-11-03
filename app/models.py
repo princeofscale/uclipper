@@ -15,6 +15,22 @@ class FrameMode(StrEnum):
 class SlicingMode(StrEnum):
     SEQUENTIAL = "sequential"  # подряд друг за другом
     EVENLY_SPACED = "evenly_spaced"  # равномерно по всему видео
+    HIGHLIGHTS = "highlights"  # из каждой части ролика — самый громкий и живой момент (по звуку)
+
+
+class CutMode(StrEnum):
+    """Как пользователь настраивает нарезку: всё сам или доверяет автоподбору."""
+
+    AUTO = "auto"
+    MANUAL = "manual"
+
+
+class Goal(StrEnum):
+    """Куда пойдут клипы: от этого зависят их число и длина в автоподборе."""
+
+    TIKTOK = "tiktok"
+    SHORTS = "shorts"
+    UNIVERSAL = "universal"
 
 
 class BannerMode(StrEnum):
@@ -96,6 +112,8 @@ class Draft(BaseModel):
     duration: float = 0.0
     thumbnail: str | None = None
     settings: ClipSettings = Field(default_factory=ClipSettings)
+    mode: CutMode | None = None  # None: человек ещё не выбрал, как нарезать
+    goal: Goal = Goal.TIKTOK  # цель автоподбора
 
     @classmethod
     def from_video(cls, info: VideoInfo, settings: ClipSettings) -> "Draft":
@@ -174,6 +192,7 @@ class JobState(BaseModel):
     stage: str = "В очереди"
     log: list[str] = Field(default_factory=list)
     clips: list[ClipResult] = Field(default_factory=list)
+    total_clips: int = 0  # сколько клипов решено сделать (известно после расчёта плана; 0 — ещё считаем)
     trim: TrimInfo | None = None  # None, если начало и конец не обрезались
     archive_name: str | None = None  # имя ZIP-архива в папке задачи
     error: str | None = None

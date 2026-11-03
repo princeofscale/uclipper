@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Callable
 
 from app.config import Settings
-from app.models import ClipResult, JobRequest, JobState, JobStatus, SourceType, TrimInfo
+from app.models import ClipResult, JobRequest, JobState, JobStatus, SlicingMode, SourceType, TrimInfo
 from app.services.auto_trim import analyze_trim
 from app.services.banner_manager import BannerError, ensure_sfx, resolve_banner
 from app.services.downloader import (
@@ -25,13 +25,16 @@ from app.services.downloader import (
     extract_video_id,
     resolve_upload,
 )
+from app.services.highlights import find_highlights
 from app.services.video_processor import (
+    ClipSchedule,
     MediaError,
     MediaInfo,
     RenderOptions,
     compute_clip_schedule,
     probe_media,
     render_clip,
+    snap,
 )
 
 logger = logging.getLogger(__name__)
@@ -59,7 +62,7 @@ class JobManager:
         self._archives: dict[str, Path] = {}
         self._cancelled: set[str] = set()
         self._stopping = threading.Event()
-        self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="clipbanner-job")
+        self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="clipper-job")
 
     # ---------- публичный интерфейс ----------
 
@@ -239,9 +242,7 @@ class JobManager:
         self._log(job_id, f"Источник: {info.width}×{info.height}, {info.duration:.1f} с, {sound}")
         start_offset, end_offset = self._trim(request, job_id, source, info)
         try:
-            schedule = compute_clip_schedule(
-                info.duration, start_offset, request.num_clips, request.clip_duration, request.slicing_mode, end_offset
-            )
+            schedule = self._schedule(request, job_id, source, info, start_offset, end_offset)
         except ValueError as error:
             raise MediaError(str(error)) from error
         for warning in schedule.warnings:
@@ -279,6 +280,37 @@ class JobManager:
         self._update(job_id, status=JobStatus.DONE, stage="Готово", progress=100.0, archive_name=archive.name)
         self._log(job_id, f"Готово: роликов — {len(clips)}, архив {archive.name}")
         notifier.touch()
+
+    def _schedule(
+        self, request: JobRequest, job_id: str, source: Path, info: MediaInfo, start_offset: float, end_offset: float
+    ) -> ClipSchedule:
+        """Где в источнике лежат клипы. Режим «яркие моменты» ищет их по звуку, а если не вышло — раскладывает ровно."""
+        highlights = request.slicing_mode is SlicingMode.HIGHLIGHTS
+        base = compute_clip_schedule(
+            info.duration,
+            start_offset,
+            request.num_clips,
+            request.clip_duration,
+            SlicingMode.EVENLY_SPACED if highlights else request.slicing_mode,
+            end_offset,
+        )
+        if not highlights:
+            return base
+        self._update(job_id, stage="Ищу яркие моменты")
+        self._check_not_stopping(job_id)
+        starts: list[float] = []
+        if info.has_audio:
+            starts = find_highlights(
+                source, start_offset, info.duration - end_offset, request.num_clips, base.clip_duration
+            )
+        if not starts:
+            warning = "Яркие моменты найти не вышло (в ролике мало звука) — клипы распределены равномерно."
+            self._log(job_id, f"Внимание: {warning}")
+            return ClipSchedule(base.starts, base.clip_duration, base.slicing_mode, [*base.warnings, warning])
+        starts = [snap(second) for second in starts]
+        self._log(job_id, "Яркие моменты: " + ", ".join(f"{second:.0f} с" for second in starts))
+        kept = [warning for warning in base.warnings if "перекрыв" not in warning]
+        return ClipSchedule(starts, base.clip_duration, SlicingMode.HIGHLIGHTS, kept)
 
     def _trim(self, request: JobRequest, job_id: str, source: Path, info: MediaInfo) -> tuple[float, float]:
         """Сколько секунд отрезать с начала и с конца: ищет программа (`auto_trim`) или это задано вручную."""
@@ -350,6 +382,7 @@ class JobManager:
         on_clip: Notify | None,
     ) -> list[ClipResult]:
         total = len(starts)
+        self._update(job_id, total_clips=total)
         self._log(job_id, f"Нарезаю клипов: {total}, чистая длительность каждого — {clip_duration:g} с")
         clips: list[ClipResult] = []
         for position, start in enumerate(starts):

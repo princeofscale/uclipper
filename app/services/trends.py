@@ -1,0 +1,298 @@
+"""«В тренде»: что сейчас смотрят русскоязычные зрители — сырьё для нарезки под TikTok и Shorts.
+
+Официальную ленту трендов YouTube закрыл, поэтому берём то, что доступно без входа в аккаунт: поиск
+YouTube с фильтром «за неделю» и сортировкой по просмотрам (через yt-dlp) по запросам тех жанров, из
+которых получаются хорошие клипы. Две тонкости, которые пришлось учесть:
+
+• поиск по-русски возвращает и английские ролики с машинным переводом названия — настоящее название
+  узнаём через oEmbed (быстро, пачкой) и оставляем только то, что по-русски на самом деле;
+• ролик короче пяти минут — уже готовый шорт, нарезать нечего, а длиннее четырёх часов — слишком тяжело.
+
+Ответы кешируются на полчаса: данные меняются медленно, а YouTube не любит одинаковые запросы по кругу.
+Все функции блокирующие — зовите их через `TrendCache.cached` (он уводит работу в поток).
+"""
+from __future__ import annotations
+
+import asyncio
+import base64
+import json
+import logging
+import re
+import shutil
+import time
+import urllib.parse
+import urllib.request
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from typing import TypeVar
+
+import yt_dlp
+
+log = logging.getLogger(__name__)
+
+T = TypeVar("T")
+
+CACHE_SECONDS = 30 * 60
+FAILURE_SECONDS = 3 * 60  # после неудачи не долбим источник чаще, чем раз в пару минут
+MIN_SECONDS = 5 * 60  # короче — это уже готовый шорт, нарезать нечего
+MAX_SECONDS = 4 * 3600  # длиннее — слишком тяжело для бота
+MIN_VIEWS = 2_000  # совсем непросматриваемое в «тренд» не пускаем
+PER_CHANNEL = 2  # столько роликов с одного канала в одной подборке, чтобы список не был однообразным
+FETCH_LIMIT = 40  # сколько результатов просим у YouTube на один запрос
+OEMBED_URL = "https://www.youtube.com/oembed?format=json&url="
+USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+
+_CYRILLIC = re.compile(r"[А-Яа-яЁё]")
+_NOT_RUSSIAN = re.compile(r"[әғқңөұүһіїєґўӘҒҚҢӨҰҮҺІЇЄҐЎ]")  # кириллица, но казахский, украинский, белорусский
+
+
+class TrendsError(RuntimeError):
+    """Не получилось узнать, что в тренде. Текст — по-русски, его увидит пользователь."""
+
+
+@dataclass(frozen=True)
+class Category:
+    id: str  # короткий — он едет в callback_data
+    emoji: str
+    title: str
+    queries: tuple[str, ...]  # что искать на YouTube; короткие русские слова дают самую русскую выдачу
+    hint: str  # чем хороши для нарезки
+
+
+CATEGORIES: tuple[Category, ...] = (
+    Category("podcast", "🎙", "Подкасты и интервью", ("интервью", "подкаст"), "цитаты и острые моменты разговора"),
+    Category("humor", "😂", "Юмор и стендап", ("стендап", "юмор"), "панчи, которые просят повторить"),
+    Category("games", "🎮", "Игры и стримы", ("прохождение", "майнкрафт"), "хайлайты и неожиданные повороты"),
+    Category("money", "💼", "Бизнес и деньги", ("деньги", "заработок"), "советы и разборы в паре фраз"),
+    Category("movies", "🎬", "Кино и сериалы", ("обзор фильма", "обзор сериала"), "мнения, споры и разборы сюжета"),
+    Category("sport", "⚽", "Спорт", ("футбол", "хоккей", "бокс"), "голы, нокауты и громкие заявления"),
+)
+CATEGORY_BY_ID = {category.id: category for category in CATEGORIES}
+
+
+# ---------------------------------------------------------------------------
+# Кеш
+# ---------------------------------------------------------------------------
+
+
+class TrendCache:
+    """Кеш с временем жизни. `cached` не даёт нескольким нажавшим одновременно гонять один запрос дважды."""
+
+    def __init__(self, ttl: float = CACHE_SECONDS, *, clock: Callable[[], float] = time.monotonic, size: int = 64) -> None:
+        self._ttl = ttl
+        self._clock = clock
+        self._size = size
+        self._items: dict[str, tuple[float, object]] = {}
+        self._locks: dict[str, asyncio.Lock] = {}
+
+    def get(self, key: str):
+        found = self._items.get(key)
+        if found is None:
+            return None
+        expires, value = found
+        if self._clock() >= expires:
+            del self._items[key]
+            return None
+        return value
+
+    def put(self, key: str, value: object, ttl: float | None = None) -> None:
+        if len(self._items) >= self._size:
+            self._items.pop(min(self._items, key=lambda name: self._items[name][0]), None)
+        self._items[key] = (self._clock() + (self._ttl if ttl is None else ttl), value)
+
+    def forget(self, key: str) -> None:
+        self._items.pop(key, None)
+
+    def _hit(self, key: str):
+        hit = self.get(key)
+        if isinstance(hit, TrendsError):  # недавняя неудача тоже кешируется — чтобы не долбить источник
+            raise hit
+        return hit
+
+    async def cached(self, key: str, fetch: Callable[[], T]) -> T:
+        """Значение из кеша или результат `fetch()`, выполненного в потоке."""
+        hit = self._hit(key)
+        if hit is not None:
+            return hit  # type: ignore[return-value]
+        async with self._locks.setdefault(key, asyncio.Lock()):
+            hit = self._hit(key)
+            if hit is not None:
+                return hit  # type: ignore[return-value]
+            try:
+                value = await asyncio.to_thread(fetch)
+            except TrendsError as error:
+                self.put(key, error, FAILURE_SECONDS)
+                raise
+            self.put(key, value)
+            return value
+
+
+# ---------------------------------------------------------------------------
+# Поиск на YouTube
+# ---------------------------------------------------------------------------
+
+_PERIODS = {"day": 2, "week": 3, "month": 4}  # значения фильтра «Дата загрузки» в поиске YouTube
+
+
+def search_filter(period: str = "week") -> str:
+    """Параметр `sp` поиска YouTube: тип «видео», период, сортировка по числу просмотров.
+
+    Это protobuf, собранный руками: sort=3 (по просмотрам), в фильтрах — дата и тип (1 = видео).
+    """
+    filters = bytes([0x08, _PERIODS[period], 0x10, 0x01])
+    raw = bytes([0x08, 0x03, 0x12, len(filters)]) + filters
+    return urllib.parse.quote(base64.urlsafe_b64encode(raw).decode(), safe="")
+
+
+def looks_russian(title: str) -> bool:
+    """Название написано по-русски: не английское и не на казахском/украинском (там своя кириллица)."""
+    if _NOT_RUSSIAN.search(title):
+        return False
+    letters = [char for char in title if char.isalpha()]
+    count = len(_CYRILLIC.findall(title))
+    return count >= 4 and count / len(letters) >= 0.4
+
+
+def _js_runtimes() -> dict[str, dict]:
+    found = {name: {} for name in ("deno", "node", "bun") if shutil.which(name)}
+    return found or {"deno": {}}
+
+
+def _search(query: str, period: str) -> list[dict]:
+    url = f"https://www.youtube.com/results?search_query={urllib.parse.quote(query)}&sp={search_filter(period)}"
+    options = {
+        "quiet": True,
+        "no_warnings": True,
+        "extract_flat": True,
+        "playlistend": FETCH_LIMIT,
+        "js_runtimes": _js_runtimes(),
+        "socket_timeout": 15,
+    }
+    try:
+        with yt_dlp.YoutubeDL(options) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except yt_dlp.utils.YoutubeDLError as error:
+        raise TrendsError("YouTube сейчас не отвечает — попробуйте через пару минут.") from error
+    return [entry for entry in (info or {}).get("entries") or [] if entry and entry.get("id")]
+
+
+def _search_all(queries: tuple[str, ...], period: str) -> tuple[list[dict], bool]:
+    """Результаты всех запросов разом, самые просматриваемые первыми. Второе значение: хоть один ответил."""
+
+    def one(query: str) -> list[dict] | None:
+        try:
+            return _search(query, period)
+        except TrendsError:
+            return None
+
+    with ThreadPoolExecutor(max_workers=len(queries)) as pool:
+        answers = list(pool.map(one, queries))
+    merged: dict[str, dict] = {}
+    for entries in answers:
+        for entry in entries or []:
+            merged.setdefault(entry["id"], entry)
+    ordered = sorted(merged.values(), key=lambda entry: int(entry.get("view_count") or 0), reverse=True)
+    return ordered, any(entries is not None for entries in answers)
+
+
+def pick_videos(entries: list[dict], limit: int, *, taken: set[str] | None = None) -> list[dict]:
+    """Оставляет русскоязычные ролики подходящей длины, не больше двух с канала. Порядок сохраняется."""
+    seen = set(taken or ())
+    per_channel: dict[str, int] = {}
+    chosen: list[dict] = []
+    for entry in entries:
+        video_id = entry.get("id") or ""
+        title = (entry.get("title") or "").strip()
+        duration = float(entry.get("duration") or 0)
+        views = int(entry.get("view_count") or 0)
+        if video_id in seen or not title or not looks_russian(title) or views < MIN_VIEWS:
+            continue
+        if not MIN_SECONDS <= duration <= MAX_SECONDS or entry.get("live_status") in ("is_live", "is_upcoming"):
+            continue
+        channel = entry.get("channel") or entry.get("uploader") or ""
+        if channel and per_channel.get(channel, 0) >= PER_CHANNEL:
+            continue
+        seen.add(video_id)
+        per_channel[channel] = per_channel.get(channel, 0) + 1
+        chosen.append(
+            {
+                "video_id": video_id,
+                "title": title,
+                "duration": duration,
+                "uploader": channel,
+                "views": views,
+                "url": f"https://www.youtube.com/watch?v={video_id}",
+                "thumbnail": f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg",
+            }
+        )
+        if len(chosen) >= limit:
+            break
+    return chosen
+
+
+def _original_title(video_id: str) -> str | None:
+    """Настоящее название ролика (не машинный перевод) через oEmbed. `None` — узнать не вышло."""
+    watch = urllib.parse.quote(f"https://www.youtube.com/watch?v={video_id}", safe="")
+    request = urllib.request.Request(OEMBED_URL + watch, headers={"User-Agent": USER_AGENT})
+    try:
+        with urllib.request.urlopen(request, timeout=8) as response:  # noqa: S310 — адрес зашит выше
+            return str(json.loads(response.read(200_000)).get("title") or "") or None
+    except (OSError, ValueError):
+        return None
+
+
+def keep_original_russian(videos: list[dict]) -> list[dict]:
+    """Убирает английские ролики с переведённым названием. Если проверить не вышло — ролик остаётся."""
+    if not videos:
+        return []
+    with ThreadPoolExecutor(max_workers=min(8, len(videos))) as pool:
+        originals = list(pool.map(lambda video: _original_title(video["video_id"]), videos))
+    kept = []
+    for video, original in zip(videos, originals):
+        if original is None:
+            kept.append(video)
+        elif looks_russian(original):
+            kept.append({**video, "title": original})
+    return kept
+
+
+def fetch_videos(queries: tuple[str, ...], limit: int = 8) -> list[dict]:
+    """Самое просматриваемое по запросам: сначала за неделю, не хватило — добираем за месяц.
+
+    Пустой список — ничего подходящего; `TrendsError` — YouTube не ответил.
+    """
+    chosen: list[dict] = []
+    answered = False
+    for period in ("week", "month"):
+        entries, ok = _search_all(queries, period)
+        answered = answered or ok
+        if not ok:
+            continue
+        candidates = pick_videos(entries, limit * 3, taken={video["video_id"] for video in chosen})
+        chosen += keep_original_russian(candidates)[: limit - len(chosen)]
+        if len(chosen) >= limit:
+            break
+    if not answered:
+        raise TrendsError("YouTube сейчас не отвечает — попробуйте через пару минут.")
+    return chosen
+
+
+def fetch_category(category: Category, limit: int = 8) -> list[dict]:
+    return fetch_videos(category.queries, limit)
+
+
+# ---------------------------------------------------------------------------
+# Подписи
+# ---------------------------------------------------------------------------
+
+
+def views_text(views: int) -> str:
+    """`1_340_000` → «1,3 млн», `87_300` → «87 тыс.», `950` → «950»."""
+    if views >= 10_000_000:
+        return f"{views / 1_000_000:.0f} млн"
+    if views >= 1_000_000:
+        return f"{views / 1_000_000:.1f}".replace(".", ",") + " млн"
+    if views >= 1_000:
+        return f"{views / 1_000:.0f} тыс."
+    return str(views)
