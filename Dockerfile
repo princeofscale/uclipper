@@ -27,4 +27,4 @@ RUN useradd --system --uid 10001 --home-dir /app bot \
     && mkdir -p /app/workspace && chown -R bot:bot /app/workspace
 USER bot
 
-CMD ["python", "-m", "app.bot.app"]
+CMD ["python", "-m", "app.bot"]

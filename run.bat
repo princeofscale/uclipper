@@ -49,7 +49,7 @@ if /i "%~1"=="--check" (
 )
 
 echo ClipBanner Bot запускается. Остановить: Ctrl+C
-".venv\Scripts\python.exe" -m app.bot.app
+".venv\Scripts\python.exe" -m app.bot
 goto :eof
 
 :no_ffmpeg

@@ -75,4 +75,4 @@ if [ "$CHECK_ONLY" = "1" ]; then
 fi
 
 echo "ClipBanner Bot запускается. Остановить: Ctrl+C"
-exec .venv/bin/python -m app.bot.app
+exec .venv/bin/python -m app.bot
