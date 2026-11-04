@@ -128,7 +128,10 @@ def test_tiny_cache_file_is_not_trusted(ydl, tmp_path):
 def test_download_passes_the_options_from_the_spec_to_yt_dlp(ydl, tmp_path):
     download_video_cached(URL, 720, cache_dir=tmp_path)
     opts = ydl.instances[0].opts
-    assert opts["format"] == "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best"
+    assert opts["format"] == (
+        "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]"
+        "/bestvideo[height<=?720]+bestaudio/best[height<=?720]/best"
+    )  # хвост — запасные варианты для площадок без mp4+m4a или без указанной высоты
     assert opts["merge_output_format"] == "mp4"
     assert opts["noplaylist"] is True
     assert opts["outtmpl"] == str(tmp_path / f"source_{VIDEO_ID}.%(ext)s")
@@ -188,6 +191,16 @@ def test_download_progress_goes_from_zero_to_one_across_video_and_audio(ydl, tmp
     assert seen == [0.25, 0.5, 0.625, 1.0]
 
 
+def test_download_progress_reaches_one_when_the_file_is_a_single_stream(ydl, tmp_path):
+    ydl.progress_events = [
+        {"status": "downloading", "filename": "clip.mp4", "downloaded_bytes": 50, "total_bytes": 100},
+        {"status": "finished", "filename": "clip.mp4"},
+    ]
+    seen = []
+    download_video_cached(RUTUBE_URL, cache_dir=tmp_path, on_progress=seen.append)
+    assert seen == [0.25, 0.5, 1.0]  # HLS и клипы приходят одним файлом: без финального шага шкала застряла бы на половине
+
+
 # ---------- ошибки площадок ----------
 
 
@@ -201,6 +214,7 @@ def test_download_progress_goes_from_zero_to_one_across_video_and_audio(ydl, tmp
         ("ERROR: [vk] x: Access restricted", "приватности"),
         ("ERROR: [youtube] x: This live event will begin in 2 hours", "Трансляция ещё не началась"),
         ("ERROR: [youtube] x: Requested format is not available", "снизить максимальное качество"),
+        ("ERROR: [dailymotion] x: The extractor is attempting impersonation, but none of these impersonate targets are available: firefox", "защита от ботов"),
     ],
 )
 def test_known_failures_are_explained_in_russian(ydl, tmp_path, raw, expected):

@@ -30,6 +30,7 @@ _ERROR_HINTS = (
     ("http error 404", "Такого ролика нет: возможно, его удалили."),
     ("requested format is not available", "Для этого ролика нет подходящего формата — попробуйте снизить максимальное качество."),
     ("will begin in", "Трансляция ещё не началась."),
+    ("impersonat", "Площадка сейчас не пускает сервер (защита от ботов) — попробуйте ещё раз через пару минут."),
 )
 
 
@@ -64,6 +65,20 @@ def _explain(error: Exception, platform: Platform) -> str:
             return message
     first_line = text.removeprefix("ERROR: ").splitlines()[0] if text else "неизвестная ошибка"
     return f"Не удалось получить видео с площадки {platform.title}: {first_line}"
+
+
+def _format_selector(max_height: int) -> str:
+    """Лучшее видео не выше `max_height`: mp4 + m4a (как у YouTube), потом готовый mp4, потом любые видео и звук.
+
+    `height<=?` пропускает форматы без указанной высоты: у части площадок (например, у Coub-вставок на OK) её нет.
+    """
+    return (
+        f"bestvideo[height<={max_height}][ext=mp4]+bestaudio[ext=m4a]"
+        f"/best[height<={max_height}][ext=mp4]"
+        f"/bestvideo[height<=?{max_height}]+bestaudio"
+        f"/best[height<=?{max_height}]"
+        "/best"
+    )
 
 
 def _hours_text(seconds: float) -> str:
@@ -142,8 +157,10 @@ def download_video_cached(
         return cached
 
     seen_files: list[str] = []
+    reported = 0.0
 
     def on_event(event: dict) -> None:
+        nonlocal reported
         if on_progress is None:
             return
         name = event.get("filename") or ""
@@ -154,10 +171,11 @@ def download_video_cached(
         else:
             total = event.get("total_bytes") or event.get("total_bytes_estimate") or 0
             part = min(1.0, (event.get("downloaded_bytes") or 0) / total) if total else 0.0
-        on_progress(min(1.0, (min(seen_files.index(name), 1) + part) / 2))
+        reported = min(1.0, (min(seen_files.index(name), 1) + part) / 2)
+        on_progress(reported)
 
     options = _base_options(source.platform) | {
-        "format": f"bestvideo[height<={max_height}][ext=mp4]+bestaudio[ext=m4a]/best[height<={max_height}][ext=mp4]/best",
+        "format": _format_selector(max_height),
         "format_sort": ["res", "vcodec:h264"],  # то же разрешение — H.264 раньше AV1 (быстрее и совместимее)
         "merge_output_format": "mp4",
         "outtmpl": str(cache_dir / f"source_{key}.%(ext)s"),
@@ -170,6 +188,8 @@ def download_video_cached(
             ydl.download([source.url])
     except yt_dlp.utils.YoutubeDLError as error:
         raise DownloadError(_explain(error, source.platform)) from error
+    if on_progress is not None and reported < 1.0:
+        on_progress(1.0)  # файл был один (HLS, клип): шкала «два файла» до конца не дошла сама
     return _finalize(key, cache_dir)
 
 
