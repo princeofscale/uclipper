@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass, field
 
 from aiogram import Bot
@@ -37,6 +38,9 @@ class RunningJob:
     sent_clips: set[int] = field(default_factory=set)  # индексы уже отправленных роликов
     last_progress_text: str = ""  # чтобы не править сообщение тем же текстом дважды
     finished: bool = False
+    started_at: float = field(default_factory=time.monotonic)  # от этого момента считается «прошло»
+    moved_at: float = field(default_factory=time.monotonic)  # когда у человека на глазах в последний раз что-то менялось
+    last_key: tuple | None = None  # что именно было видно в тот момент: стадия, процент, число готовых клипов
 
 
 class JobRunner:
@@ -47,7 +51,6 @@ class JobRunner:
         self._manager = manager
         self._store = store
         self._lock = asyncio.Lock()
-        self._latest: dict[str, JobState] = {}
         self._events: dict[str, asyncio.Event] = {}
         self._loop = asyncio.get_running_loop()
         self._jobs: dict[str, RunningJob] = {}  # по порядку запуска; задача уходит отсюда, когда клипы доставлены
@@ -60,17 +63,14 @@ class JobRunner:
         loop = self._loop
         events: dict[str, asyncio.Event] = {}
 
-        def on_update(state: JobState) -> None:  # зовётся из потока задачи
-            self._latest[state.id] = state
+        def wake(state: JobState) -> None:  # зовётся из потока задачи: только будит слежение
+            # Само состояние берётся живым у менеджера. Присланный снимок хранить нельзя: между колбэками задача
+            # может минутами менять стадию молча (анализ ролика), и снимок показывал бы давно прошедшее.
             event = events.get(state.id)
             if event is not None:
                 loop.call_soon_threadsafe(event.set)
 
-        def on_clip(state: JobState) -> None:  # тоже из потока: только складываем состояние
-            self._latest[state.id] = state
-            event = events.get(state.id)
-            if event is not None:
-                loop.call_soon_threadsafe(event.set)
+        on_update = on_clip = wake
 
         # id задачи заранее неизвестен, поэтому событие создаём после submit по первому колбэку.
         job_id = self._manager.submit(request, on_update=on_update, on_clip=on_clip)
@@ -122,7 +122,7 @@ class JobRunner:
         running = self._jobs.get(job_id)
         if running is None:
             return None
-        return self._latest.get(job_id) or running.state
+        return self._manager.get(job_id) or running.state
 
     def oldest_state(self) -> JobState | None:
         """Состояние самой давней из живых нарезок: её прогресс видят те, кому бот сейчас отказывает."""
@@ -143,7 +143,7 @@ class JobRunner:
                 except (asyncio.TimeoutError, TimeoutError):
                     pass  # событие не пришло вовремя — работаем по таймеру
                 event.clear()
-                state = self._latest.get(job_id) or self._manager.get(job_id)
+                state = self._manager.get(job_id)
                 if state is not None:
                     running.state = state
                     await self._send_new_clips(running)
@@ -182,7 +182,16 @@ class JobRunner:
     async def _edit_progress(self, running: RunningJob) -> None:
         state = running.state
         waiting = state.status is JobStatus.QUEUED
-        text = texts.progress_text(state, ahead=self._manager.ahead_of(state.id) if waiting else 0)
+        now = time.monotonic()
+        key = (state.status, state.stage, round(state.progress), len(state.clips))
+        if key != running.last_key:  # у человека на глазах что-то изменилось: молчание отсчитывается заново
+            running.last_key, running.moved_at = key, now
+        text = texts.progress_text(
+            state,
+            ahead=self._manager.ahead_of(state.id) if waiting else 0,
+            elapsed=now - running.started_at,
+            quiet=now - running.moved_at,
+        )
         if text == running.last_progress_text:
             return  # тот же процент и та же стадия — лишний запрос к Telegram не нужен
         running.last_progress_text = text
@@ -207,7 +216,6 @@ class JobRunner:
         running.state = state
         running.finished = True
         self._events.pop(job_id, None)
-        self._latest.pop(job_id, None)
         try:
             if state.status is JobStatus.ERROR:
                 await self._show_final(

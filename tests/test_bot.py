@@ -25,7 +25,7 @@ from app.bot.rich import plain_text
 from app.bot.runner import RunningJob
 from app.bot.states import Flow
 from app.config import Settings
-from app.models import CutMode, FrameMode, Goal, JobStatus, SlicingMode
+from app.models import CutMode, FrameMode, Goal, JobState, JobStatus, SlicingMode
 from app.services import capacity
 from app.services.platforms import EVERYWHERE, SEARCHABLE
 from app.services.platforms import TRENDING as TREND_PLATFORMS
@@ -2178,3 +2178,102 @@ async def test_a_failed_rename_does_not_stop_the_rest_of_the_profile_setup(harne
     await prepare_bot(harness.bot)
 
     assert harness.session.calls("setMyDescription")
+
+
+# ---------- прогресс: стадия видна сразу, время идёт, долгое молчание объяснено ----------
+
+
+async def _wait_until(condition, *, timeout: float = 8.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if condition():
+            return True
+        await asyncio.sleep(0.1)
+    return condition()
+
+
+async def test_progress_shows_the_stage_the_job_is_in_right_now(harness, monkeypatch):
+    """Разбор ролика идёт минутами и ничего не присылает боту: сообщение всё равно должно сменить стадию.
+
+    Раньше оно висело на последнем присланном снимке — «Скачивание видео 20%» — всё время анализа.
+    """
+    import threading
+
+    from app.bot import runner as runner_module
+    from app.models import JobRequest
+    from app.services import jobs as jobs_module
+
+    shown: list[str] = []
+    finish = threading.Event()
+
+    async def edit(message, html, markup=None):
+        shown.append(plain_text(html))
+
+    def long_analysis(self, request, job_id, notifier, on_clip):
+        self._update(job_id, status=JobStatus.RUNNING, stage="Скачивание видео", progress=20.0)
+        notifier.touch()  # последнее, что бот получает сам
+        self._update(job_id, stage="Анализ видео")  # дальше долго и молча — как в настоящей задаче
+        finish.wait(30)
+        raise jobs_module.JobCancelled
+
+    monkeypatch.setattr(runner_module, "edit_html", edit)
+    monkeypatch.setattr(jobs_module.JobManager, "_run", long_analysis)
+    request = JobRequest(source_type="upload", upload_id="demo", banner_count=0)
+
+    await harness.ctx.runner.start(1, 1, request, None)
+    try:
+        assert await _wait_until(lambda: any("Анализ видео" in text for text in shown)), shown
+    finally:
+        finish.set()
+        await _wait_finished(harness)
+
+
+def test_progress_text_counts_the_time_in_steps_that_do_not_flood_telegram():
+    state = JobState(id="j", status=JobStatus.RUNNING, stage="Рендер клипа 1 из 8", progress=21.0)
+
+    shown = plain_text(texts.progress_text(state, elapsed=5 * 60 + 17))
+    assert "Рендер клипа 1 из 8" in shown and "21%" in shown and "5 мин" in shown
+    assert "40 с" in plain_text(texts.progress_text(state, elapsed=47))
+    assert "1 ч 2 мин" in plain_text(texts.progress_text(state, elapsed=3725))
+
+    # Сообщение правится только когда текст изменился: после двух минут это раз в минуту, а не каждую секунду.
+    same_minute = (texts.progress_text(state, elapsed=5 * 60 + 5), texts.progress_text(state, elapsed=5 * 60 + 55))
+    assert same_minute[0] == same_minute[1]
+    assert texts.progress_text(state, elapsed=5 * 60 + 5) != texts.progress_text(state, elapsed=6 * 60 + 5)
+
+
+def test_progress_text_explains_a_long_silence_and_points_to_the_stop_button():
+    state = JobState(id="j", status=JobStatus.RUNNING, stage="Ищу яркие моменты", progress=20.0)
+
+    calm = plain_text(texts.progress_text(state, elapsed=9 * 60, quiet=2 * 60))
+    worried = plain_text(texts.progress_text(state, elapsed=14 * 60, quiet=11 * 60))
+
+    assert "Остановить" not in calm
+    assert "Ищу яркие моменты" in worried and "11 мин" in worried and "Остановить" in worried
+
+
+async def test_the_progress_message_counts_time_and_warns_only_after_a_long_silence(harness, monkeypatch):
+    from app.bot import runner as runner_module
+
+    shown: list[str] = []
+
+    async def edit(message, html, markup=None):
+        shown.append(plain_text(html))
+
+    monkeypatch.setattr(runner_module, "edit_html", edit)
+    runner, manager = harness.ctx.runner, harness.ctx.manager
+    job_id = _occupy(harness, user_id=1, progress=20.0, stage="Ищу яркие моменты")
+    running = runner._jobs[job_id]  # noqa: SLF001
+
+    await runner._edit_progress(running)  # noqa: SLF001
+    assert "⏱" in shown[-1] and "Остановить" not in shown[-1]
+
+    running.started_at -= 15 * 60  # пятнадцать минут задаче, из них двенадцать — без единой перемены
+    running.moved_at -= 12 * 60
+    await runner._edit_progress(running)  # noqa: SLF001
+    assert "15 мин" in shown[-1] and "12 мин" in shown[-1] and "Остановить" in shown[-1]
+
+    manager._update(job_id, stage="Рендер клипа 1 из 8")  # noqa: SLF001 — перемена: молчание отсчитывается заново
+    running.state = manager.get(job_id)
+    await runner._edit_progress(running)  # noqa: SLF001
+    assert "Рендер клипа 1 из 8" in shown[-1] and "Остановить" not in shown[-1]

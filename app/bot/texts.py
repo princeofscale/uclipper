@@ -516,12 +516,32 @@ def progress_bar(percent: float) -> str:
 
 
 QUEUED_TEXT = "<h3>⏳ Задача в очереди</h3><p>Начну, как только освободится сервер.</p>"
+STALL_NOTICE_SECONDS = 10 * 60  # столько стадия может стоять на месте, прежде чем бот объяснит молчание
 
 
-def progress_text(state: JobState, ahead: int = 0) -> str:
-    """Сообщение-прогресс: стадия, полоса, счётчик клипов и (свёрнуто) последние строки лога.
+def elapsed_text(seconds: float) -> str:
+    """Сколько идёт задача. Шаг крупный (10 с, затем минута): сообщение правится, только когда текст изменился,
+    а Telegram не любит правок чаще раза в секунду.
+    """
+    seconds = max(0, int(seconds))
+    if seconds < 10:
+        return "меньше 10 с"
+    if seconds < 60:
+        return f"{seconds // 10 * 10} с"
+    if seconds < 120:
+        rest = seconds % 60 // 10 * 10
+        return f"1 мин {rest} с" if rest else "1 мин"
+    hours, minutes = divmod(seconds // 60, 60)
+    if hours:
+        return f"{hours} ч {minutes} мин" if minutes else f"{hours} ч"
+    return f"{minutes} мин"
+
+
+def progress_text(state: JobState, ahead: int = 0, *, elapsed: float | None = None, quiet: float = 0.0) -> str:
+    """Сообщение-прогресс: стадия, полоса, время, счётчик клипов и (свёрнуто) последние строки лога.
 
     `ahead` — сколько задач впереди; показывается только у ждущей очереди задачи.
+    `elapsed` — сколько секунд задача идёт; `quiet` — сколько секунд на экране ничего не менялось.
     """
     head = {
         JobStatus.QUEUED: "⏳ Задача в очереди",
@@ -533,7 +553,14 @@ def progress_text(state: JobState, ahead: int = 0) -> str:
     parts = [f"<h3>{head}</h3>"]
     if state.status is JobStatus.QUEUED and ahead > 0:
         parts.append(f"<p>🧍 Перед вами в очереди: <b>{ahead}</b>. Начну, как только дойдёт очередь.</p>")
-    parts.append(f"<p><code>{progress_bar(state.progress)}</code> <b>{state.progress:.0f}%</b></p>")
+    running = state.status is JobStatus.RUNNING
+    clock = f" · ⏱ {elapsed_text(elapsed)}" if running and elapsed is not None else ""
+    parts.append(f"<p><code>{progress_bar(state.progress)}</code> <b>{state.progress:.0f}%</b>{clock}</p>")
+    if running and quiet >= STALL_NOTICE_SECONDS:
+        parts.append(
+            f"<p><i>⌛ Стадия «{esc(state.stage)}» идёт уже {int(quiet // 60)} мин без перемен. "
+            "На длинных роликах так бывает. Если ждать надоело — нажмите «⏹ Остановить».</i></p>"
+        )
     if state.clips:
         parts.append(f"<p>🎞 Клипов готово: <b>{len(state.clips)}</b></p>")
     trim = state.trim
