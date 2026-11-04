@@ -240,3 +240,17 @@ def test_the_everywhere_id_cannot_clash_with_a_platform():
 def test_titles_lists_every_platform_for_error_messages():
     text = titles()
     assert all(platform.title in text for platform in PLATFORMS)
+
+
+def test_every_platform_explains_itself_for_the_help():
+    """Справка собирается из реестра: какие ссылки подходят и почему искать (или смотреть тренды) нельзя."""
+    for platform in PLATFORMS:
+        assert platform.links, platform.id
+        if platform.search:
+            assert not platform.why_not_search, platform.id
+        else:
+            assert platform.why_not_search, platform.id
+        if platform.search and not platform.trends:
+            assert platform.why_not_trends, platform.id
+        else:
+            assert not platform.why_not_trends, platform.id

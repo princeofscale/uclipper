@@ -20,6 +20,8 @@ _YOUTUBE_PATHS = frozenset({"shorts", "embed", "live", "v"})
 
 EVERYWHERE = "all"  # в кнопках выбора площадки: «везде» (это не площадка, из id площадок его не выбрать)
 
+WHY_BY_CHANNEL = "поиск идёт по каналам, а не по названиям роликов"  # одна причина у VK Play, Twitch и Kick
+
 
 @dataclass(frozen=True)
 class Platform:
@@ -30,34 +32,59 @@ class Platform:
     search: bool = False  # есть поиск по названию
     trends: bool = False  # есть раздел «В тренде» (нужно много свежих роликов на русском)
     id_patterns: tuple[str, ...] = ()  # как достать id ролика из адреса: именованная группа `id`
+    links: str = ""  # какие ссылки подходят (одной фразой, для справки)
+    why_not_search: str = ""  # у площадок без поиска: почему искать по названию нельзя (для справки)
+    why_not_trends: str = ""  # у площадок с поиском, но без «В тренде»: почему
 
 
 YOUTUBE = Platform(
-    "youtube", "YouTube", "▶️", ("youtube.com", "youtu.be", "youtube-nocookie.com"), search=True, trends=True
-)
+    "youtube", "YouTube", "▶️", ("youtube.com", "youtu.be", "youtube-nocookie.com"), search=True, trends=True,
+    links="обычные ролики, Shorts и записи эфиров",
+)  # fmt: skip
 RUTUBE = Platform(
     "rutube", "RuTube", "📺", ("rutube.ru",), search=True, trends=True,
     id_patterns=(r"(?:video(?:/private)?|embed)/(?P<id>[0-9a-z]{32})",),
+    links="ролики, в том числе по приватной ссылке",
 )  # fmt: skip
 # Адрес VK Play `live.vkvideo.ru` — поддомен `vkvideo.ru`: площадку выбирает самый длинный подошедший домен.
 VKPLAY = Platform(
     "vkplay", "VK Play", "🎮", ("vkplay.live", "live.vkplay.ru", "live.vkvideo.ru"),
     id_patterns=(r"/record/(?P<id>[0-9a-f-]{36})",),
+    links="записи эфиров",
+    why_not_search=WHY_BY_CHANNEL,
 )  # fmt: skip
-VK = Platform("vk", "VK Видео", "💙", ("vkvideo.ru", "vk.com", "vk.ru"), id_patterns=(r"(?:video|clip)(?P<id>-?\d+_\d+)",))
-DZEN = Platform("dzen", "Дзен", "✨", ("dzen.ru", "zen.yandex.ru"), id_patterns=(r"(?P<id>[0-9a-f]{24})",))
-OK = Platform("ok", "OK", "🧡", ("ok.ru", "odnoklassniki.ru"), id_patterns=(r"/video(?:embed)?/(?P<id>\d+)",))
+VK = Platform(
+    "vk", "VK Видео", "💙", ("vkvideo.ru", "vk.com", "vk.ru"), id_patterns=(r"(?:video|clip)(?P<id>-?\d+_\d+)",),
+    links="видео и клипы",
+    why_not_search="поиск работает только после входа в аккаунт",
+)  # fmt: skip
+DZEN = Platform(
+    "dzen", "Дзен", "✨", ("dzen.ru", "zen.yandex.ru"), id_patterns=(r"(?P<id>[0-9a-f]{24})",),
+    links="видео",
+    why_not_search="поиск открывается только после входа через Яндекс",
+)  # fmt: skip
+OK = Platform(
+    "ok", "OK", "🧡", ("ok.ru", "odnoklassniki.ru"), id_patterns=(r"/video(?:embed)?/(?P<id>\d+)",),
+    links="видео",
+    why_not_search="поиск не учитывает слова запроса и всегда показывает одну и ту же ленту",
+)  # fmt: skip
 TWITCH = Platform(
     "twitch", "Twitch", "🟣", ("twitch.tv",),
     id_patterns=(r"/(?:videos|v)/(?P<id>\d+)", r"(?:/clip/|clips\.twitch\.tv/)(?P<id>[\w-]+)"),
+    links="записи эфиров и клипы",
+    why_not_search=WHY_BY_CHANNEL,
 )  # fmt: skip
 KICK = Platform(
     "kick", "Kick", "🟢", ("kick.com",),
     id_patterns=(r"(?:clip=|/clips/)(?P<id>clip_[\w-]+)", r"/videos/(?P<id>[0-9a-f-]{36})"),
+    links="клипы",
+    why_not_search=WHY_BY_CHANNEL,
 )  # fmt: skip
 DAILYMOTION = Platform(
     "dailymotion", "Dailymotion", "🔵", ("dailymotion.com", "dai.ly"), search=True,
     id_patterns=(r"(?:/video/|dai\.ly/)(?P<id>[a-z0-9]+)",),
+    links="ролики",
+    why_not_trends="русскоязычных роликов там мало",
 )  # fmt: skip
 
 PLATFORMS: tuple[Platform, ...] = (YOUTUBE, RUTUBE, VK, DZEN, OK, VKPLAY, TWITCH, KICK, DAILYMOTION)

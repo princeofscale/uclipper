@@ -332,6 +332,141 @@ def test_help_is_honest_about_where_search_and_trends_work():
     assert "Dailymotion" in texts.SEARCH_SITES and "Dailymotion" not in texts.TREND_SITES
 
 
+# ---------- /start: красивее и честно про площадки ----------
+
+
+def _position(plain: str, needle: str) -> int:
+    found = plain.find(needle)
+    assert found >= 0, f"«{needle}» нет в тексте:\n{plain}"
+    return found
+
+
+def test_start_is_a_friendly_welcome_with_steps():
+    html = texts.start()
+    plain = plain_text(html)
+    assert html.startswith("<h1>🎬 TgRader Clipper</h1>")
+    assert "<ol>" in html and "<blockquote>" in html  # шаги и подсказка в цитате
+    for word in ("9:16", "TikTok", "Shorts", "Reels", "рекламный баннер"):
+        assert word in plain, word
+    assert "Авто" in plain and "вручную" in plain.lower()
+
+
+def test_start_groups_platforms_by_what_the_bot_can_do_with_them():
+    plain = plain_text(texts.start())
+    link_only = _position(plain, "Только по ссылке")
+    both = _position(plain, "Поиск, тренды и ссылки")
+    search_only = _position(plain, "Поиск и ссылки")
+    for platform in PLATFORMS:
+        place = _position(plain, platform.title)
+        if platform.search and platform.trends:
+            assert both < place < search_only, platform.title
+        elif platform.search:
+            assert search_only < place < link_only, platform.title
+        else:
+            assert place > link_only, platform.title
+
+
+def test_the_busy_notice_sits_under_the_welcome_not_before_the_title():
+    from app.bot.busy import Busy, Cause
+
+    plain = plain_text(texts.start(Busy(Cause.OTHERS, progress=42)))
+    assert plain.startswith("🎬 TgRader Clipper")
+    assert _position(plain, "Бот сейчас занят") < _position(plain, "Как это работает")
+    assert "Бот сейчас занят" not in plain_text(texts.start())
+
+
+# ---------- справка: что сейчас работает ----------
+
+
+def _help_row(platform) -> list[str]:
+    row = re.search(rf"<tr><td>{re.escape(platform.emoji)} {re.escape(platform.title)}</td>(.*?)</tr>", texts.HELP)
+    assert row, f"в таблице справки нет {platform.title}"
+    return re.findall(r"<td>(.*?)</td>", row.group(1))
+
+
+def test_help_table_shows_for_every_platform_what_works_now():
+    assert "<table" in texts.HELP
+    for platform in PLATFORMS:
+        assert _help_row(platform) == ["✅", "✅" if platform.search else "—", "✅" if platform.trends else "—"], platform.id
+
+
+def test_help_table_header_names_the_three_abilities():
+    header = re.search(r"<tr>(<th>.*?)</tr>", texts.HELP).group(1)
+    assert re.findall(r"<th>(.*?)</th>", header) == ["Площадка", "🔗 Ссылка", "🔍 Поиск", "🔥 Тренды"]
+
+
+def test_help_explains_why_some_platforms_are_link_only():
+    plain = plain_text(texts.HELP)
+    for platform in PLATFORMS:
+        if not platform.search:
+            assert platform.why_not_search in plain, platform.id
+        if platform.search and not platform.trends:
+            assert platform.why_not_trends in plain, platform.id
+        assert platform.links in plain, platform.id
+    assert "пришлите ссылку" in plain
+
+
+def test_help_mentions_that_the_bot_cuts_one_video_at_a_time():
+    plain = plain_text(texts.HELP)
+    assert "один ролик за раз" in plain and "красные" in plain
+
+
+# ---------- списки роликов ----------
+
+TREND_VIDEO = {
+    "platform": "rutube", "title": "A <b>", "duration": 600, "uploader": "Канал & Ко", "views": 12_345,
+}  # fmt: skip
+
+
+def test_a_trend_item_is_three_short_lines():
+    html = texts.trend_list(CATEGORIES[0], [TREND_VIDEO], EVERYWHERE)
+    assert (
+        "<li><b>A &lt;b&gt;</b><br/><i>📺 RuTube · 👤 Канал &amp; Ко</i><br/>⏱ 10:00 · 👁 12 тыс.</li>" in html
+    ), html
+
+
+def test_a_trend_item_on_one_platform_skips_the_platform_tag_and_missing_numbers():
+    video = {"platform": "youtube", "title": "Без канала", "duration": 0, "views": 0}
+    html = texts.trend_list(CATEGORIES[0], [video], "youtube")
+    assert "<li><b>Без канала</b></li>" in html
+    video = {"platform": "youtube", "title": "Один", "duration": 75, "uploader": "Автор", "views": 950}
+    assert "<li><b>Один</b><br/><i>👤 Автор</i><br/>⏱ 1:15 · 👁 950</li>" in texts.trend_list(CATEGORIES[0], [video], "youtube")
+
+
+def test_long_titles_are_shortened_in_lists_but_never_cut_in_a_word_or_an_entity():
+    title = "Очень длинное название выпуска " * 8 + "AT&T"
+    for html in (
+        texts.trend_list(CATEGORIES[0], [{"title": title, "duration": 60}], "youtube"),
+        texts.search_cards([{"title": title, "duration": 60}]),
+    ):
+        shown = re.search(r"<li><b>(.*?)</b>", html).group(1)
+        assert shown.endswith("…") and len(plain_text(shown)) <= 111, shown
+        assert not re.search(r"&[a-z]*$", shown.removesuffix("…")), shown  # сущность не обрезана посередине
+        assert_valid_rich(html)
+
+
+def test_the_trend_header_says_where_and_for_which_period():
+    plain = plain_text(texts.trend_list(CATEGORIES[0], [TREND_VIDEO], "youtube"))
+    assert "▶️ YouTube" in plain and "за неделю" in plain
+    everywhere = plain_text(texts.trend_list(CATEGORIES[0], [TREND_VIDEO], EVERYWHERE))
+    assert "Везде" in everywhere and "за неделю" in everywhere and "за последнее время" in everywhere
+
+
+def test_the_trend_list_ends_with_the_hint_in_a_quote_and_keeps_numbers_aligned_with_buttons():
+    html = texts.trend_list(CATEGORIES[0], [TREND_VIDEO, dict(TREND_VIDEO, title="Второй")], EVERYWHERE)
+    assert html.count("<li>") == 2 and "<ol>" in html
+    assert re.search(r"<blockquote>[^<]*Выберите ролик[^<]*TikTok[^<]*</blockquote>", html)
+
+
+def test_search_cards_look_like_trend_items_without_views():
+    entries = [{"platform": "dailymotion", "title": "Один", "uploader": "Автор", "duration": 90, "views": 5_000_000}]
+    everywhere = texts.search_cards(entries)
+    assert "<li><b>Один</b><br/><i>🔵 Dailymotion · 👤 Автор</i><br/>⏱ 1:30</li>" in everywhere  # просмотров в поиске нет
+    one = texts.search_cards(entries, "dailymotion")
+    assert "<li><b>Один</b><br/><i>👤 Автор</i><br/>⏱ 1:30</li>" in one
+    assert "Dailymotion" in plain_text(one)  # зато где искали — в шапке
+
+
 @pytest.mark.parametrize(
     ("seconds", "expected"),
     [(95, "1:35"), (3725, "1:02:05"), (0, "0:00"), (59.6, "1:00")],

@@ -28,6 +28,27 @@ LINK_ONLY_SITES = ", ".join(f"{platform.emoji} {platform.title}" for platform in
 LINK_ONLY_NOTE = f"{LINK_ONLY_SITES} — только по ссылке: искать на них бот не умеет."
 MAX_HOURS = MAX_SOURCE_SECONDS // 3600
 
+
+def _names(platforms: Sequence[Platform], *, bold: bool = False) -> str:
+    return " · ".join(f"{p.emoji} <b>{p.title}</b>" if bold else f"{p.emoji} {p.title}" for p in platforms)
+
+
+# Что бот умеет с каждой площадкой — из реестра, чтобы /start, справка и подсказки не расходились с делом.
+_FULL = tuple(p for p in PLATFORMS if p.search and p.trends)
+_SEARCH_ONLY = tuple(p for p in PLATFORMS if p.search and not p.trends)
+_LINK_ONLY = tuple(p for p in PLATFORMS if not p.search)
+PLATFORM_GROUPS = "".join(
+    f"<li>{icon} <b>{label}:</b> {_names(group)}</li>"
+    for icon, label, group in (
+        ("⭐", "Поиск, тренды и ссылки", _FULL),
+        ("🔍", "Поиск и ссылки", _SEARCH_ONLY),
+        ("🔗", "Только по ссылке", _LINK_ONLY),
+    )
+    if group
+)
+
+TITLE_LIMIT = 110  # длиннее название в списке роликов не показываем: на телефоне оно превращается в стену текста
+
 # ---------- главное меню и справка ----------
 
 def start(busy: Busy | None = None) -> str:
@@ -35,16 +56,17 @@ def start(busy: Busy | None = None) -> str:
     notice = busy_notice(busy) if busy is not None else ""
     return f"""\
 <h1>🎬 {NAME}</h1>
-<p>Нарезаю длинные ролики на вертикальные клипы <b>9:16</b> для <b>TikTok</b>, <b>Shorts</b> и <b>Reels</b> — и вклеиваю в них рекламный баннер.</p>
-<p>🌐 Работаю с: {PLATFORM_LIST}</p>
+<p>Превращаю длинные ролики в <b>вертикальные клипы 9:16</b> для <b>TikTok</b>, <b>Shorts</b> и <b>Reels</b> — и вклеиваю в них рекламный баннер.</p>
 {notice}<hr/>
-<ul>
-<li>🤖 <b>Авто</b> — сам подберу число клипов, длину и самые яркие моменты</li>
-<li>🛠 <b>Вручную</b> — каждый параметр в ваших руках</li>
-<li>🔥 <b>В тренде</b> — что смотрят прямо сейчас, и сразу в нарезку</li>
-</ul>
-<blockquote>👇 Пришлите <b>ссылку</b> на ролик, <b>название</b> или <b>видеофайл</b> — дальше всё кнопками.</blockquote>"""
-
+<h3>✨ Как это работает</h3>
+<ol>
+<li>📥 Пришлите <b>ссылку</b>, <b>название</b> или <b>видеофайл</b></li>
+<li>🤖 Выберите <b>Авто</b> (подберу всё сам) или настройте <b>вручную</b></li>
+<li>🎞 Готовые клипы придут сюда, в чат</li>
+</ol>
+<h3>🌐 Откуда беру ролики</h3>
+<ul>{PLATFORM_GROUPS}</ul>
+<blockquote>👇 Нажмите кнопку ниже или просто пришлите ссылку</blockquote>"""
 
 
 def _busy_bar(progress: float) -> str:
@@ -94,29 +116,62 @@ def busy_alert(busy: Busy) -> str:
     return "💾 На сервере сейчас мало места — попробуйте чуть позже."
 
 
+def _help_table() -> str:
+    """Таблица «что сейчас работает»: по строке на площадку, галочки берутся из реестра."""
+    rows = "".join(
+        f"<tr><td>{p.emoji} {p.title}</td><td>✅</td><td>{'✅' if p.search else '—'}</td><td>{'✅' if p.trends else '—'}</td></tr>"
+        for p in (*_FULL, *_SEARCH_ONLY, *_LINK_ONLY)  # сначала умеющие больше всего
+    )
+    return (
+        "<table bordered compact><tr><th>Площадка</th><th>🔗 Ссылка</th><th>🔍 Поиск</th><th>🔥 Тренды</th></tr>"
+        f"{rows}</table>"
+    )
+
+
+def _why_items() -> str:
+    """Почему поиска или трендов где-то нет. Площадки с одной причиной стоят в одной строке."""
+    by_reason: dict[str, list[Platform]] = {}
+    for platform in _LINK_ONLY:
+        by_reason.setdefault(platform.why_not_search, []).append(platform)
+    items = [f"<li>{_names(group, bold=True)} — {reason}</li>" for reason, group in by_reason.items()]
+    items += [
+        f"<li>{_names([p], bold=True)} — раздела «В тренде» нет: {p.why_not_trends}</li>" for p in _SEARCH_ONLY
+    ]
+    return "".join(items)
+
+
+def _link_items() -> str:
+    return "".join(f"<li>{_names([p], bold=True)} — {p.links}</li>" for p in PLATFORMS)
+
+
 HELP = f"""\
-<h2>❓ Как это работает</h2>
+<h2>❓ Справка</h2>
+<h3>Как это работает</h3>
 <ol>
 <li>📥 Пришлите <b>ссылку</b> на ролик, <b>название</b> или <b>видеофайл</b>.</li>
 <li>🎛 Выберите режим: <b>🤖 Авто</b> или <b>🛠 Вручную</b>.</li>
 <li>🚀 Нажмите <b>«Нарезать»</b> — клипы придут в чат по одному, а если они влезают в 50 МБ, то ещё и одним ZIP.</li>
 </ol>
 <hr/>
+<h3>🧭 Что сейчас работает</h3>
+{_help_table()}
+<p><i>✅ есть · — нет. На площадках без поиска бот работает <b>только по ссылке</b>: найдите ролик сами и пришлите ссылку на него. По ссылке работает каждая площадка.</i></p>
+<details><summary>🤔 Почему поиск и тренды не везде</summary>
+<ul>{_why_items()}</ul>
+<p><i>Ищу только там, где у площадки есть открытый поиск без входа в аккаунт.</i></p>
+</details>
+<details><summary>🔗 Какие ссылки подходят</summary>
+<ul>{_link_items()}</ul>
+<p><i>Берутся только записи — не прямые эфиры, не длиннее {MAX_HOURS} часов и не по платной подписке. Нужна ссылка на конкретный ролик, а не на канал или плейлист.</i></p>
+</details>
+<hr/>
 <details><summary>🤖 Что делает авто-режим</summary>
-<p>Смотрит на длину ролика и вашу цель (TikTok, Shorts или универсально) и сам выбирает число и длину клипов. Из каждой части ролика берёт самый громкий и «живой» момент — по звуку. Заставку и титры убирает автообрезкой.</p>
+<p>Смотрит на длину ролика и вашу цель (TikTok, Shorts или универсально) и сам выбирает число и длину клипов. Из каждой части ролика берёт самый громкий и «живой» момент — по звуку. Видео ставит по центру на размытом фоне, сверху и снизу остаются красивые поля.</p>
+<p>В длинных роликах (от 5 минут) не ищет моменты в самом начале и конце: там обычно заставка, реклама и титры. Заставку и титры убирает автообрезкой.</p>
 <p><i>Это правила и анализ звука, а не нейросеть: зато быстро и предсказуемо. План всегда можно поправить вручную.</i></p>
 </details>
-<details><summary>🌐 Откуда беру ролики</summary>
-<ul>
-<li>🔗 <b>По ссылке</b> — {PLATFORM_LIST}.</li>
-<li>🔍 <b>По названию</b> — {SEARCH_SITES}: можно выбрать одну площадку или искать везде.</li>
-<li>🔥 <b>В тренде</b> — подборки {TREND_SITES}.</li>
-</ul>
-<p>{LINK_ONLY_NOTE}</p>
-<p><i>Берутся только записи — не прямые эфиры, не длиннее {MAX_HOURS} часов и не по платной подписке.</i></p>
-</details>
 <details><summary>🔥 Раздел «В тренде»</summary>
-<p>Самые просматриваемые свежие ролики на русском по жанрам: подкасты, юмор, игры, бизнес, кино, спорт. Площадку можно выбрать — или смотреть везде сразу. Выберите ролик — и сразу получите план нарезки под TikTok.</p>
+<p>Самые просматриваемые свежие ролики на русском по жанрам: подкасты, юмор, игры, бизнес, кино, спорт. Площадку можно выбрать — {TREND_SITES} — или смотреть обе сразу. Выберите ролик — и сразу получите план нарезки под TikTok.</p>
 <p><i>Данные обновляются раз в полчаса.</i></p>
 </details>
 <details><summary>🎬 Как работает баннер</summary>
@@ -125,8 +180,9 @@ HELP = f"""\
 <details><summary>✂️ Обрезка краёв</summary>
 <p>Автообрезка убирает заставку, титры и пустые края по звуку и яркости. Если она не нужна — задайте секунды вручную или оставьте ролик целиком.</p>
 </details>
-<details><summary>📏 Ограничения Telegram</summary>
+<details><summary>📏 Ограничения</summary>
 <ul>
+<li>Бот режет <b>один ролик за раз</b>: пока он занят, кнопки нового ролика в меню красные. «🔄 Проверить» покажет, когда он освободится.</li>
 <li>Бот принимает файл до <b>20 МБ</b> — для ролика побольше пришлите ссылку.</li>
 <li>Бот отдаёт файл до <b>50 МБ</b> — клип потяжелее он перекодирует в 720×1280.</li>
 </ul>
@@ -216,24 +272,48 @@ def searching(query: str, choice: str = EVERYWHERE) -> str:
     return f"<p>🔍 Ищу ({scope_label(choice)}): <b>{esc(query)}</b>…</p>"
 
 
+def shorten(title: str, limit: int = TITLE_LIMIT) -> str:
+    """Название для списка: лишние пробелы убраны, длинное обрезано по границе слова и закончено «…».
+
+    Режется до экранирования, поэтому HTML-сущность (`&amp;`) посередине не разрывается.
+    """
+    title = " ".join(title.split())
+    if len(title) <= limit:
+        return title
+    cut = title[: limit - 1]
+    space = cut.rfind(" ")
+    if space >= limit * 0.6:
+        cut = cut[:space]
+    return cut.rstrip(" ,;:.-–—") + "…"
+
+
+def listing_item(entry: dict, *, tag_platform: bool, views: bool) -> str:
+    """Пункт списка роликов — три коротких строки: название, «площадка · канал», «длительность · просмотры»."""
+    uploader = entry.get("uploader")
+    who = " · ".join(
+        part
+        for part in (platform_tag(entry.get("platform")) if tag_platform else "", f"👤 {esc(uploader)}" if uploader else "")
+        if part
+    )
+    duration = entry.get("duration") or 0
+    seen = int(entry.get("views") or 0) if views else 0
+    numbers = " · ".join(
+        part for part in (f"⏱ {duration_text(duration)}" if duration else "", f"👁 {views_text(seen)}" if seen else "") if part
+    )
+    lines = [f"<b>{esc(shorten(entry.get('title') or 'Без названия'))}</b>"]
+    if who:
+        lines.append(f"<i>{who}</i>")
+    if numbers:
+        lines.append(numbers)
+    return "<li>" + "<br/>".join(lines) + "</li>"
+
+
 def search_cards(entries: list[dict], choice: str = EVERYWHERE) -> str:
-    items = []
-    for entry in entries:
-        title = esc(entry.get("title") or "Без названия")
-        meta = " · ".join(
-            part
-            for part in (
-                platform_tag(entry.get("platform")),
-                esc(entry.get("uploader") or ""),
-                "⏱ " + duration_text(entry.get("duration") or 0),
-            )
-            if part
-        )
-        items.append(f"<li><b>{title}</b><br/><i>{meta}</i></li>")
+    """Итог поиска по названию. Значок площадки у ролика нужен, только когда искали сразу везде."""
+    items = "".join(listing_item(entry, tag_platform=choice == EVERYWHERE, views=False) for entry in entries)
     return (
-        "<h3>🔍 Нашёл такие ролики</h3><p>Выберите нужный:</p><ol>"
-        + "".join(items)
-        + f"</ol><footer>{scope_label(choice)} · тот же запрос на другой площадке — кнопками ниже</footer>"
+        f"<h3>🔍 Нашёл такие ролики</h3><p>{scope_label(choice)} · выберите нужный:</p><ol>{items}</ol>"
+        "<footer>Не то? Тот же запрос на другой площадке — кнопками ниже.</footer>"
     )
 
 
@@ -530,6 +610,13 @@ def trends_loading(category: Category, choice: str = EVERYWHERE) -> str:
     )
 
 
+def period_phrase(choice: str) -> str:
+    """За какой срок данные: у одной площадки — её срок, у «Везде» — срок каждой (они разные)."""
+    if choice == EVERYWHERE:
+        return " · ".join(f"{p.emoji} {p.title} {PERIOD_TEXT.get(p.id, 'за последнее время')}" for p in TRENDING)
+    return PERIOD_TEXT.get(choice, "за последнее время")
+
+
 def trends_home(choice: str = EVERYWHERE) -> str:
     items = "".join(
         f"<li>{category.emoji} <b>{esc(category.title)}</b> — {esc(category.hint)}</li>" for category in CATEGORIES
@@ -538,7 +625,7 @@ def trends_home(choice: str = EVERYWHERE) -> str:
 <h1>🔥 В тренде</h1>
 <p>Что <b>прямо сейчас</b> смотрят русскоязычные зрители. Выберите площадку и жанр — покажу самые просматриваемые ролики, которые стоит нарезать на <b>TikTok</b> и <b>Shorts</b>.</p>
 <ul>{items}</ul>
-<footer>{scope_label(choice)}: данные {PERIOD_TEXT.get(choice, "за последнее время")} · обновляются раз в полчаса</footer>"""
+<footer>{scope_label(choice)}: данные {period_phrase(choice)} · обновляются раз в полчаса</footer>"""
 
 
 def trend_list(category: Category, videos: list[dict], choice: str = EVERYWHERE, *, missing: Sequence[Platform] = ()) -> str:
@@ -553,25 +640,16 @@ def trend_list(category: Category, videos: list[dict], choice: str = EVERYWHERE,
             f"{head}<p>🫥 {scope_label(choice)}: сейчас ничего подходящего не нашлось. "
             f"Загляните позже, выберите другой жанр или другую площадку.</p>{note}"
         )
-    items = []
-    for video in videos:
-        meta = " · ".join(
-            part
-            for part in (
-                platform_tag(video.get("platform")) if choice == EVERYWHERE else "",
-                esc(video.get("uploader") or ""),
-                "⏱ " + duration_text(video.get("duration") or 0),
-                "👁 " + views_text(int(video.get("views") or 0)),
-            )
-            if part
-        )
-        items.append(f"<li><b>{esc(video['title'])}</b><br/><i>{meta}</i></li>")
-    period = PERIOD_TEXT.get(choice, "за последнее время")
+    if choice == EVERYWHERE:
+        where = f"<p>{scope_label(choice)} · самое просматриваемое<br/><i>{period_phrase(choice)}</i></p>"
+    else:
+        where = f"<p>{scope_label(choice)} · самое просматриваемое <b>{period_phrase(choice)}</b></p>"
+    items = "".join(listing_item(video, tag_platform=choice == EVERYWHERE, views=True) for video in videos)
     return (
-        f"{head}"
-        f"<p>{scope_label(choice)} · самое просматриваемое {period} — {esc(category.hint)}.</p>"
-        f"<ol>{''.join(items)}</ol>"
-        "<blockquote>Выберите ролик — сразу подберу нарезку под TikTok.</blockquote>"
+        f"{head}{where}"
+        f"<p>💡 <i>Для нарезки: {esc(category.hint)}</i></p>"
+        f"<ol>{items}</ol>"
+        "<blockquote>👇 Выберите ролик кнопкой ниже — сразу подберу нарезку под TikTok.</blockquote>"
         f"{note}"
     )
 
