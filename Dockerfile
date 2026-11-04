@@ -1,6 +1,10 @@
 # TgRader Clipper: Python + FFmpeg + Node (Node нужен yt-dlp, чтобы решать JS-челленджи YouTube).
-# Debian 13 (trixie): в нём Node 20+, а yt-dlp-ejs не работает со старым Node.
+# yt-dlp требует Node 22+, а в Debian 13 из пакетов только Node 20 — поэтому готовый Node 22 (LTS) берём
+# из официального образа: один файл, на тех же Debian 13 и glibc.
+FROM node:22-trixie-slim AS node
+
 FROM python:3.13-slim-trixie
+COPY --from=node /usr/local/bin/node /usr/local/bin/node
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -8,7 +12,7 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg nodejs ca-certificates \
+    && apt-get install -y --no-install-recommends ffmpeg ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
