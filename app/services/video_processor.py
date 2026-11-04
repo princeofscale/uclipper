@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Callable, Literal
 
 from app.config import BANNER_VIDEO_EXTS, FPS
-from app.models import BannerMode, BannerPosition, FrameMode, SlicingMode, StaticPosition
+from app.models import BannerMode, BannerPosition, FrameMode, SlicingMode
 from app.services.face_center import detect_face_center_x
 
 MIN_CLIP_SECONDS = 1.0
@@ -25,10 +25,7 @@ PORTRAIT = (1080, 1920)  # 9:16 — blur_pad и center_crop
 LANDSCAPE = (1920, 1080)  # режим original
 FRAME_SIZE = {FrameMode.BLUR_PAD: PORTRAIT, FrameMode.CENTER_CROP: PORTRAIT, FrameMode.ORIGINAL: LANDSCAPE}
 DIM_COLOR = "black@0.45"  # затемнение замороженного кадра на 45%
-MIN_STATIC_MARGIN = 140  # поле Blur-Pad уже этого (px) не вмещает баннер — тогда он ложится поверх кадра у края
-STATIC_EDGE = 0.04  # отступ баннера от края кадра в этом случае, доля высоты
-STATIC_EDGE_BOX = 0.22  # и его наибольшая высота, доля высоты кадра
-MAX_VIDEO_PAUSE = 20.0  # видео-баннер дольше этого обрезается (загрузка и так не принимает длиннее)
+MAX_VIDEO_PAUSE = 20.0  # пауза под видео-баннер не длиннее этого, даже если сам файл длиннее
 MIN_VIDEO_PAUSE = 1.0
 BANNER_Y = {  # верх баннера; доли высоты кадра дают те же 180 / 240 px на 1920 и разумные отступы на 1080
     BannerPosition.CENTER: "(H-h)/2",
@@ -178,8 +175,6 @@ class MediaInfo:
     width: int
     height: int
     has_audio: bool
-    video_codec: str | None
-    audio_codec: str | None
 
 
 def probe_media(path: Path) -> MediaInfo:
@@ -215,8 +210,6 @@ def probe_media(path: Path) -> MediaInfo:
         width=int(video.get("width") or 0),
         height=int(video.get("height") or 0),
         has_audio=audio is not None,
-        video_codec=video.get("codec_name"),
-        audio_codec=audio.get("codec_name") if audio else None,
     )
 
 
@@ -255,8 +248,6 @@ class RenderOptions:
     banner_scale: int = 85  # % короткой стороны кадра (в вертикальных режимах это ширина)
     banner_sound: bool = True  # слышен ли звук видео-баннера
     enable_sfx: bool = False
-    static_position: StaticPosition = StaticPosition.TOP  # постоянный баннер: верхнее или нижнее поле
-    static_scale: int = 92  # % короткой стороны кадра
 
 
 def _base_video_chain(frame_mode: FrameMode, face_cx: float | None) -> str:
@@ -284,38 +275,6 @@ def _base_video_chain(frame_mode: FrameMode, face_cx: float | None) -> str:
         f"[fg]scale={width}:{height}:force_original_aspect_ratio=decrease:force_divisible_by=2[fg_scaled];"
         f"[bg_blur][fg_scaled]overlay=(W-w)/2:(H-h)/2,format=yuv420p,setsar=1[v_base]"
     )
-
-
-def blur_pad_margin(src_w: int, src_h: int) -> int:
-    """Высота верхнего (и нижнего) поля Blur-Pad в пикселях: кадр 1080×1920 минус вписанная в него картинка."""
-    width, height = PORTRAIT
-    if src_w <= 0 or src_h <= 0 or src_w * height <= src_h * width:  # 9:16 и уже: картинка во всю высоту
-        return 0
-    shown = round(width * src_h / src_w / 2) * 2
-    return max(0, (height - shown) // 2)
-
-
-@dataclass(frozen=True)
-class StaticLayout:
-    box_w: int  # во что вписывается баннер (с сохранением пропорций), px
-    box_h: int
-    y: str  # верх баннера — выражение overlay (`h` — высота баннера)
-    in_margin: bool  # стоит в поле Blur-Pad, а не поверх картинки
-
-
-def plan_static_layout(frame_mode: FrameMode, src_w: int, src_h: int, position: StaticPosition, scale: int) -> StaticLayout:
-    """Где ставить постоянный баннер: по центру верхнего/нижнего поля Blur-Pad, а если поля нет или оно узкое — у края кадра."""
-    width, height = FRAME_SIZE[frame_mode]
-    box_w = int(round(min(width, height) * scale / 100)) // 2 * 2
-    margin = blur_pad_margin(src_w, src_h) if frame_mode is FrameMode.BLUR_PAD else 0
-    top = position is StaticPosition.TOP
-    if margin >= MIN_STATIC_MARGIN:
-        pad = max(24, round(margin * 0.08))
-        box_h = (margin - 2 * pad) // 2 * 2
-        return StaticLayout(box_w, box_h, f"({margin}-h)/2" if top else f"H-({margin}+h)/2", True)
-    edge = round(height * STATIC_EDGE)
-    box_h = round(height * STATIC_EDGE_BOX) // 2 * 2
-    return StaticLayout(box_w, box_h, str(edge) if top else f"H-h-{edge}", False)
 
 
 def _read_seconds(timeline: BannerTimeline) -> float:
@@ -370,15 +329,6 @@ def _enable_windows(timeline: BannerTimeline) -> str:
 def _dim_chain(timeline: BannerTimeline, video: str) -> list[str]:
     """Затемняет замороженный кадр на время показа → метка `[v_dim]`."""
     return [f"[{video}]drawbox=x=0:y=0:w=iw:h=ih:color={DIM_COLOR}:t=fill:enable='{_enable_windows(timeline)}'[v_dim]"]
-
-
-def _static_chain(layout: StaticLayout, static_idx: int, video: str) -> list[str]:
-    """Кладёт постоянный баннер на кадр → метка `[v_static]`. Слой идёт после затемнения, поэтому не темнеет."""
-    return [
-        f"[{static_idx}:v]scale={layout.box_w}:{layout.box_h}:force_original_aspect_ratio=decrease:force_divisible_by=2,"
-        "format=rgba,setsar=1[static]",
-        f"[{video}][static]overlay=x=(W-w)/2:y={layout.y}[v_static]",
-    ]
 
 
 def _popup_overlay(timeline: BannerTimeline, opts: RenderOptions, banner_idx: int, video: str, *, animated: bool) -> list[str]:
@@ -456,14 +406,11 @@ def build_filter_graph(
     sfx_idx: int | None = None,
     face_cx: float | None = None,
     banner: BannerMedia | None = None,
-    static_idx: int | None = None,
-    source_size: tuple[int, int] | None = None,
 ) -> str:
     """Весь `filter_complex` одного клипа. Выходные метки: `[v_out]` и `[a_out]`.
 
-    Входы: `[0:…]` — источник; с `banner_idx` — всплывающий баннер (у GIF и видео по одному входу на окно показа
-    подряд); `static_idx` — постоянный баннер (нужен `source_size` — по нему считается поле Blur-Pad);
-    `[sfx_idx:a]` — звук появления баннера. Слои: ролик → затемнение (только при остановке) → постоянный → всплывающий.
+    Входы: `[0:…]` — источник; с `banner_idx` — баннер (у GIF и видео по одному входу на окно показа подряд);
+    `[sfx_idx:a]` — звук появления баннера. Слои: ролик → затемнение (только при остановке) → баннер.
     """
     media = banner or BannerMedia()
     chains = [_base_video_chain(opts.frame_mode, face_cx), _audio_prep_chain(has_audio, _read_seconds(timeline))]
@@ -476,14 +423,6 @@ def build_filter_graph(
             chains += _freeze_segments(timeline)
             chains += _dim_chain(timeline, "v_cat")
             video, audio = "v_dim", "a_cat"
-        else:
-            video, audio = "v_base", "a_prep"
-    if static_idx is not None:
-        if source_size is None:
-            raise ValueError("source_size обязателен, когда есть постоянный баннер")
-        layout = plan_static_layout(opts.frame_mode, *source_size, opts.static_position, opts.static_scale)
-        chains += _static_chain(layout, static_idx, video)
-        video = "v_static"
     if not shown:
         chains += [f"[{video}]null[v_out]", f"[{audio}]anull[a_out]"]
         return ";".join(chains)
@@ -504,15 +443,12 @@ def build_ffmpeg_command(
     has_audio: bool = True,
     banner: Path | None = None,
     banner_media: BannerMedia | None = None,
-    static: Path | None = None,
-    static_media: BannerMedia | None = None,
-    source_size: tuple[int, int] | None = None,
     sfx: Path | None = None,
     face_cx: float | None = None,
 ) -> list[str]:
     """Команда FFmpeg: быстрый seek `-ss/-t` перед `-i`, один `filter_complex`, H.264 + AAC.
 
-    Порядок входов: источник, всплывающий баннер (у GIF/видео — по входу на окно), постоянный баннер, звук SFX.
+    Порядок входов: источник, баннер (у GIF/видео — по входу на окно), звук SFX.
     """
     command = [
         "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-nostats", "-progress", "pipe:1",
@@ -520,7 +456,7 @@ def build_ffmpeg_command(
     ]  # fmt: skip
     media = banner_media or BannerMedia()
     next_input = 1
-    banner_idx = sfx_idx = static_idx = None
+    banner_idx = sfx_idx = None
     if timeline.windows:
         if banner is not None and banner_media is None:
             media = probe_banner(banner)
@@ -534,19 +470,12 @@ def build_ffmpeg_command(
                     command += ["-stream_loop", "-1", "-t", f"{end - start:.3f}"]
                 command += ["-i", str(banner)]
             next_input += len(timeline.windows)
-    if static is not None:
-        static_kind = (static_media or probe_banner(static)).kind
-        static_idx = next_input
-        if static_kind != "image":  # анимация зациклена на всё время клипа (конец задаёт `-t` на выходе)
-            command += ["-stream_loop", "-1"]
-        command += ["-i", str(static)]
-        next_input += 1
     if timeline.windows and sfx is not None:
         sfx_idx = next_input
         command += ["-i", str(sfx)]
     graph = build_filter_graph(
         timeline, opts, has_audio=has_audio, banner_idx=banner_idx, sfx_idx=sfx_idx, face_cx=face_cx,
-        banner=media, static_idx=static_idx, source_size=source_size,
+        banner=media,
     )  # fmt: skip
     command += [
         "-filter_complex", graph, "-map", "[v_out]", "-map", "[a_out]",
@@ -595,14 +524,10 @@ def render_clip(
     *,
     info: MediaInfo,
     banner: Path | None = None,
-    static: Path | None = None,
     sfx: Path | None = None,
     on_progress: Callable[[float], None] | None = None,
 ) -> BannerTimeline:
-    """Рендерит один вертикальный клип за один проход FFmpeg и возвращает его таймлайн.
-
-    `banner` — всплывающий баннер (показы), `static` — постоянный (весь клип, не зависит от показов).
-    """
+    """Рендерит один вертикальный клип за один проход FFmpeg и возвращает его таймлайн."""
     wants_banner = opts.banner_count > 0
     if wants_banner and banner is None:
         raise MediaError("Для показа баннера нужен файл баннера — выберите баннер или поставьте 0 показов.")
@@ -619,8 +544,8 @@ def render_clip(
         face_cx = detect_face_center_x(source, clip_start, timeline.clip_duration)
     command = build_ffmpeg_command(
         source, output, clip_start, timeline, opts,
-        has_audio=info.has_audio, banner=banner, banner_media=media, static=static,
-        source_size=(info.width, info.height), sfx=sfx if use_sfx else None, face_cx=face_cx,
+        has_audio=info.has_audio, banner=banner, banner_media=media,
+        sfx=sfx if use_sfx else None, face_cx=face_cx,
     )  # fmt: skip
     output.parent.mkdir(parents=True, exist_ok=True)
     try:

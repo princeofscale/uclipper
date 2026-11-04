@@ -1,17 +1,15 @@
-"""Конвейер целиком: пресеты и SFX, менеджер задач (источник → нарезка → ролики → ZIP).
+"""Конвейер целиком: менеджер задач (источник → нарезка → ролики → ZIP).
 
 Telegram-обвязка проверяется отдельно в `tests/test_bot.py`; здесь — только движок нарезки."""
 import io
 import shutil
 import time
-import wave
 import zipfile
 
 import pytest
-from PIL import Image
 
 from app.models import JobRequest, JobStatus
-from app.services.banner_manager import ensure_presets, ensure_sfx
+from app.services.banner_manager import ensure_sfx
 from app.services.downloader import save_local_upload
 from app.services.jobs import JobManager
 from tests.media_utils import probe
@@ -20,8 +18,7 @@ WAIT_SECONDS = 180
 
 
 @pytest.fixture
-def manager(settings):
-    ensure_presets(settings.banners_dir)
+def manager(settings, banner_id):
     ensure_sfx(settings.sfx_dir)
     jobs = JobManager(settings)
     yield jobs
@@ -38,7 +35,7 @@ def request_for(upload, **overrides) -> JobRequest:
     """Запрос из спеки: 2 клипа по 9 с, 2 показа баннера по 2 с (итого 13 с на клип)."""
     fields = dict(
         source_type="upload", upload_id=upload, num_clips=2, clip_duration=9,
-        banner_count=2, banner_duration=2, banner_id="preset_tgrader.png",
+        banner_count=2, banner_duration=2, banner_id="banner.png",
     )  # fmt: skip
     return JobRequest(**{**fields, **overrides})
 
@@ -87,7 +84,7 @@ def test_youtube_job_takes_the_video_from_cache(manager, settings, synthetic_vid
     """Ролик, уже лежащий в workspace/cache, повторно не качается (сеть не нужна)."""
     video_id = "dQw4w9WgXcQ"
     shutil.copy(synthetic_video, settings.cache_dir / f"source_{video_id}.mp4")
-    request = JobRequest(source_type="youtube", url=f"https://www.youtube.com/watch?v={video_id}", num_clips=1, clip_duration=3, banner_count=0)
+    request = JobRequest(source_type="link", url=f"https://www.youtube.com/watch?v={video_id}", num_clips=1, clip_duration=3, banner_count=0)
     state = manager.run_sync(request)
     assert state.status is JobStatus.DONE, state.error
     assert any("кеш" in line for line in state.log)
@@ -214,22 +211,6 @@ def test_get_returns_a_copy_and_unknown_ids_are_none(manager, upload_id):
     assert "мусор" not in again.log
     assert manager.get("нет-такой-задачи") is None
     assert manager.zip_path("нет-такой-задачи") is None
-
-
-# ---------- пресеты и SFX (спека, раздел 6) ----------
-
-
-def test_preset_banners_and_sfx_are_generated(settings):
-    ensure_presets(settings.banners_dir)
-    sound = ensure_sfx(settings.sfx_dir)
-    for name in ("preset_tgrader.png", "preset_rubup.png", "preset_musor_drop.png"):
-        with Image.open(settings.banners_dir / name) as image:
-            assert (image.size, image.mode) == ((920, 360), "RGBA")
-            assert image.getpixel((0, 0))[3] == 0  # скруглённые углы прозрачны
-            assert image.getpixel((460, 180))[3] == 255
-    with wave.open(str(sound)) as wav:
-        assert (wav.getnchannels(), wav.getframerate()) == (2, 44100)
-        assert wav.getnframes() / wav.getframerate() == pytest.approx(0.25, abs=0.005)
 
 
 def test_synthetic_source_is_20_seconds_720p_with_audio(synthetic_video):

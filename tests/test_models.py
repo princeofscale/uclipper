@@ -5,7 +5,7 @@ from pydantic import ValidationError
 from app.config import Settings
 from app.models import JobRequest, SourceType
 
-UPLOAD = {"source_type": SourceType.UPLOAD, "upload_id": "a" * 32, "banner_id": "preset_tgrader.png"}
+UPLOAD = {"source_type": SourceType.UPLOAD, "upload_id": "a" * 32, "banner_id": "banner.mp4"}
 
 
 def test_banner_is_required_when_it_has_to_be_shown():
@@ -20,7 +20,7 @@ def test_banner_is_optional_when_it_is_never_shown():
 
 def test_each_source_type_needs_its_own_field():
     with pytest.raises(ValidationError):
-        JobRequest(source_type=SourceType.YOUTUBE, banner_count=0)
+        JobRequest(source_type=SourceType.LINK, banner_count=0)
     with pytest.raises(ValidationError):
         JobRequest(source_type=SourceType.UPLOAD, banner_count=0)
 
@@ -40,8 +40,6 @@ def test_each_source_type_needs_its_own_field():
         ("clip_duration", 180.5),
         ("start_offset", -1),
         ("end_offset", -1),
-        ("static_scale", 39),
-        ("static_scale", 101),
     ],
 )
 def test_values_outside_the_documented_range_are_rejected(field, value):
@@ -62,8 +60,6 @@ def test_values_outside_the_documented_range_are_rejected(field, value):
         ("banner_scale", 95),
         ("clip_duration", 2.0),
         ("clip_duration", 180),
-        ("static_scale", 40),
-        ("static_scale", 100),
     ],
 )
 def test_range_edges_are_accepted(field, value):
@@ -91,20 +87,10 @@ def test_default_settings_follow_the_layout_from_the_spec():
     assert settings.outputs_dir.as_posix().endswith("workspace/outputs")
     assert settings.cache_dir.as_posix().endswith("workspace/cache")
     assert settings.uploads_dir.as_posix().endswith("workspace/uploads")
-    assert settings.asset_banners_dir.as_posix().endswith("assets/banners")
 
 
 def test_new_options_default_to_the_old_behaviour():
     request = JobRequest(**{**UPLOAD, "banner_count": 0})
     assert request.end_offset == 0
     assert request.auto_trim is False  # автообрезка включается явно (интерфейс включает её сам)
-    assert request.static_banner_id is None
-    assert request.static_position == "top"
-    assert request.static_scale == 92
     assert request.banner_sound is True
-
-
-def test_static_position_is_top_or_bottom_only():
-    JobRequest(**{**UPLOAD, "static_position": "bottom"})
-    with pytest.raises(ValidationError):
-        JobRequest(**{**UPLOAD, "static_position": "center"})

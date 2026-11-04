@@ -55,7 +55,6 @@ GOALS: dict[Goal, GoalSpec] = {
 class AutoPlan:
     settings: ClipSettings
     spec: GoalSpec
-    clip_total_seconds: float  # длина готового клипа вместе с паузами под баннер
     shortened: bool  # ролик короткий: клип пришлось сделать короче обычного
 
 
@@ -93,7 +92,6 @@ def plan_auto(
     pause = banner_seconds or 0.0
     while banners > 1 and clip + banners * pause > SHORTS_LIMIT:
         banners -= 1
-    total = clip + banners * pause
 
     frame = FrameMode.CENTER_CROP if spec.full_screen and face_crop else FrameMode.BLUR_PAD
     settings = ClipSettings.model_validate(
@@ -112,8 +110,7 @@ def plan_auto(
             "banner_scale": 85,
             "banner_sound": True,
             "enable_sfx": False,
-            "static_banner_id": None,
             "max_height": 720 if duration > LONG_SOURCE_MINUTES * 60 else 1080,
         }
     )
-    return AutoPlan(settings=settings, spec=spec, clip_total_seconds=total, shortened=shortened)
+    return AutoPlan(settings=settings, spec=spec, shortened=shortened)

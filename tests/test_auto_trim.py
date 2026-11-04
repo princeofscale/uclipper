@@ -67,7 +67,6 @@ def test_suggestion_exposes_offsets_for_the_cutter(episodes):
     result = analyse(path)
     assert result.start_offset == pytest.approx(result.start)
     assert result.end_offset == pytest.approx(result.duration - result.end)
-    assert result.usable == pytest.approx(result.end - result.start)
     assert isinstance(result, TrimSuggestion)
 
 

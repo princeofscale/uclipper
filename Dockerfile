@@ -14,10 +14,9 @@ RUN apt-get update \
 WORKDIR /app
 
 # Зависимости отдельным слоем: он пересобирается только при смене requirements.txt.
-# Тестовые пакеты (pytest*) в образ бота не нужны.
+# Всё для тестов лежит в requirements-dev.txt и в образ бота не попадает.
 COPY requirements.txt .
-RUN grep -viE '^\s*pytest' requirements.txt > /tmp/runtime-requirements.txt \
-    && pip install -r /tmp/runtime-requirements.txt
+RUN pip install -r requirements.txt
 
 COPY app ./app
 COPY assets ./assets

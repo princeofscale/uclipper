@@ -39,11 +39,11 @@ PROXY_ENV = "TELEGRAM_PROXY"
 
 # Что видно в пустом чате до первого нажатия «Старт» (команд у бота нет — только кнопки).
 BOT_DESCRIPTION = (
-    "TgRader Clipper нарезает YouTube-ролики на вертикальные клипы 9:16 для TikTok и Shorts "
-    "и вклеивает рекламный баннер.\n"
+    "TgRader Clipper нарезает ролики с YouTube, RuTube, VK Видео и других площадок "
+    "на вертикальные клипы 9:16 для TikTok и Shorts и вклеивает рекламный баннер.\n"
     "Нажмите «Старт» и пришлите ссылку — всё остальное кнопками."
 )
-BOT_SHORT_DESCRIPTION = "Нарезка YouTube на клипы для TikTok и Shorts"
+BOT_SHORT_DESCRIPTION = "Нарезка роликов с YouTube, RuTube, VK на клипы для TikTok и Shorts"
 
 
 def token_from_env() -> str:

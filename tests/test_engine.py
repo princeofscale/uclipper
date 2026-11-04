@@ -24,7 +24,6 @@ from tests.media_utils import (
 def test_probe_media_reports_streams(synthetic_video, silent_video):
     info = probe_media(synthetic_video)
     assert (info.width, info.height, info.has_audio) == (1280, 720, True)
-    assert (info.video_codec, info.audio_codec) == ("h264", "aac")
     assert info.duration == pytest.approx(20, abs=0.2)
     assert probe_media(silent_video).has_audio is False
 
@@ -137,7 +136,7 @@ def test_banner_shows_need_a_banner_file(synthetic_video, tmp_path):
 
 
 def test_ffmpeg_failure_is_reported_and_leaves_no_partial_file(tmp_path):
-    info = MediaInfo(duration=10, width=1280, height=720, has_audio=True, video_codec="h264", audio_codec="aac")
+    info = MediaInfo(duration=10, width=1280, height=720, has_audio=True)
     with pytest.raises(MediaError, match="missing.mp4"):
         render_clip(tmp_path / "missing.mp4", tmp_path / "x.mp4", 0.0, 5.0, RenderOptions(banner_count=0), info=info)
     assert not (tmp_path / "x.mp4").exists()

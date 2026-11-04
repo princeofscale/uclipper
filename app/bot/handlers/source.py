@@ -1,4 +1,4 @@
-"""Приём источника: ссылка на YouTube, поиск по названию, присланный файл и выбор из найденного.
+"""Приём источника: ссылка на ролик любой площадки, поиск по названию, присланный файл и выбор из найденного.
 
 Любой принятый ролик начинает диалог заново: прежний черновик, ожидание ввода и списки результатов
 забываются, а человек видит выбор режима (или сразу автоплан, если ролик выбран в «В тренде»).
@@ -33,20 +33,15 @@ from app.bot.rich import esc
 from app.bot.states import Flow
 from app.config import TELEGRAM_MAX_UPLOAD_MB, VIDEO_EXTS
 from app.models import ClipSettings, Draft, VideoInfo
-from app.services.downloader import (
-    DownloadError,
-    extract_video_id,
-    fetch_video_info,
-    save_local_upload,
-    search_videos,
-)
+from app.services.downloader import DownloadError, fetch_video_info, save_local_upload
+from app.services.platforms import identify, mentions_known_site
+from app.services.search import search_videos
 from app.services.video_processor import MediaError, probe_media
 
 log = logging.getLogger(__name__)
 router = Router(name="source")
 
-# Прямая ссылка YouTube или «похоже на ссылку» (тогда честно скажем, что не подошло).
-_YOUTUBE_HINT = re.compile(r"(youtu\.?\s?be|youtube\.com|youtube-nocookie\.com)", re.IGNORECASE)
+# «Похоже на ссылку», но площадку мы не знаем (или это не ролик) — тогда честно скажем, что не подошло.
 _URL_HINT = re.compile(r"^(https?://|www\.)|\.[a-z]{2,}/", re.IGNORECASE)
 
 
@@ -59,8 +54,8 @@ def _base_settings(ctx: AppContext, user_id: int) -> ClipSettings:
     settings = ctx.store.settings(user_id)
     banner = ctx.banner()
     if banner is None:
-        return update_settings(settings, banner_id=None, banner_count=0, static_banner_id=None)
-    return update_settings(settings, banner_id=banner.id, static_banner_id=None)
+        return update_settings(settings, banner_id=None, banner_count=0)
+    return update_settings(settings, banner_id=banner.id)
 
 
 async def open_draft(
@@ -77,15 +72,14 @@ async def open_draft(
 async def open_video(
     state: FSMContext, ctx: AppContext, user_id: int, info: dict, *, auto: bool = False
 ) -> tuple[str, InlineKeyboardMarkup]:
-    """Ролик с YouTube (сведения `info`) → первый экран диалога."""
+    """Ролик по ссылке (сведения `info`) → первый экран диалога."""
     video = VideoInfo(
-        video_id=info["video_id"],
         url=info["url"],
         title=info.get("title") or "Без названия",
         duration=float(info.get("duration") or 0),
+        platform=info.get("platform") or None,
         uploader=info.get("uploader") or None,
         thumbnail=info.get("thumbnail") or None,
-        resolutions=info.get("resolutions") or [],
     )
     return await open_draft(state, ctx, Draft.from_video(video, _base_settings(ctx, user_id)), auto=auto)
 
@@ -110,7 +104,7 @@ async def _accepts_source(message: Message, state: FSMContext, ctx: AppContext) 
     if current in (None, Flow.waiting_link.state, Flow.waiting_query.state, Flow.waiting_file.state):
         return True
     if current in (Flow.editing.state, Flow.choosing.state):
-        return bool(extract_video_id(text))
+        return identify(text) is not None
     return False
 
 
@@ -122,11 +116,12 @@ async def _not_busy(message: Message, ctx: AppContext) -> bool:
 @router.message(_accepts_source, F.text)
 async def on_text(message: Message, state: FSMContext, ctx: AppContext) -> None:
     text = (message.text or "").strip()
-    if extract_video_id(text):
-        await _from_url(message, state, ctx, text)
+    source = identify(text)
+    if source is not None:
+        await _from_url(message, state, ctx, source.url)
         return
     current = await state.get_state()
-    looks_like_link = _YOUTUBE_HINT.search(text) or _URL_HINT.search(text)
+    looks_like_link = mentions_known_site(text) or _URL_HINT.search(text)
     if looks_like_link and current != Flow.waiting_query.state:
         await show(message, texts.BAD_LINK, keyboards.back_to_menu())
         return
@@ -164,7 +159,7 @@ async def _search(message: Message, state: FSMContext, ctx: AppContext, query: s
         await replace(status, texts.error_text(str(error)), keyboards.back_to_menu())
         return
     except Exception:  # noqa: BLE001
-        log.exception("Поиск на YouTube упал")
+        log.exception("Поиск по названию упал")
         await replace(
             status,
             texts.error_text("Поиск не удался. Попробуйте ещё раз или пришлите ссылку."),
@@ -195,7 +190,7 @@ async def on_pick(callback: CallbackQuery, state: FSMContext, ctx: AppContext) -
         return
     await safe_answer(callback)
     info = {
-        "video_id": entry["video_id"],
+        "platform": entry.get("platform"),
         "url": entry["url"],
         "title": entry.get("title"),
         "duration": entry.get("duration"),
@@ -243,7 +238,7 @@ async def on_file(message: Message, state: FSMContext, ctx: AppContext) -> None:
         log.exception("Не удалось принять видеофайл")
         await replace(
             status,
-            texts.error_text("Не получилось принять файл. Попробуйте ещё раз или пришлите ссылку на YouTube."),
+            texts.error_text("Не получилось принять файл. Попробуйте ещё раз или пришлите ссылку на ролик."),
             keyboards.back_to_menu(),
         )
         return

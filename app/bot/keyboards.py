@@ -22,6 +22,7 @@ from app.bot.options import CHOICES
 from app.bot.steppers import Stepper
 from app.models import ClipSettings, Draft, Goal
 from app.services.autoplan import GOALS
+from app.services.platforms import PLATFORM_BY_ID, SEARCHABLE
 from app.services.trends import CATEGORIES
 
 PRIMARY = ButtonStyle.PRIMARY.value
@@ -69,14 +70,17 @@ def search_results(
     again: tuple[str, str] = ("🔄 Искать другое", "ask:query"),
     back: tuple[str, str] = ("🏠 В начало", MENU),
 ) -> InlineKeyboardMarkup:
-    """Список найденных роликов: по кнопке на строку и два пути назад."""
+    """Список найденных роликов: по кнопке на строку и два пути назад. Если площадок несколько, у кнопки её значок."""
     builder = InlineKeyboardBuilder()
+    mixed = len({entry.get("platform") for entry in entries}) > 1
     for index, entry in enumerate(entries):
+        platform = PLATFORM_BY_ID.get(entry.get("platform") or "")
+        badge = f"{platform.emoji} " if mixed and platform else ""
         title = entry.get("title") or "Без названия"
-        if len(title) > 40:
-            title = title[:39] + "…"
+        if len(title) > 36:
+            title = title[:35] + "…"
         minutes = texts.duration_text(entry.get("duration") or 0)
-        _add(builder, f"{index + 1}. {title} · {minutes}", f"pick:{index}", PRIMARY if index == 0 else None)
+        _add(builder, f"{index + 1}. {badge}{title} · {minutes}", f"pick:{index}", PRIMARY if index == 0 else None)
     _add(builder, *again)
     _add(builder, *back)
     builder.adjust(*([1] * len(entries)), 2)
@@ -233,25 +237,34 @@ def banners_screen(banner_name: str | None) -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
-def trends_home() -> InlineKeyboardMarkup:
+def trends_home(platform_id: str) -> InlineKeyboardMarkup:
+    """Сверху переключатель площадки (выбранная — синяя), ниже жанры этой площадки."""
     builder = InlineKeyboardBuilder()
+    for platform in SEARCHABLE:
+        selected = platform.id == platform_id
+        _add(
+            builder,
+            f"{'● ' if selected else ''}{platform.emoji} {platform.title}",
+            f"trends:{platform.id}",
+            PRIMARY if selected else None,
+        )
     for category in CATEGORIES:
-        _add(builder, f"{category.emoji} {category.title}", f"trend:{category.id}")
+        _add(builder, f"{category.emoji} {category.title}", f"trend:{platform_id}:{category.id}")
     _add(builder, "🏠 В начало", MENU)
-    builder.adjust(*([2] * (len(CATEGORIES) // 2)), 1)
+    builder.adjust(len(SEARCHABLE), *([2] * (len(CATEGORIES) // 2)), 1)
     return builder.as_markup()
 
 
-def trend_results(videos: list[dict]) -> InlineKeyboardMarkup:
-    """Ролики жанра: выбрать один или вернуться к жанрам."""
-    return search_results(videos, again=("⬅️ К жанрам", "screen:trends"))
+def trend_results(videos: list[dict], platform_id: str) -> InlineKeyboardMarkup:
+    """Ролики жанра: выбрать один или вернуться к жанрам той же площадки."""
+    return search_results(videos, again=("⬅️ К жанрам", f"trends:{platform_id}"))
 
 
-def trends_retry(category_id: str) -> InlineKeyboardMarkup:
+def trends_retry(platform_id: str, category_id: str) -> InlineKeyboardMarkup:
     """Не получилось загрузить тренды: повторить или вернуться."""
     builder = InlineKeyboardBuilder()
-    _add(builder, "🔄 Повторить", f"trend:{category_id}", PRIMARY)
-    _add(builder, "⬅️ К жанрам", "screen:trends")
+    _add(builder, "🔄 Повторить", f"trend:{platform_id}:{category_id}", PRIMARY)
+    _add(builder, "⬅️ К жанрам", f"trends:{platform_id}")
     builder.adjust(1, 1)
     return builder.as_markup()
 

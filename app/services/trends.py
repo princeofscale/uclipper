@@ -1,14 +1,19 @@
 """«В тренде»: что сейчас смотрят русскоязычные зрители — сырьё для нарезки под TikTok и Shorts.
 
-Официальную ленту трендов YouTube закрыл, поэтому берём то, что доступно без входа в аккаунт: поиск
-YouTube с фильтром «за неделю» и сортировкой по просмотрам (через yt-dlp) по запросам тех жанров, из
-которых получаются хорошие клипы. Две тонкости, которые пришлось учесть:
+Официальных лент трендов у площадок нет (YouTube свою закрыл, у RuTube «Популярное» — подборка кино),
+поэтому берём то, что доступно без входа в аккаунт, по запросам тех жанров, из которых получаются хорошие клипы:
 
-• поиск по-русски возвращает и английские ролики с машинным переводом названия — настоящее название
+• YouTube — поиск с фильтром «за неделю» и сортировкой по просмотрам (через yt-dlp);
+• RuTube — открытый поиск их API; сортировки по просмотрам там нет, так что свежие ролики
+  (неделя → месяц → квартал) упорядочиваем по просмотрам сами.
+
+Две тонкости, которые пришлось учесть:
+
+• поиск YouTube по-русски возвращает и английские ролики с машинным переводом названия — настоящее название
   узнаём через oEmbed (быстро, пачкой) и оставляем только то, что по-русски на самом деле;
-• ролик короче пяти минут — уже готовый шорт, нарезать нечего, а длиннее четырёх часов — слишком тяжело.
+• ролик короче пяти минут — уже готовый шорт, нарезать нечего, а слишком длинный бот не потянет.
 
-Ответы кешируются на полчаса: данные меняются медленно, а YouTube не любит одинаковые запросы по кругу.
+Ответы кешируются на полчаса: данные меняются медленно, а площадки не любят одинаковые запросы по кругу.
 Все функции блокирующие — зовите их через `TrendCache.cached` (он уводит работу в поток).
 """
 from __future__ import annotations
@@ -16,9 +21,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
-import logging
 import re
-import shutil
 import time
 import urllib.parse
 import urllib.request
@@ -27,21 +30,22 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import TypeVar
 
-import yt_dlp
-
-log = logging.getLogger(__name__)
+from app.config import MAX_SOURCE_SECONDS
+from app.services import rutube, youtube
 
 T = TypeVar("T")
 
 CACHE_SECONDS = 30 * 60
 FAILURE_SECONDS = 3 * 60  # после неудачи не долбим источник чаще, чем раз в пару минут
 MIN_SECONDS = 5 * 60  # короче — это уже готовый шорт, нарезать нечего
-MAX_SECONDS = 4 * 3600  # длиннее — слишком тяжело для бота
-MIN_VIEWS = 2_000  # совсем непросматриваемое в «тренд» не пускаем
+MAX_SECONDS = MAX_SOURCE_SECONDS  # длиннее бот всё равно не примет
+MIN_VIEWS = {"youtube": 2_000, "rutube": 500}  # совсем непросматриваемое в «тренд» не пускаем (у RuTube числа скромнее)
+DEFAULT_MIN_VIEWS = 1_000
 PER_CHANNEL = 2  # столько роликов с одного канала в одной подборке, чтобы список не был однообразным
 FETCH_LIMIT = 40  # сколько результатов просим у YouTube на один запрос
+FRESH_DAYS = (7, 30, 90)  # RuTube: что считать свежим — сначала неделя, потом месяц, потом квартал
 OEMBED_URL = "https://www.youtube.com/oembed?format=json&url="
-USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+USER_AGENT = rutube.USER_AGENT
 
 _CYRILLIC = re.compile(r"[А-Яа-яЁё]")
 _NOT_RUSSIAN = re.compile(r"[әғқңөұүһіїєґўӘҒҚҢӨҰҮҺІЇЄҐЎ]")  # кириллица, но казахский, украинский, белорусский
@@ -129,7 +133,7 @@ class TrendCache:
 
 
 # ---------------------------------------------------------------------------
-# Поиск на YouTube
+# Отбор
 # ---------------------------------------------------------------------------
 
 _PERIODS = {"day": 2, "week": 3, "month": 4}  # значения фильтра «Дата загрузки» в поиске YouTube
@@ -154,27 +158,58 @@ def looks_russian(title: str) -> bool:
     return count >= 4 and count / len(letters) >= 0.4
 
 
-def _js_runtimes() -> dict[str, dict]:
-    found = {name: {} for name in ("deno", "node", "bun") if shutil.which(name)}
-    return found or {"deno": {}}
+def pick_videos(cards: list[dict], limit: int, *, taken: set[str] | None = None) -> list[dict]:
+    """Оставляет русскоязычные ролики подходящей длины, не больше двух с канала. Порядок сохраняется.
+
+    На входе карточки площадок (`youtube.video_card`, `rutube.video_card`), на выходе — то, что нужно боту.
+    """
+    seen = set(taken or ())
+    per_channel: dict[str, int] = {}
+    chosen: list[dict] = []
+    for card in cards:
+        video_id = card.get("video_id") or ""
+        title = (card.get("title") or "").strip()
+        duration = float(card.get("duration") or 0)
+        views = int(card.get("views") or 0)
+        if video_id in seen or not title or not looks_russian(title):
+            continue
+        if views < MIN_VIEWS.get(card.get("platform") or "", DEFAULT_MIN_VIEWS) or card.get("live"):
+            continue
+        if not MIN_SECONDS <= duration <= MAX_SECONDS:
+            continue
+        channel = card.get("uploader") or ""
+        if channel and per_channel.get(channel, 0) >= PER_CHANNEL:
+            continue
+        seen.add(video_id)
+        per_channel[channel] = per_channel.get(channel, 0) + 1
+        chosen.append(
+            {
+                "platform": card["platform"],
+                "video_id": video_id,
+                "title": title,
+                "duration": duration,
+                "uploader": channel,
+                "views": views,
+                "url": card["url"],
+                "thumbnail": card.get("thumbnail") or "",
+            }
+        )
+        if len(chosen) >= limit:
+            break
+    return chosen
 
 
-def _search(query: str, period: str) -> list[dict]:
+# ---------------------------------------------------------------------------
+# YouTube
+# ---------------------------------------------------------------------------
+
+
+def _search_youtube(query: str, period: str) -> list[dict]:
     url = f"https://www.youtube.com/results?search_query={urllib.parse.quote(query)}&sp={search_filter(period)}"
-    options = {
-        "quiet": True,
-        "no_warnings": True,
-        "extract_flat": True,
-        "playlistend": FETCH_LIMIT,
-        "js_runtimes": _js_runtimes(),
-        "socket_timeout": 15,
-    }
     try:
-        with yt_dlp.YoutubeDL(options) as ydl:
-            info = ydl.extract_info(url, download=False)
-    except yt_dlp.utils.YoutubeDLError as error:
-        raise TrendsError("YouTube сейчас не отвечает — попробуйте через пару минут.") from error
-    return [entry for entry in (info or {}).get("entries") or [] if entry and entry.get("id")]
+        return youtube.search(url, FETCH_LIMIT)
+    except youtube.YoutubeError as error:
+        raise TrendsError(str(error)) from error
 
 
 def _search_all(queries: tuple[str, ...], period: str) -> tuple[list[dict], bool]:
@@ -182,53 +217,18 @@ def _search_all(queries: tuple[str, ...], period: str) -> tuple[list[dict], bool
 
     def one(query: str) -> list[dict] | None:
         try:
-            return _search(query, period)
+            return _search_youtube(query, period)
         except TrendsError:
             return None
 
     with ThreadPoolExecutor(max_workers=len(queries)) as pool:
         answers = list(pool.map(one, queries))
     merged: dict[str, dict] = {}
-    for entries in answers:
-        for entry in entries or []:
-            merged.setdefault(entry["id"], entry)
-    ordered = sorted(merged.values(), key=lambda entry: int(entry.get("view_count") or 0), reverse=True)
-    return ordered, any(entries is not None for entries in answers)
-
-
-def pick_videos(entries: list[dict], limit: int, *, taken: set[str] | None = None) -> list[dict]:
-    """Оставляет русскоязычные ролики подходящей длины, не больше двух с канала. Порядок сохраняется."""
-    seen = set(taken or ())
-    per_channel: dict[str, int] = {}
-    chosen: list[dict] = []
-    for entry in entries:
-        video_id = entry.get("id") or ""
-        title = (entry.get("title") or "").strip()
-        duration = float(entry.get("duration") or 0)
-        views = int(entry.get("view_count") or 0)
-        if video_id in seen or not title or not looks_russian(title) or views < MIN_VIEWS:
-            continue
-        if not MIN_SECONDS <= duration <= MAX_SECONDS or entry.get("live_status") in ("is_live", "is_upcoming"):
-            continue
-        channel = entry.get("channel") or entry.get("uploader") or ""
-        if channel and per_channel.get(channel, 0) >= PER_CHANNEL:
-            continue
-        seen.add(video_id)
-        per_channel[channel] = per_channel.get(channel, 0) + 1
-        chosen.append(
-            {
-                "video_id": video_id,
-                "title": title,
-                "duration": duration,
-                "uploader": channel,
-                "views": views,
-                "url": f"https://www.youtube.com/watch?v={video_id}",
-                "thumbnail": f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg",
-            }
-        )
-        if len(chosen) >= limit:
-            break
-    return chosen
+    for cards in answers:
+        for card in cards or []:
+            merged.setdefault(card["video_id"], card)
+    ordered = sorted(merged.values(), key=lambda card: card["views"], reverse=True)
+    return ordered, any(cards is not None for cards in answers)
 
 
 def _original_title(video_id: str) -> str | None:
@@ -257,7 +257,7 @@ def keep_original_russian(videos: list[dict]) -> list[dict]:
     return kept
 
 
-def fetch_videos(queries: tuple[str, ...], limit: int = 8) -> list[dict]:
+def fetch_youtube(queries: tuple[str, ...], limit: int = 8) -> list[dict]:
     """Самое просматриваемое по запросам: сначала за неделю, не хватило — добираем за месяц.
 
     Пустой список — ничего подходящего; `TrendsError` — YouTube не ответил.
@@ -265,11 +265,11 @@ def fetch_videos(queries: tuple[str, ...], limit: int = 8) -> list[dict]:
     chosen: list[dict] = []
     answered = False
     for period in ("week", "month"):
-        entries, ok = _search_all(queries, period)
+        cards, ok = _search_all(queries, period)
         answered = answered or ok
         if not ok:
             continue
-        candidates = pick_videos(entries, limit * 3, taken={video["video_id"] for video in chosen})
+        candidates = pick_videos(cards, limit * 3, taken={video["video_id"] for video in chosen})
         chosen += keep_original_russian(candidates)[: limit - len(chosen)]
         if len(chosen) >= limit:
             break
@@ -278,8 +278,61 @@ def fetch_videos(queries: tuple[str, ...], limit: int = 8) -> list[dict]:
     return chosen
 
 
-def fetch_category(category: Category, limit: int = 8) -> list[dict]:
-    return fetch_videos(category.queries, limit)
+# ---------------------------------------------------------------------------
+# RuTube
+# ---------------------------------------------------------------------------
+
+
+def _search_rutube_all(queries: tuple[str, ...]) -> tuple[list[dict], bool]:
+    """Ответы RuTube на все запросы, без повторов. Второе значение: хоть один ответил."""
+
+    def one(query: str) -> list[dict] | None:
+        try:
+            return rutube.search(query)
+        except rutube.RutubeError:
+            return None
+
+    with ThreadPoolExecutor(max_workers=len(queries)) as pool:
+        answers = list(pool.map(one, queries))
+    merged: dict[str, dict] = {}
+    for cards in answers:
+        for card in cards or []:
+            merged.setdefault(card["video_id"], card)
+    return list(merged.values()), any(cards is not None for cards in answers)
+
+
+def freshness_rank(published: float | None, now: float) -> int:
+    """0 — выложено за неделю, 1 — за месяц, 2 — за квартал, 3 — давно (или дата неизвестна)."""
+    if published is None:
+        return len(FRESH_DAYS)
+    age_days = (now - published) / 86400
+    return next((rank for rank, days in enumerate(FRESH_DAYS) if age_days <= days), len(FRESH_DAYS))
+
+
+def fetch_rutube(queries: tuple[str, ...], limit: int = 8, *, now: float | None = None) -> list[dict]:
+    """Свежие ролики RuTube, самые просматриваемые первыми: сначала за неделю, не хватило — за месяц и квартал.
+
+    Пустой список — ничего подходящего; `TrendsError` — RuTube не ответил.
+    """
+    cards, answered = _search_rutube_all(queries)
+    if not answered:
+        raise TrendsError("RuTube сейчас не отвечает — попробуйте через пару минут.")
+    moment = time.time() if now is None else now
+    fresh = [card for card in cards if freshness_rank(card.get("published"), moment) < len(FRESH_DAYS)]
+    fresh.sort(key=lambda card: (freshness_rank(card.get("published"), moment), -card["views"]))
+    return pick_videos(fresh, limit)
+
+
+# ---------------------------------------------------------------------------
+# Подборка по жанру
+# ---------------------------------------------------------------------------
+
+FETCHERS: dict[str, Callable[[tuple[str, ...], int], list[dict]]] = {"youtube": fetch_youtube, "rutube": fetch_rutube}
+PERIOD_TEXT = {"youtube": "за неделю", "rutube": "за последнее время"}  # как называть период в подписях
+
+
+def fetch_category(category: Category, platform: str = "youtube", limit: int = 8) -> list[dict]:
+    return FETCHERS[platform](category.queries, limit)
 
 
 # ---------------------------------------------------------------------------

@@ -88,6 +88,13 @@ def solid_banner(media_dir):
     return path
 
 
+@pytest.fixture
+def banner_id(settings, solid_banner):
+    """Картинка-баннер в папке баннеров (задача берёт файл по имени). Возвращает его id."""
+    shutil.copy(solid_banner, settings.banners_dir / "banner.png")
+    return "banner.png"
+
+
 @pytest.fixture(scope="session")
 def freeze_clip(synthetic_video, solid_banner, tmp_path_factory):
     """Клип из спеки: T=9 с, K=2 остановки по D=2 с, Blur-Pad, без SFX. Рендерится один раз за сессию."""

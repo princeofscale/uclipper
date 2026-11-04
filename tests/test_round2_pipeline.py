@@ -1,21 +1,21 @@
-"""Раунд 2 в сборе: автообрезка и смещения в задаче, постоянный и видео-баннер."""
+"""Раунд 2 в сборе: автообрезка и смещения в задаче, видео-баннер."""
+
+import shutil
 
 import pytest
 
 from app.models import JobRequest, JobStatus
-from app.services.banner_manager import ensure_presets, ensure_sfx, ensure_strip_presets, save_uploaded_banner
+from app.services.banner_manager import ensure_sfx
 from app.services.downloader import save_local_upload
 from app.services.jobs import JobManager
 from tests.media_utils import audio_frequency, make_color_video, make_episode, probe, rgb_at
-from tests.test_render_variants import RED, is_pink
+from tests.test_render_variants import RED
 
 WAIT_SECONDS = 180
 
 
 @pytest.fixture
 def manager(settings):
-    ensure_presets(settings.banners_dir)
-    ensure_strip_presets(settings.banners_dir)
     ensure_sfx(settings.sfx_dir)
     jobs = JobManager(settings)
     yield jobs
@@ -34,9 +34,9 @@ def plain_episode(media_dir):
 
 
 @pytest.fixture(scope="module")
-def traffic_bytes(media_dir):
+def traffic_video(media_dir):
     """Видео-баннер 2 с: красный, синий, звук 1000 Гц."""
-    return make_color_video(media_dir / "round2_traffic.mp4", [("red", 1.0), ("blue", 1.0)], tone_hz=1000).read_bytes()
+    return make_color_video(media_dir / "round2_traffic.mp4", [("red", 1.0), ("blue", 1.0)], tone_hz=1000)
 
 
 def put_upload(settings, path):
@@ -89,19 +89,13 @@ def test_a_job_without_any_trim_reports_no_trim(manager, settings, synthetic_vid
 # ---------- задача: баннеры ----------
 
 
-def test_job_with_a_video_popup_and_a_static_banner(manager, settings, synthetic_video, traffic_bytes):
-    from PIL import Image
-    import io
-
-    buffer = io.BytesIO()
-    Image.new("RGB", (900, 300), (255, 51, 102)).save(buffer, "PNG")
-    static = save_uploaded_banner("pink.png", buffer.getvalue(), settings.banners_dir)
-    popup = save_uploaded_banner("traffic.mp4", traffic_bytes, settings.banners_dir)
+def test_job_with_a_video_banner_pauses_for_the_length_of_the_video(manager, settings, synthetic_video, traffic_video):
+    shutil.copy(traffic_video, settings.banners_dir / "traffic.mp4")
 
     state = manager.run_sync(
         request_for(
             put_upload(settings, synthetic_video), clip_duration=6, banner_count=1, banner_duration=4.5,
-            banner_id=popup.id, static_banner_id=static.id,
+            banner_id="traffic.mp4",
         )
     )  # fmt: skip
     assert state.status is JobStatus.DONE, state.error
@@ -110,13 +104,5 @@ def test_job_with_a_video_popup_and_a_static_banner(manager, settings, synthetic
     assert clip.duration == pytest.approx(8.0, abs=0.1)  # пауза = длина видео-баннера (2 с), а не 4.5 с с ползунка
     assert clip.banner_windows == [pytest.approx((3, 5), abs=0.05)]
     assert probe(output).duration == pytest.approx(8.0, abs=0.15)
-    assert is_pink(rgb_at(output, 1.0, (540, 328), settings.base_dir))  # постоянный — в верхнем поле
-    assert is_pink(rgb_at(output, 3.5, (540, 328), settings.base_dir))  # и в паузе тоже
-    assert rgb_at(output, 3.25, (540, 960), settings.base_dir) == pytest.approx(RED, abs=40)  # всплывающий — в паузе
-    assert audio_frequency(output, 3.2, 1.5, settings.base_dir) == pytest.approx(1000, abs=60)
-
-
-def test_job_stops_early_on_an_unknown_static_banner(manager, settings, synthetic_video):
-    state = manager.run_sync(request_for(put_upload(settings, synthetic_video), static_banner_id="nope.png"))
-    assert state.status is JobStatus.ERROR
-    assert "не найден" in state.error and state.clips == []
+    assert rgb_at(output, 3.25, (540, 960), settings.base_dir) == pytest.approx(RED, abs=40)  # баннер — в паузе
+    assert audio_frequency(output, 3.2, 1.5, settings.base_dir) == pytest.approx(1000, abs=60)  # со своим звуком

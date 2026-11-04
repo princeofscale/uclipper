@@ -44,14 +44,9 @@ class BannerPosition(StrEnum):
     BOTTOM = "bottom"
 
 
-class StaticPosition(StrEnum):
-    TOP = "top"  # постоянный баннер в верхнем поле (или у верхнего края)
-    BOTTOM = "bottom"
-
-
 class SourceType(StrEnum):
-    YOUTUBE = "youtube"
-    UPLOAD = "upload"
+    LINK = "link"  # ссылка на ролик: YouTube, RuTube, VK Видео и другие площадки
+    UPLOAD = "upload"  # видеофайл, присланный боту
 
 
 class JobStatus(StrEnum):
@@ -82,31 +77,27 @@ class ClipSettings(BaseModel):
     banner_sound: bool = True  # звук видео-баннера (если он есть в файле)
     enable_sfx: bool = False
 
-    static_banner_id: str | None = None  # постоянный баннер: весь клип, не темнеет при остановке
-    static_position: StaticPosition = StaticPosition.TOP
-    static_scale: int = Field(92, ge=40, le=100)  # % ширины кадра
-
     max_height: int = Field(1080, ge=144, le=2160)  # потолок качества при скачивании
 
 
 class VideoInfo(BaseModel):
     """Сведения о ролике для карточки в боте."""
 
-    video_id: str
     url: str
     title: str
     duration: float
+    platform: str | None = None  # id площадки из `app.services.platforms`
     uploader: str | None = None
     thumbnail: str | None = None
-    resolutions: list[int] = Field(default_factory=list)
 
 
 class Draft(BaseModel):
     """Черновик задачи: выбранный источник + текущие настройки (живёт в FSM-состоянии диалога)."""
 
-    source_type: SourceType = SourceType.YOUTUBE
+    source_type: SourceType = SourceType.LINK
     url: str | None = None
     upload_id: str | None = None
+    platform: str | None = None  # id площадки ролика (`None` — присланный файл)
     title: str = "Видео"
     uploader: str | None = None
     duration: float = 0.0
@@ -117,10 +108,11 @@ class Draft(BaseModel):
 
     @classmethod
     def from_video(cls, info: VideoInfo, settings: ClipSettings) -> "Draft":
-        """Черновик из карточки YouTube-ролика."""
+        """Черновик из карточки ролика по ссылке."""
         return cls(
-            source_type=SourceType.YOUTUBE,
+            source_type=SourceType.LINK,
             url=info.url,
+            platform=info.platform,
             title=info.title,
             uploader=info.uploader,
             duration=info.duration,
@@ -146,14 +138,14 @@ class Draft(BaseModel):
 class JobRequest(ClipSettings):
     """Параметры одной задачи нарезки: источник + настройки (все поля настроек — унаследованы)."""
 
-    source_type: SourceType = SourceType.YOUTUBE
+    source_type: SourceType = SourceType.LINK
     url: str | None = None
     upload_id: str | None = None
 
     @model_validator(mode="after")
     def _check_source_and_banner(self) -> "JobRequest":
-        if self.source_type is SourceType.YOUTUBE and not (self.url and self.url.strip()):
-            raise ValueError("Укажите ссылку на YouTube-ролик.")
+        if self.source_type is SourceType.LINK and not (self.url and self.url.strip()):
+            raise ValueError("Укажите ссылку на ролик.")
         if self.source_type is SourceType.UPLOAD and not self.upload_id:
             raise ValueError("Сначала пришлите видеофайл.")
         if self.banner_count > 0 and not self.banner_id:

@@ -1,4 +1,4 @@
-"""Telegram-бот TgRader Clipper: нарезка YouTube-роликов на вертикальные клипы с баннером."""
+"""Telegram-бот TgRader Clipper: нарезка роликов с YouTube, RuTube, VK Видео и других площадок на вертикальные клипы с баннером."""
 
 from app.bot.app import main
 

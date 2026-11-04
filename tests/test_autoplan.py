@@ -43,13 +43,12 @@ def test_total_length_with_the_banner_stays_within_shorts_limits():
             result = plan(duration, goal)
             s = result.settings
             assert s.clip_duration + s.banner_count * 7.5 <= SHORTS_LIMIT + 1e-9, (goal, duration)
-            assert result.clip_total_seconds == pytest.approx(s.clip_duration + s.banner_count * 7.5)
 
 
 def test_banner_count_is_reduced_until_the_clip_fits():
     spec_long = plan(3600, Goal.UNIVERSAL, banner=20.0)  # 30 + 2·20 = 70 > 59 → один показ
     assert spec_long.settings.banner_count == 1
-    assert spec_long.clip_total_seconds == pytest.approx(50.0)
+    assert spec_long.settings.clip_duration + 20.0 == pytest.approx(50.0)
 
 
 def test_universal_shows_two_banners_and_blur_pad():
@@ -65,7 +64,7 @@ def test_full_screen_only_when_faces_can_be_followed(goal):
 
 def test_without_a_banner_file_there_are_no_banners():
     result = plan(3600, Goal.UNIVERSAL, banner=None)
-    assert result.settings.banner_count == 0 and result.clip_total_seconds == result.settings.clip_duration
+    assert result.settings.banner_count == 0
 
 
 def test_short_video_is_taken_whole():
@@ -85,7 +84,6 @@ def test_auto_settings_are_the_documented_ones():
     assert s.slicing_mode is SlicingMode.HIGHLIGHTS and s.auto_trim
     assert (s.start_offset, s.end_offset) == (0.0, 0.0)
     assert s.banner_mode is BannerMode.FREEZE and s.banner_scale == 85 and s.banner_sound and not s.enable_sfx
-    assert s.static_banner_id is None
 
 
 def test_very_long_sources_are_downloaded_in_lower_quality():

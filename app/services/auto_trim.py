@@ -53,10 +53,6 @@ class TrimSuggestion:
     def end_offset(self) -> float:
         return self.duration - self.end
 
-    @property
-    def usable(self) -> float:
-        return self.end - self.start
-
 
 def _ffmpeg(args: list[str]) -> subprocess.CompletedProcess:
     try:

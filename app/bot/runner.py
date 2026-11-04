@@ -36,7 +36,6 @@ class RunningJob:
     state: JobState
     sent_clips: set[int] = field(default_factory=set)  # индексы уже отправленных роликов
     last_progress_text: str = ""  # чтобы не править сообщение тем же текстом дважды
-    cancelled: bool = False
     finished: bool = False
 
 
@@ -87,7 +86,6 @@ class JobRunner:
         running = self._jobs.get(job_id)
         if running is None or running.finished:
             return False
-        running.cancelled = True
         return self._manager.cancel(job_id)
 
     def active_for_user(self, user_id: int) -> str | None:

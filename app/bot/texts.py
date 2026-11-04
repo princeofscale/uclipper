@@ -9,29 +9,36 @@ from __future__ import annotations
 from app.bot.options import CHOICES
 from app.bot.rich import esc
 from app.bot.steppers import Stepper
+from app.config import MAX_SOURCE_SECONDS
 from app.models import ClipSettings, Draft, JobState, JobStatus
 from app.services.autoplan import AutoPlan
-from app.services.trends import CATEGORIES, Category, views_text
+from app.services.platforms import PLATFORM_BY_ID, PLATFORMS, Platform
+from app.services.search import RESULTS
+from app.services.trends import CATEGORIES, PERIOD_TEXT, Category, views_text
 
 NAME = "TgRader Clipper"
+PLATFORM_LIST = " · ".join(f"{platform.emoji} {platform.title}" for platform in PLATFORMS)
+SEARCH_SITES = " и ".join(f"{platform.emoji} {platform.title}" for platform in PLATFORMS if platform.search)
+MAX_HOURS = MAX_SOURCE_SECONDS // 3600
 
 # ---------- главное меню и справка ----------
 
 START = f"""\
 <h1>🎬 {NAME}</h1>
-<p>Нарезаю длинные YouTube-ролики на вертикальные клипы <b>9:16</b> для <b>TikTok</b>, <b>Shorts</b> и <b>Reels</b> — и вклеиваю в них рекламный баннер.</p>
+<p>Нарезаю длинные ролики на вертикальные клипы <b>9:16</b> для <b>TikTok</b>, <b>Shorts</b> и <b>Reels</b> — и вклеиваю в них рекламный баннер.</p>
+<p>🌐 Работаю с: {PLATFORM_LIST}</p>
 <hr/>
 <ul>
 <li>🤖 <b>Авто</b> — сам подберу число клипов, длину и самые яркие моменты</li>
 <li>🛠 <b>Вручную</b> — каждый параметр в ваших руках</li>
 <li>🔥 <b>В тренде</b> — что смотрят прямо сейчас, и сразу в нарезку</li>
 </ul>
-<blockquote>👇 Пришлите <b>ссылку</b> на YouTube, <b>название</b> ролика или <b>видеофайл</b> — дальше всё кнопками.</blockquote>"""
+<blockquote>👇 Пришлите <b>ссылку</b> на ролик, <b>название</b> или <b>видеофайл</b> — дальше всё кнопками.</blockquote>"""
 
-HELP = """\
+HELP = f"""\
 <h2>❓ Как это работает</h2>
 <ol>
-<li>📥 Пришлите <b>ссылку</b> на YouTube, <b>название</b> ролика или <b>видеофайл</b>.</li>
+<li>📥 Пришлите <b>ссылку</b> на ролик, <b>название</b> или <b>видеофайл</b>.</li>
 <li>🎛 Выберите режим: <b>🤖 Авто</b> или <b>🛠 Вручную</b>.</li>
 <li>🚀 Нажмите <b>«Нарезать»</b> — клипы придут в чат по одному, а если они влезают в 50 МБ, то ещё и одним ZIP.</li>
 </ol>
@@ -40,9 +47,17 @@ HELP = """\
 <p>Смотрит на длину ролика и вашу цель (TikTok, Shorts или универсально) и сам выбирает число и длину клипов. Из каждой части ролика берёт самый громкий и «живой» момент — по звуку. Заставку и титры убирает автообрезкой.</p>
 <p><i>Это правила и анализ звука, а не нейросеть: зато быстро и предсказуемо. План всегда можно поправить вручную.</i></p>
 </details>
+<details><summary>🌐 Откуда беру ролики</summary>
+<ul>
+<li>🔗 <b>По ссылке</b> — {PLATFORM_LIST}.</li>
+<li>🔍 <b>По названию</b> — ищу на {SEARCH_SITES}.</li>
+<li>🔥 <b>В тренде</b> — подборки тех же {SEARCH_SITES}.</li>
+</ul>
+<p><i>Берутся только записи — не прямые эфиры, и не длиннее {MAX_HOURS} часов.</i></p>
+</details>
 <details><summary>🔥 Раздел «В тренде»</summary>
-<p>Самые просматриваемые за неделю ролики на русском по жанрам: подкасты, юмор, игры, бизнес, кино, спорт. Выберите ролик — и сразу получите план нарезки под TikTok.</p>
-<p><i>Данные берутся с YouTube и обновляются раз в полчаса.</i></p>
+<p>Самые просматриваемые свежие ролики на русском по жанрам: подкасты, юмор, игры, бизнес, кино, спорт. Площадку можно переключить. Выберите ролик — и сразу получите план нарезки под TikTok.</p>
+<p><i>Данные обновляются раз в полчаса.</i></p>
 </details>
 <details><summary>🎬 Как работает баннер</summary>
 <p>В нужный момент клип замирает, играет баннер <b>TGrader</b> (7 секунд, со звуком), и ролик продолжается с того же места. В ручном режиме баннер можно выключить, показать несколько раз, сдвинуть или уменьшить.</p>
@@ -57,42 +72,40 @@ HELP = """\
 </ul>
 </details>"""
 
-REQUEST_LINK = """\
+REQUEST_LINK = f"""\
 <h3>🔗 Пришлите ссылку</h3>
-<p>На обычный ролик, <code>youtu.be</code> или Shorts.</p>
-<blockquote>Например: <code>https://youtu.be/dQw4w9WgXcQ</code></blockquote>"""
+<p>На ролик с любой из площадок:</p>
+<p>{PLATFORM_LIST}</p>
+<blockquote>Например: <code>https://rutube.ru/video/…</code> или <code>https://youtu.be/…</code></blockquote>"""
 
-REQUEST_QUERY = """\
+REQUEST_QUERY = f"""\
 <h3>🔍 Что искать?</h3>
-<p>Напишите название ролика — найду на YouTube до <b>5</b> вариантов.</p>
+<p>Напишите название ролика — поищу на {SEARCH_SITES} и покажу до <b>{RESULTS}</b> вариантов.</p>
 <blockquote>Можно уточнить: «дуров интервью лекс фридман»</blockquote>"""
 
 REQUEST_FILE = """\
 <h3>📁 Пришлите видеофайл</h3>
 <p>Подойдут <b>mp4</b>, <b>mov</b> и <b>mkv</b> — до <b>20 МБ</b>.</p>
-<blockquote>Ролик больше? Проще прислать ссылку на YouTube.</blockquote>"""
+<blockquote>Ролик больше? Проще прислать ссылку.</blockquote>"""
 
 NUDGE = "<p>👇 Выберите действие кнопкой — или пришлите <b>ссылку</b>, <b>название</b> или <b>видеофайл</b>.</p>"
 NOT_ALLOWED = "🔒 Это закрытый бот.\nВаш ID: <code>{user_id}</code> — передайте его владельцу, чтобы он добавил вас."
 
-SEARCHING = "<p>🔍 Ищу на YouTube: <b>{query}</b>…</p>"
-SEARCH_NOTHING = "<p>🫥 По запросу «{query}» ничего не нашлось.</p><p>Попробуйте другое название или пришлите ссылку на YouTube.</p>"
+SEARCHING = f"<p>🔍 Ищу на {SEARCH_SITES}: " + "<b>{query}</b>…</p>"
+SEARCH_NOTHING = "<p>🫥 По запросу «{query}» ничего не нашлось.</p><p>Попробуйте другое название или пришлите ссылку.</p>"
 FETCHING = "<p>⏳ Смотрю ролик…</p>"
 
-BAD_LINK = """\
-<h3>🤔 Это не похоже на ссылку на YouTube</h3>
-<p>Подойдут такие:</p>
-<ul>
-<li><code>youtube.com/watch?v=…</code></li>
-<li><code>youtu.be/…</code></li>
-<li><code>youtube.com/shorts/…</code></li>
-</ul>
-<p>Или просто пришлите <b>название</b> ролика — поищу.</p>"""
+BAD_LINK = f"""\
+<h3>🤔 Эту ссылку я не узнаю</h3>
+<p>Беру ролики отсюда:</p>
+<p>{PLATFORM_LIST}</p>
+<p>Нужна ссылка именно на <b>ролик</b> — не на канал, плейлист или главную страницу.</p>
+<blockquote>Или просто пришлите <b>название</b> — поищу на {SEARCH_SITES}.</blockquote>"""
 
 DOWNLOADING_FILE = "<p>⏳ Скачиваю видеофайл…</p>"
-FILE_TOO_BIG = "<p>📦 Файл больше <b>20 МБ</b> — обычный бот такой не примет.</p><p>Пришлите ссылку на YouTube: качество выберем сами.</p>"
-FILE_BAD = "<p>😕 Не получилось прочитать видеофайл: {error}</p><p>Пришлите другой файл или ссылку на YouTube.</p>"
-NOT_A_VIDEO = "<p>🙅 Это не видеофайл. Подойдут <b>.mp4</b>, <b>.mov</b> и <b>.mkv</b> — или пришлите ссылку на YouTube.</p>"
+FILE_TOO_BIG = "<p>📦 Файл больше <b>20 МБ</b> — обычный бот такой не примет.</p><p>Пришлите ссылку на ролик: качество выберем сами.</p>"
+FILE_BAD = "<p>😕 Не получилось прочитать видеофайл: {error}</p><p>Пришлите другой файл или ссылку на ролик.</p>"
+NOT_A_VIDEO = "<p>🙅 Это не видеофайл. Подойдут <b>.mp4</b>, <b>.mov</b> и <b>.mkv</b> — или пришлите ссылку на ролик.</p>"
 BUSY = "<p>⏳ Сейчас идёт нарезка. Дождитесь результата или нажмите <b>«⏹ Остановить»</b> под прогрессом.</p>"
 
 # Короткие подсказки для всплывающих окошек (без разметки: Telegram показывает их как есть).
@@ -123,13 +136,23 @@ def error_text(message: str) -> str:
 # ---------- поиск ----------
 
 
+def platform_tag(platform_id: str | None) -> str:
+    """«📺 RuTube» — откуда ролик. Пусто, если площадка неизвестна (например, ролик прислали файлом)."""
+    platform = PLATFORM_BY_ID.get(platform_id or "")
+    return f"{platform.emoji} {platform.title}" if platform else ""
+
+
 def search_cards(entries: list[dict]) -> str:
     items = []
     for entry in entries:
         title = esc(entry.get("title") or "Без названия")
         meta = " · ".join(
             part
-            for part in (esc(entry.get("uploader") or ""), "⏱ " + duration_text(entry.get("duration") or 0))
+            for part in (
+                platform_tag(entry.get("platform")),
+                esc(entry.get("uploader") or ""),
+                "⏱ " + duration_text(entry.get("duration") or 0),
+            )
             if part
         )
         items.append(f"<li><b>{title}</b><br/><i>{meta}</i></li>")
@@ -139,15 +162,23 @@ def search_cards(entries: list[dict]) -> str:
 # ---------- карточка ролика ----------
 
 
-def video_card(title: str, uploader: str | None, duration: float) -> str:
-    """Название, автор и длина ролика — цитатой, чтобы карточка отличалась от остального экрана."""
-    meta = [part for part in (f"👤 {esc(uploader)}" if uploader else "", f"⏱ {duration_text(duration)}" if duration else "") if part]
+def video_card(title: str, uploader: str | None, duration: float, platform: str | None = None) -> str:
+    """Название, автор, длина и площадка ролика — цитатой, чтобы карточка отличалась от остального экрана."""
+    meta = [
+        part
+        for part in (
+            f"👤 {esc(uploader)}" if uploader else "",
+            f"⏱ {duration_text(duration)}" if duration else "",
+            platform_tag(platform),
+        )
+        if part
+    ]
     line = f"<br/>{' · '.join(meta)}" if meta else ""
     return f"<blockquote><b>{esc(title)}</b>{line}</blockquote>"
 
 
 def _card(draft: Draft) -> str:
-    return video_card(draft.title, draft.uploader, draft.duration)
+    return video_card(draft.title, draft.uploader, draft.duration, draft.platform)
 
 
 def mode_screen(draft: Draft) -> str:
@@ -394,30 +425,31 @@ BANNER_PREVIEW_CAPTION = "<b>TGrader</b> · {seconds} · со звуком"
 # ---------- тренды ----------
 
 
-def trends_loading(category: Category) -> str:
+def trends_loading(category: Category, platform: Platform) -> str:
     return (
         f"<h2>{category.emoji} {esc(category.title)}</h2>"
-        "<p>🔥 Смотрю, что сейчас в тренде…</p>"
+        f"<p>🔥 Смотрю, что сейчас в тренде на {platform.emoji} {platform.title}…</p>"
         "<footer>В первый раз это занимает несколько секунд</footer>"
     )
 
 
-def trends_home() -> str:
+def trends_home(platform: Platform) -> str:
     items = "".join(
         f"<li>{category.emoji} <b>{esc(category.title)}</b> — {esc(category.hint)}</li>" for category in CATEGORIES
     )
     return f"""\
 <h1>🔥 В тренде</h1>
-<p>Что <b>прямо сейчас</b> смотрят русскоязычные зрители. Выберите жанр — покажу самые просматриваемые ролики недели, которые стоит нарезать на <b>TikTok</b> и <b>Shorts</b>.</p>
+<p>Что <b>прямо сейчас</b> смотрят русскоязычные зрители. Выберите площадку и жанр — покажу самые просматриваемые ролики, которые стоит нарезать на <b>TikTok</b> и <b>Shorts</b>.</p>
 <ul>{items}</ul>
-<footer>Данные YouTube за неделю · обновляются раз в полчаса</footer>"""
+<footer>{platform.emoji} {platform.title}: данные {PERIOD_TEXT[platform.id]} · обновляются раз в полчаса</footer>"""
 
 
-def trend_list(category: Category, videos: list[dict]) -> str:
+def trend_list(category: Category, videos: list[dict], platform: Platform) -> str:
     if not videos:
         return (
             f"<h2>{category.emoji} {esc(category.title)}</h2>"
-            "<p>🫥 Сейчас ничего подходящего не нашлось. Загляните позже или выберите другой жанр.</p>"
+            f"<p>🫥 На {platform.emoji} {platform.title} сейчас ничего подходящего не нашлось. "
+            "Загляните позже, выберите другой жанр или другую площадку.</p>"
         )
     items = []
     for video in videos:
@@ -433,7 +465,7 @@ def trend_list(category: Category, videos: list[dict]) -> str:
         items.append(f"<li><b>{esc(video['title'])}</b><br/><i>{meta}</i></li>")
     return (
         f"<h2>{category.emoji} {esc(category.title)}</h2>"
-        f"<p>Самое просматриваемое за неделю — {esc(category.hint)}.</p>"
+        f"<p>{platform.emoji} <b>{platform.title}</b> · самое просматриваемое {PERIOD_TEXT[platform.id]} — {esc(category.hint)}.</p>"
         f"<ol>{''.join(items)}</ol>"
         "<blockquote>Выберите ролик — сразу подберу нарезку под TikTok.</blockquote>"
     )

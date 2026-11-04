@@ -1,4 +1,4 @@
-"""Загрузчик: распознавание ссылок YouTube, кеш по video_id, передача опций yt-dlp, локальные файлы.
+"""Загрузчик: ссылки площадок, кеш по ключу ролика, опции yt-dlp, объяснение ошибок, локальные файлы.
 
 yt-dlp подменяется фейком (в тестах нет сети); всё остальное — настоящий код: файлы, кеш, ремукс через ffmpeg.
 """
@@ -10,12 +10,12 @@ from pathlib import Path
 import pytest
 import yt_dlp
 
-from app.services import downloader
+from app.config import MAX_SOURCE_SECONDS
+from app.services import downloader, youtube
 from app.services.downloader import (
     DownloadError,
     cached_source_path,
     download_video_cached,
-    extract_video_id,
     fetch_video_info,
     resolve_upload,
     save_local_upload,
@@ -23,6 +23,21 @@ from app.services.downloader import (
 
 VIDEO_ID = "dQw4w9WgXcQ"
 URL = f"https://www.youtube.com/watch?v={VIDEO_ID}"
+RUTUBE_ID = "0123456789abcdef0123456789abcdef"
+RUTUBE_URL = f"https://rutube.ru/video/{RUTUBE_ID}/"
+RUTUBE_KEY = f"rutube-{RUTUBE_ID}"
+VK_URL = "https://vk.com/video-22822305_456239018"
+
+
+def video_info(**overrides):
+    return {
+        "id": VIDEO_ID,
+        "title": "Заголовок",
+        "duration": 212,
+        "thumbnail": "https://i.ytimg.com/vi/x/hq.jpg",
+        "uploader": "Автор",
+        **overrides,
+    }
 
 
 @pytest.fixture
@@ -36,6 +51,7 @@ def ydl(monkeypatch):
         output_ext = "mp4"
         output_bytes = b"x" * (200 * 1024)
         progress_events = []
+        downloaded = []
 
         def __init__(self, opts):
             self.opts = opts
@@ -48,11 +64,13 @@ def ydl(monkeypatch):
             return False
 
         def extract_info(self, url, download=False):
+            self.asked = url
             if FakeYDL.error:
                 raise FakeYDL.error
             return FakeYDL.info
 
         def download(self, urls):
+            FakeYDL.downloaded.extend(urls)
             if FakeYDL.error:
                 raise FakeYDL.error
             for event in FakeYDL.progress_events:
@@ -60,64 +78,41 @@ def ydl(monkeypatch):
                     hook(event)
             Path(self.opts["outtmpl"].replace("%(ext)s", FakeYDL.output_ext)).write_bytes(FakeYDL.output_bytes)
 
+    FakeYDL.instances, FakeYDL.downloaded = [], []
     monkeypatch.setattr(downloader.yt_dlp, "YoutubeDL", FakeYDL)
     return FakeYDL
 
 
-# ---------- ссылки ----------
+# ---------- чужие ссылки ----------
 
 
-@pytest.mark.parametrize(
-    "url",
-    [
-        f"https://www.youtube.com/watch?v={VIDEO_ID}&list=PL123&t=10s",
-        f"https://youtu.be/{VIDEO_ID}?t=10",
-        f"https://www.youtube.com/shorts/{VIDEO_ID}",
-        f"https://www.youtube.com/embed/{VIDEO_ID}",
-        f"https://www.youtube.com/live/{VIDEO_ID}?feature=share",
-        f"https://m.youtube.com/watch?v={VIDEO_ID}",
-        f"youtube.com/watch?v={VIDEO_ID}",
-        f"  https://music.youtube.com/watch?v={VIDEO_ID}  ",
-    ],
-)
-def test_extract_video_id_understands_every_common_youtube_link(url):
-    assert extract_video_id(url) == VIDEO_ID
-
-
-@pytest.mark.parametrize(
-    "url",
-    [
-        f"https://example.com/watch?v={VIDEO_ID}",
-        f"https://youtube.com.evil.com/watch?v={VIDEO_ID}",
-        f"https://evil.com/?u=youtube.com/watch?v={VIDEO_ID}",
-        "https://www.youtube.com/watch?v=short",
-        "https://www.youtube.com/",
-        "https://www.youtube.com/playlist?list=PL123",
-        "not a url",
-        "",
-    ],
-)
-def test_extract_video_id_rejects_everything_else(url):
-    assert extract_video_id(url) is None
-
-
-def test_non_youtube_links_are_refused_before_any_network_call(ydl, tmp_path):
-    with pytest.raises(DownloadError):
+def test_unknown_links_are_refused_before_any_network_call(ydl, tmp_path):
+    with pytest.raises(DownloadError, match="YouTube.*RuTube.*VK Видео"):  # человеку сразу видно, что подходит
         fetch_video_info("https://example.com/x")
     with pytest.raises(DownloadError):
         download_video_cached("https://example.com/x", cache_dir=tmp_path)
+    with pytest.raises(DownloadError):
+        download_video_cached("https://youtube.com.evil.com/watch?v=" + VIDEO_ID, cache_dir=tmp_path)
     assert ydl.instances == []
 
 
 # ---------- кеш и скачивание ----------
 
 
-def test_cached_video_is_returned_without_touching_yt_dlp(ydl, tmp_path):
-    cached = tmp_path / f"source_{VIDEO_ID}.mp4"
+@pytest.mark.parametrize(("url", "key"), [(URL, VIDEO_ID), (RUTUBE_URL, RUTUBE_KEY)])
+def test_cached_video_is_returned_without_touching_yt_dlp(ydl, tmp_path, url, key):
+    cached = tmp_path / f"source_{key}.mp4"
     cached.write_bytes(b"c" * (200 * 1024))
-    assert download_video_cached(URL, cache_dir=tmp_path) == cached
-    assert cached_source_path(VIDEO_ID, tmp_path) == cached
+    assert download_video_cached(url, cache_dir=tmp_path) == cached
+    assert cached_source_path(key, tmp_path) == cached
     assert ydl.instances == []
+
+
+def test_youtube_cache_keeps_its_old_file_name(ydl, tmp_path):
+    # ролики, скачанные до появления других площадок, лежат как source_<id>.mp4 — они должны находиться и дальше
+    old = tmp_path / f"source_{VIDEO_ID}.mp4"
+    old.write_bytes(b"c" * (200 * 1024))
+    assert download_video_cached(f"https://youtu.be/{VIDEO_ID}", cache_dir=tmp_path) == old
 
 
 def test_tiny_cache_file_is_not_trusted(ydl, tmp_path):
@@ -139,6 +134,24 @@ def test_download_passes_the_options_from_the_spec_to_yt_dlp(ydl, tmp_path):
     assert opts["outtmpl"] == str(tmp_path / f"source_{VIDEO_ID}.%(ext)s")
     # при одинаковом разрешении берём H.264, а не AV1: он декодируется везде и быстрее
     assert opts["format_sort"] == ["res", "vcodec:h264"]
+    assert ydl.downloaded == [URL]
+
+
+def test_other_platforms_get_their_own_file_name_and_no_javascript_runtime(ydl, tmp_path):
+    download_video_cached(RUTUBE_URL, 720, cache_dir=tmp_path)
+    opts = ydl.instances[0].opts
+    assert opts["outtmpl"] == str(tmp_path / f"source_{RUTUBE_KEY}.%(ext)s")
+    assert opts["noplaylist"] is True and "js_runtimes" not in opts
+    assert ydl.downloaded == [RUTUBE_URL]
+    assert (tmp_path / f"source_{RUTUBE_KEY}.mp4").is_file()
+
+
+def test_the_same_video_id_on_different_platforms_never_shares_a_cache_file(ydl, tmp_path):
+    download_video_cached(VK_URL, cache_dir=tmp_path)
+    download_video_cached(RUTUBE_URL, cache_dir=tmp_path)
+    assert sorted(path.name for path in tmp_path.iterdir()) == sorted(
+        ["source_vk--22822305_456239018.mp4", f"source_{RUTUBE_KEY}.mp4"]
+    )
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="нужен ffmpeg")
@@ -149,12 +162,18 @@ def test_a_non_mp4_result_ends_up_under_the_cache_name(ydl, tmp_path):
          "-f", "lavfi", "-i", "sine=frequency=440:duration=2", "-c:v", "libx264", "-b:v", "2M", "-c:a", "aac",
          str(mkv)],
         check=True,
-    )
+    )  # fmt: skip
     ydl.output_ext, ydl.output_bytes = "mkv", mkv.read_bytes()
     result = download_video_cached(URL, cache_dir=tmp_path / "cache")
     assert result == tmp_path / "cache" / f"source_{VIDEO_ID}.mp4"
     assert result.stat().st_size > 100 * 1024
     assert not (tmp_path / "cache" / f"source_{VIDEO_ID}.mkv").exists()
+
+
+def test_an_empty_download_is_reported_instead_of_returning_a_stub(ydl, tmp_path):
+    ydl.output_bytes = b"x" * 10
+    with pytest.raises(DownloadError, match="файл с видео не появился"):
+        download_video_cached(URL, cache_dir=tmp_path)
 
 
 def test_download_progress_goes_from_zero_to_one_across_video_and_audio(ydl, tmp_path):
@@ -169,55 +188,126 @@ def test_download_progress_goes_from_zero_to_one_across_video_and_audio(ydl, tmp
     assert seen == [0.25, 0.5, 0.625, 1.0]
 
 
-def test_a_failed_download_is_reported_in_russian(ydl, tmp_path):
-    ydl.error = yt_dlp.utils.DownloadError("ERROR: [youtube] dQw4w9WgXcQ: Private video. Sign in if you've been granted access")
-    with pytest.raises(DownloadError, match="(?i)приватн"):
+# ---------- ошибки площадок ----------
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("ERROR: [youtube] x: Private video. Sign in if you've been granted access", "приватн"),
+        ("ERROR: [youtube] x: Sign in to confirm you’re not a bot", "не бот"),
+        ("ERROR: [youtube] x: Video unavailable", "недоступно"),
+        ("ERROR: [rutube] x: Unable to download JSON metadata: HTTP Error 404: Not Found", "Такого ролика нет"),
+        ("ERROR: [vk] x: Access restricted", "приватности"),
+        ("ERROR: [youtube] x: This live event will begin in 2 hours", "Трансляция ещё не началась"),
+        ("ERROR: [youtube] x: Requested format is not available", "снизить максимальное качество"),
+    ],
+)
+def test_known_failures_are_explained_in_russian(ydl, tmp_path, raw, expected):
+    ydl.error = yt_dlp.utils.DownloadError(raw)
+    with pytest.raises(DownloadError, match=expected):
         download_video_cached(URL, cache_dir=tmp_path)
+
+
+def test_an_unknown_failure_names_the_platform_and_hides_the_terminal_noise(ydl, tmp_path):
+    ydl.error = yt_dlp.utils.DownloadError("\x1b[0;31mERROR:\x1b[0m [rutube] x: Что-то пошло не так\nвторая строка")
+    with pytest.raises(DownloadError) as caught:
+        download_video_cached(RUTUBE_URL, cache_dir=tmp_path)
+    message = str(caught.value)
+    assert "площадки RuTube" in message and "Что-то пошло не так" in message
+    assert "вторая строка" not in message and "\x1b" not in message
 
 
 # ---------- сведения о ролике ----------
 
 
 def test_video_info_has_everything_the_ui_card_needs(ydl):
-    ydl.info = {
-        "id": VIDEO_ID,
-        "title": "Заголовок",
-        "duration": 212,
-        "thumbnail": "https://i.ytimg.com/vi/x/hq.jpg",
-        "uploader": "Автор",
-        "formats": [
-            {"height": 720, "vcodec": "avc1"},
-            {"height": 1080, "vcodec": "avc1"},
-            {"height": 720, "vcodec": "vp9"},
-            {"height": None, "vcodec": "none"},  # только звук
-            {"height": 360, "vcodec": "avc1"},
-        ],
-    }
+    ydl.info = video_info()
     assert fetch_video_info(URL) == {
-        "video_id": VIDEO_ID,
-        "url": f"https://www.youtube.com/watch?v={VIDEO_ID}",
+        "platform": "youtube",
+        "url": URL,
         "title": "Заголовок",
         "duration": 212,
         "thumbnail": "https://i.ytimg.com/vi/x/hq.jpg",
         "uploader": "Автор",
-        "resolutions": [1080, 720, 360],
     }
     opts = ydl.instances[0].opts
-    assert (opts["quiet"], opts["no_warnings"], opts["extract_flat"]) == (True, True, False)
+    # «плоский» разбор плейлистов: ссылка на канал не раскроется в сотни роликов
+    assert (opts["quiet"], opts["no_warnings"], opts["extract_flat"], opts["playlistend"]) == (True, True, "in_playlist", 1)
+    assert opts["noplaylist"] is True
+
+
+def test_youtube_link_is_normalised_to_the_plain_watch_address(ydl):
+    ydl.info = video_info(thumbnail=None)
+    info = fetch_video_info(f"https://youtu.be/{VIDEO_ID}?t=30&list=PL123")
+    assert info["url"] == URL
+    assert info["thumbnail"] == f"https://i.ytimg.com/vi/{VIDEO_ID}/hqdefault.jpg"  # превью есть всегда
+
+
+def test_other_platforms_keep_the_link_as_it_was_sent(ydl):
+    private = f"https://rutube.ru/video/private/{RUTUBE_ID}/?p=secret"
+    ydl.info = video_info(id=RUTUBE_ID, thumbnail=None)
+    info = fetch_video_info(private)
+    assert info["platform"] == "rutube" and info["url"] == private and info["thumbnail"] == ""
+    assert ydl.instances[0].asked == private
+
+
+def test_uploader_falls_back_to_channel_and_then_to_nothing(ydl):
+    ydl.info = video_info(uploader=None, channel="Канал")
+    assert fetch_video_info(VK_URL)["uploader"] == "Канал"
+    ydl.info = video_info(uploader=None)
+    assert fetch_video_info(VK_URL)["uploader"] == ""
+
+
+@pytest.mark.parametrize("extra", [{"_type": "playlist"}, {"_type": "multi_video"}, {"entries": []}, {"entries": [{"id": "x"}]}])
+def test_channels_and_playlists_are_refused(ydl, extra):
+    ydl.info = video_info(**extra)
+    with pytest.raises(DownloadError, match="канал или плейлист"):
+        fetch_video_info(RUTUBE_URL)
+
+
+@pytest.mark.parametrize("extra", [{"is_live": True}, {"live_status": "is_live"}, {"live_status": "is_upcoming"}])
+def test_live_streams_are_refused(ydl, extra):
+    ydl.info = video_info(**extra)
+    with pytest.raises(DownloadError, match="прямой эфир"):
+        fetch_video_info(URL)
+
+
+@pytest.mark.parametrize("duration", [None, 0, -5])
+def test_unknown_length_is_refused(ydl, duration):
+    ydl.info = video_info(duration=duration)
+    with pytest.raises(DownloadError, match="длину ролика"):
+        fetch_video_info(URL)
+
+
+def test_marathons_are_refused_but_the_limit_itself_is_fine(ydl):
+    ydl.info = video_info(duration=MAX_SOURCE_SECONDS + 60)
+    with pytest.raises(DownloadError, match="4 ч 1 мин.*длиннее 4 часов"):
+        fetch_video_info(URL)
+    ydl.info = video_info(duration=MAX_SOURCE_SECONDS)
+    assert fetch_video_info(URL)["duration"] == MAX_SOURCE_SECONDS
+
+
+def test_an_empty_answer_is_reported_with_the_platform(ydl):
+    ydl.info = None
+    with pytest.raises(DownloadError, match="VK Видео не вернул сведений"):
+        fetch_video_info(VK_URL)
 
 
 def test_unavailable_video_is_reported_as_download_error(ydl):
     ydl.error = yt_dlp.utils.DownloadError("ERROR: [youtube] dQw4w9WgXcQ: Video unavailable")
-    with pytest.raises(DownloadError):
+    with pytest.raises(DownloadError, match="недоступно"):
         fetch_video_info(URL)
 
 
-def test_every_javascript_runtime_on_path_is_enabled_for_youtube(ydl, monkeypatch):
+def test_every_javascript_runtime_on_path_is_enabled_for_youtube_only(ydl, monkeypatch):
     # yt-dlp сам включает только deno; без JS-рантайма YouTube отдаёт урезанный набор форматов
-    monkeypatch.setattr(downloader.shutil, "which", lambda name: f"/bin/{name}" if name in {"node", "bun"} else None)
-    ydl.info = {"id": VIDEO_ID, "formats": []}
+    monkeypatch.setattr(youtube.shutil, "which", lambda name: f"/bin/{name}" if name in {"node", "bun"} else None)
+    ydl.info = video_info()
     fetch_video_info(URL)
+    fetch_video_info(RUTUBE_URL)
     assert ydl.instances[0].opts["js_runtimes"] == {"node": {}, "bun": {}}
+    assert "js_runtimes" not in ydl.instances[1].opts
 
 
 # ---------- локальные файлы ----------

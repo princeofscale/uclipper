@@ -18,6 +18,7 @@ from app.bot.rich import (
 )
 from app.models import ClipSettings, Draft, Goal, JobState, JobStatus
 from app.services.autoplan import GOALS, plan_auto
+from app.services.platforms import PLATFORMS, SEARCHABLE, YOUTUBE
 from app.services.trends import CATEGORIES
 from tests.rich_check import assert_valid_rich, rich_problems
 
@@ -160,16 +161,26 @@ def _all_static_screens() -> list[str]:
         texts.BAD_LINK, texts.DOWNLOADING_FILE, texts.FILE_TOO_BIG, texts.FILE_BAD.format(error="ошибка"),
         texts.NOT_A_VIDEO, texts.BUSY, texts.QUEUED_TEXT, texts.CANCELLED, texts.BANNER_EMPTY,
         texts.error_text("плохо <b>"), texts.search_cards([{"title": "A & B", "uploader": "U", "duration": 90}]),
+        texts.search_cards([
+            {"platform": "youtube", "title": "Один <i>", "uploader": "U & V", "duration": 90},
+            {"platform": "rutube", "title": "Два", "uploader": "", "duration": 4000},
+            {"platform": "нет такой", "title": "Три", "duration": 5},
+        ]),
+        texts.mode_screen(Draft(title="Ролик", uploader="Автор", duration=600, platform="rutube")),
         texts.mode_screen(draft), texts.auto_screen(draft, plan, 7.5), texts.manual_screen(draft, 7.5),
         texts.manual_screen(Draft(settings=ClipSettings(banner_count=0)), None), texts.more_screen(draft.settings),
         texts.trim_screen(draft.settings), texts.banners_screen(Banner()), texts.banners_screen(None),
-        texts.trends_home(), texts.stats_text(3, 2, 99), texts.progress_text(running), texts.results_summary(done),
-        texts.video_card("T < 1", None, 0),
+        texts.stats_text(3, 2, 99), texts.progress_text(running), texts.results_summary(done),
+        texts.video_card("T < 1", None, 0), texts.video_card("T", "U", 60, "vk"),
     ]  # fmt: skip
-    for category in CATEGORIES:
-        screens.append(texts.trends_loading(category))
-        screens.append(texts.trend_list(category, []))
-        screens.append(texts.trend_list(category, [{"title": "A <b>", "duration": 600, "uploader": "U", "views": 12_345}]))
+    for platform in SEARCHABLE:
+        screens.append(texts.trends_home(platform))
+        for category in CATEGORIES:
+            screens.append(texts.trends_loading(category, platform))
+            screens.append(texts.trend_list(category, [], platform))
+            screens.append(
+                texts.trend_list(category, [{"title": "A <b>", "duration": 600, "uploader": "U", "views": 12_345}], platform)
+            )
     for goal in GOALS:
         screens.append(texts.auto_screen(draft, plan_auto(900, goal, ClipSettings(), banner_seconds=None, face_crop=False), None))
     return screens
@@ -201,9 +212,48 @@ def test_validator_catches_what_it_should():
 
 
 def test_trend_titles_in_lists_are_escaped_and_numbers_are_humane():
-    html = texts.trend_list(CATEGORIES[0], [{"title": "AC & DC <live>", "duration": 4000, "uploader": "Chan", "views": 1_340_000}])
+    html = texts.trend_list(
+        CATEGORIES[0], [{"title": "AC & DC <live>", "duration": 4000, "uploader": "Chan", "views": 1_340_000}], YOUTUBE
+    )
     assert "AC &amp; DC &lt;live&gt;" in html
     assert re.search(r"1,3 млн", html)
+
+
+def test_every_trend_screen_names_its_platform():
+    for platform in SEARCHABLE:
+        assert platform.title in texts.trends_home(platform)
+        assert platform.title in texts.trends_loading(CATEGORIES[0], platform)
+        assert platform.title in texts.trend_list(CATEGORIES[0], [], platform)
+        assert platform.title in texts.trend_list(CATEGORIES[0], [{"title": "x", "duration": 1}], platform)
+
+
+def test_platform_tag_names_the_source_and_stays_quiet_when_unknown():
+    assert texts.platform_tag("rutube") == "📺 RuTube"
+    assert texts.platform_tag("vk") == "💙 VK Видео"
+    assert texts.platform_tag(None) == texts.platform_tag("") == texts.platform_tag("нет такой") == ""
+
+
+def test_video_card_shows_the_platform_and_skips_what_is_unknown():
+    card = texts.video_card("Название", "Автор", 3725, "rutube")
+    assert "Название" in card and "Автор" in card and "1:02:05" in card and "RuTube" in card
+    assert "RuTube" not in texts.video_card("Название", "Автор", 60)  # файл, присланный в чат, — без площадки
+    assert "👤" not in texts.video_card("Название", None, 60, "vk")
+
+
+def test_search_cards_mark_the_platform_of_every_result():
+    html = texts.search_cards([
+        {"platform": "youtube", "title": "Один", "uploader": "A", "duration": 60},
+        {"platform": "rutube", "title": "Два", "uploader": "B", "duration": 60},
+    ])  # fmt: skip
+    assert "YouTube" in html and "RuTube" in html
+
+
+def test_start_and_help_list_every_platform():
+    for platform in PLATFORMS:
+        assert platform.title in texts.START
+        assert platform.title in texts.HELP
+        assert platform.title in texts.BAD_LINK
+        assert platform.title in texts.REQUEST_LINK
 
 
 @pytest.mark.parametrize(

@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from pathlib import Path
 
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery
@@ -51,10 +50,6 @@ class AppContext:
     trends: TrendCache = field(default_factory=TrendCache)
     banner_preview_id: str | None = None  # file_id уже отправленного превью баннера: повторно файл не грузим
 
-    @property
-    def workspace_dir(self) -> Path:
-        return self.settings.workspace_dir
-
     def banner(self) -> BannerInfo | None:
         """Главный баннер проекта — единственный, который показывает бот (`None`, если файла нет)."""
         return default_banner(self.settings.banners_dir)
@@ -63,17 +58,6 @@ class AppContext:
         """Сколько играет баннер (`None`, если баннера нет)."""
         banner = self.banner()
         return banner.duration if banner is not None and banner.duration else None
-
-    def banners(self) -> list[BannerInfo]:
-        banner = self.banner()
-        return [banner] if banner is not None else []
-
-    def banner_name(self, banner_id: str | None) -> str | None:
-        """Человеческое имя баннера по id (или сам id, если файла уже нет)."""
-        if not banner_id:
-            return None
-        banner = self.banner()
-        return banner.name if banner is not None and banner.id == banner_id else banner_id
 
 
 # ---------- черновик и диалог ----------

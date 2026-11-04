@@ -18,14 +18,9 @@ from app.config import Settings
 from app.models import ClipResult, JobRequest, JobState, JobStatus, SlicingMode, SourceType, TrimInfo
 from app.services.auto_trim import analyze_trim
 from app.services.banner_manager import BannerError, ensure_sfx, resolve_banner
-from app.services.downloader import (
-    DownloadError,
-    cached_source_path,
-    download_video_cached,
-    extract_video_id,
-    resolve_upload,
-)
+from app.services.downloader import DownloadError, cached_source_path, download_video_cached, resolve_upload
 from app.services.highlights import find_highlights
+from app.services.platforms import identify
 from app.services.video_processor import (
     ClipSchedule,
     MediaError,
@@ -228,7 +223,6 @@ class JobManager:
         # Сначала дешёвые проверки: плохой баннер не должен всплыть после долгого скачивания.
         wants_banner = request.banner_count > 0
         banner = resolve_banner(request.banner_id or "", settings.banners_dir) if wants_banner else None
-        static = resolve_banner(request.static_banner_id, settings.banners_dir) if request.static_banner_id else None
         sfx = ensure_sfx(settings.sfx_dir) if wants_banner and request.enable_sfx else None
 
         source, downloaded = self._obtain_source(request, job_id, notifier)
@@ -260,12 +254,10 @@ class JobManager:
             banner_scale=request.banner_scale,
             banner_sound=request.banner_sound,
             enable_sfx=request.enable_sfx,
-            static_position=request.static_position,
-            static_scale=request.static_scale,
         )
         clips = self._render_all(
             job_id, job_dir, source, info, schedule.starts, schedule.clip_duration, options,
-            banner, static, sfx, render_start, notifier, on_clip,
+            banner, sfx, render_start, notifier, on_clip,
         )  # fmt: skip
 
         self._update(job_id, stage="Упаковка архива")
@@ -344,15 +336,16 @@ class JobManager:
             return path, False
 
         url = (request.url or "").strip()
-        video_id = extract_video_id(url)
-        if video_id and cached_source_path(video_id, settings.cache_dir):
+        source = identify(url)
+        if source is not None and cached_source_path(source.key, settings.cache_dir):
             self._update(job_id, stage="Видео из кеша")
             self._log(job_id, "Видео уже есть в кеше — повторно не скачиваю")
             notifier.touch()
             return download_video_cached(url, request.max_height, cache_dir=settings.cache_dir), False
 
         self._update(job_id, stage="Скачивание видео")
-        self._log(job_id, f"Скачиваю видео с YouTube (до {request.max_height}p)…")
+        where = source.platform.title if source is not None else "площадки"
+        self._log(job_id, f"Скачиваю видео с {where} (до {request.max_height}p)…")
         notifier.touch()
 
         def on_download(fraction: float) -> None:
@@ -375,7 +368,6 @@ class JobManager:
         clip_duration: float,
         options: RenderOptions,
         banner: Path | None,
-        static: Path | None,
         sfx: Path | None,
         render_start: float,
         notifier: "_Notifier",
@@ -400,7 +392,7 @@ class JobManager:
 
             timeline = render_clip(
                 source, job_dir / filename, start, clip_duration, options,
-                info=info, banner=banner, static=static, sfx=sfx, on_progress=on_progress,
+                info=info, banner=banner, sfx=sfx, on_progress=on_progress,
             )  # fmt: skip
             clip = ClipResult(
                 index=number,
