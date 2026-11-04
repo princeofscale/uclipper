@@ -2,6 +2,7 @@
 
 Как и в test_engine.py, проверяется готовый ролик (ffprobe/ffmpeg/Pillow), а не текст графа FFmpeg.
 """
+import subprocess
 from types import SimpleNamespace
 
 import pytest
@@ -11,7 +12,18 @@ from app.services import video_processor
 from app.services.banner_manager import ensure_sfx
 from app.services.video_processor import MediaError, RenderOptions, probe_media, render_clip
 from tests.conftest import CLIP_START, PINK
-from tests.media_utils import bright_rows, bright_span, frame_png, luma_at, make_gif, mean_abs_diff, probe, rgb_at, volume_db
+from tests.media_utils import (
+    bright_rows,
+    bright_span,
+    frame_png,
+    luma_at,
+    make_gif,
+    make_video,
+    mean_abs_diff,
+    probe,
+    rgb_at,
+    volume_db,
+)
 
 RED, BLUE = (255, 0, 0), (0, 0, 255)
 
@@ -44,6 +56,50 @@ def test_each_frame_mode_has_its_own_size_and_composition(synthetic_video, tmp_p
     middle = luma_at(output, 1.0, (size[0] // 2, size[1] // 2), tmp_path)
     low, high = edge_minus_middle
     assert low <= luma_at(output, 1.0, edge, tmp_path) - middle <= high
+
+
+@pytest.mark.parametrize(
+    ("mode", "center"),
+    [
+        (FrameMode.BLUR_PAD, (540, 960)),
+        (FrameMode.CENTER_CROP, (540, 960)),
+        (FrameMode.ORIGINAL, (960, 540)),
+    ],
+)
+def test_a_source_with_non_square_pixels_is_not_squeezed(mode, center, tmp_path):
+    """Анаморфный ролик (хранится 960×720, но пиксель 4:3 — на экране это 16:9) не должен сплющиваться.
+
+    В кадре белый квадрат 200×200 «на экране» (хранится как 150×200). В готовом клипе он обязан остаться квадратом.
+    """
+    source = make_video(
+        tmp_path / "anamorphic.mp4", size="960x720", seconds=3, audio=False,
+        video_filter="geq=lum='if(between(X,W/2-75,W/2+75)*between(Y,H/2-100,H/2+100),255,60)':cb=128:cr=128,setsar=4/3",
+    )  # fmt: skip
+    pixel_shape = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=sample_aspect_ratio", "-of", "csv=p=0", str(source)],
+        capture_output=True, text=True,
+    ).stdout.strip()  # fmt: skip
+    assert pixel_shape == "4:3", "тестовый ролик должен быть анаморфным"
+
+    output = tmp_path / "clip.mp4"
+    render(source, output, seconds=2.0, frame_mode=mode, banner_count=0)
+
+    across = bright_span(output, 1.0, center[1], tmp_path)
+    down = bright_rows(output, 1.0, center[0], tmp_path)
+    assert across is not None and down is not None, "белый квадрат пропал из кадра"
+    width, height = across[1] - across[0] + 1, down[1] - down[0] + 1
+    assert width / height == pytest.approx(1.0, abs=0.05), f"квадрат стал {width}×{height}"
+
+
+def test_render_hands_the_cpu_budget_to_ffmpeg(synthetic_video, tmp_path, monkeypatch):
+    seen = []
+    real_run = video_processor._run_ffmpeg
+    monkeypatch.setattr(video_processor, "ffmpeg_threads", lambda: 1)
+    monkeypatch.setattr(video_processor, "_run_ffmpeg", lambda command, total, progress: (seen.append(command), real_run(command, total, progress))[1])
+
+    render(synthetic_video, tmp_path / "budget.mp4", seconds=1.0, banner_count=0)
+
+    assert len(seen) == 1 and "-filter_threads" in seen[0]
 
 
 def test_original_mode_pads_a_4_3_source_with_black_bars(quad_video, tmp_path):

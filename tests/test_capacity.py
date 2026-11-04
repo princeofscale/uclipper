@@ -16,8 +16,10 @@ from app.services.capacity import (
     DEFAULT_MIN_FREE_GB,
     MAX_DOWNLOAD_THREADS,
     cache_limit_bytes_from_env,
+    cpu_limit,
     disk_is_low,
     download_threads_from_env,
+    ffmpeg_threads,
     free_bytes,
     jobs_limit_reached,
     max_jobs_from_env,
@@ -265,3 +267,51 @@ def test_only_the_cache_is_capped(tmp_path):
 
     assert enforce_cache_limit(settings, 10, now=now) == 0
     assert all(path.exists() for path in other)
+
+
+# ---------- процессор: потоков у ffmpeg не больше, чем контейнеру разрешено ----------
+
+
+@pytest.mark.parametrize(
+    ("content", "expected"),
+    [
+        ("max 100000\n", None),  # лимита нет
+        ("100000 100000\n", 1),  # compose: cpus: 1.0
+        ("150000 100000\n", 2),  # полтора ядра: два потока, чтобы выбрать их целиком
+        ("200000 100000\n", 2),
+        ("50000 100000\n", 1),  # меньше ядра — всё равно хотя бы один поток
+        ("100000 0\n", None),  # бессмыслица не должна ронять рендер
+        ("мусор\n", None),
+        ("", None),
+    ],
+)
+def test_the_cpu_limit_is_read_from_the_container_cgroup(tmp_path, content, expected):
+    (tmp_path / "cpu.max").write_text(content)
+
+    assert cpu_limit(tmp_path) == expected
+
+
+def test_a_machine_without_cgroups_has_no_cpu_limit(tmp_path):
+    assert cpu_limit(tmp_path) is None
+
+
+def test_ffmpeg_threads_follow_the_container_limit(monkeypatch):
+    monkeypatch.delenv("FFMPEG_THREADS", raising=False)
+    monkeypatch.setattr(capacity, "cpu_limit", lambda *args, **kwargs: 1)
+
+    assert ffmpeg_threads() == 1
+
+
+def test_ffmpeg_threads_are_up_to_ffmpeg_when_nothing_limits_the_cpu(monkeypatch):
+    monkeypatch.delenv("FFMPEG_THREADS", raising=False)
+    monkeypatch.setattr(capacity, "cpu_limit", lambda *args, **kwargs: None)
+
+    assert ffmpeg_threads() is None
+
+
+@pytest.mark.parametrize(("raw", "expected"), [("3", 3), ("1", 1), ("0", None), ("2,5", 2)])
+def test_ffmpeg_threads_can_be_set_by_hand(monkeypatch, raw, expected):
+    monkeypatch.setenv("FFMPEG_THREADS", raw)
+    monkeypatch.setattr(capacity, "cpu_limit", lambda *args, **kwargs: 1)  # ручная настройка важнее лимита
+
+    assert ffmpeg_threads() == expected

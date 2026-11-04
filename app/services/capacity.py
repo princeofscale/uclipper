@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import shutil
 from pathlib import Path
@@ -21,6 +22,8 @@ MAX_JOBS_ENV = "MAX_JOBS"
 MIN_FREE_ENV = "MIN_FREE_GB"
 CACHE_LIMIT_ENV = "CACHE_LIMIT_GB"
 DOWNLOAD_THREADS_ENV = "DOWNLOAD_THREADS"
+FFMPEG_THREADS_ENV = "FFMPEG_THREADS"
+CGROUP_DIR = Path("/sys/fs/cgroup")
 
 DEFAULT_MAX_JOBS = 1  # нарезок одновременно: один ролик за раз, остальным бот говорит «занят»
 DEFAULT_MIN_FREE_GB = 5.0  # меньше — новые задачи не берём
@@ -60,6 +63,32 @@ def download_threads_from_env() -> int:
     """Сколько кусочков ролика качать одновременно (от 1 до `MAX_DOWNLOAD_THREADS`); 1 — по одному, как раньше."""
     wanted = int(_number_from_env(DOWNLOAD_THREADS_ENV, DEFAULT_DOWNLOAD_THREADS))
     return min(MAX_DOWNLOAD_THREADS, max(1, wanted))
+
+
+def cpu_limit(cgroup_dir: Path = CGROUP_DIR) -> int | None:
+    """Сколько ядер дозволено контейнеру (`cpus` в compose), округляя вверх; `None` — лимита нет или он не читается.
+
+    Docker с cgroup v2 кладёт его в `cpu.max` как «квота период» (или «max период», если лимита нет).
+    """
+    try:
+        quota, period = (cgroup_dir / "cpu.max").read_text().split()[:2]
+        cores = int(quota) / int(period)
+    except (OSError, ValueError, ZeroDivisionError):
+        return None
+    return max(1, math.ceil(cores)) if cores > 0 else None
+
+
+def ffmpeg_threads() -> int | None:
+    """Сколько потоков отдать ffmpeg; `None` — пусть выберет сам.
+
+    ffmpeg видит все ядра хоста, а контейнеру разрешено меньше (на сервере — одно): лишние потоки не получают
+    процессора, мешают друг другу и съедают четверть времени. Поэтому потоков столько, сколько разрешено контейнеру.
+    `FFMPEG_THREADS` в `.env` важнее: число — столько потоков, 0 — не ограничивать.
+    """
+    wanted = _number_from_env(FFMPEG_THREADS_ENV, -1)
+    if wanted < 0:
+        return cpu_limit()
+    return int(wanted) or None
 
 
 def free_bytes(path: Path) -> int | None:

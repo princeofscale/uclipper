@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Callable, Literal
 
 from app.config import BANNER_VIDEO_EXTS, FPS
+from app.services.capacity import ffmpeg_threads
 from app.models import BannerMode, BannerPosition, FrameMode, SlicingMode
 from app.services.face_center import detect_face_center_x
 
@@ -250,6 +251,13 @@ class RenderOptions:
     enable_sfx: bool = False
 
 
+# У анаморфных роликов и записей старого ТВ пиксель не квадратный (SAR ≠ 1:1): на экране кадр шире (или уже), чем
+# хранится в файле. Остальные фильтры SAR не учитывают, и такой ролик получался бы сплюснутым. Поэтому кадр сначала
+# растягивается до настоящих пропорций (размер ни в какую сторону не уменьшается), а дальше все пиксели квадратные.
+# У обычных роликов SAR 1:1: размеры остаются прежними (в том числе нечётные), и фильтр ничего не делает.
+SQUARE_PIXELS = "scale=w='if(gt(sar,1),trunc(iw*sar/2)*2,iw)':h='if(lt(sar,1),trunc(ih/sar/2)*2,ih)',setsar=1"
+
+
 def _base_video_chain(frame_mode: FrameMode, face_cx: float | None) -> str:
     """Приводит кадр к целевому формату → метка `[v_base]` (30 fps, yuv420p, SAR 1)."""
     width, height = FRAME_SIZE[frame_mode]
@@ -258,18 +266,18 @@ def _base_video_chain(frame_mode: FrameMode, face_cx: float | None) -> str:
         # (но не дальше границ картинки).
         x = "(iw-ow)/2" if face_cx is None else f"'min(max({face_cx:.4f}*iw-ow/2,0),iw-ow)'"
         return (
-            f"[0:v]fps={FPS},scale={width}:{height}:force_original_aspect_ratio=increase,"
+            f"[0:v]fps={FPS},{SQUARE_PIXELS},scale={width}:{height}:force_original_aspect_ratio=increase,"
             f"crop={width}:{height}:x={x}:y=(ih-oh)/2,format=yuv420p,setsar=1[v_base]"
         )
     if frame_mode is FrameMode.ORIGINAL:
         return (
-            f"[0:v]fps={FPS},scale={width}:{height}:force_original_aspect_ratio=decrease:force_divisible_by=2,"
+            f"[0:v]fps={FPS},{SQUARE_PIXELS},scale={width}:{height}:force_original_aspect_ratio=decrease:force_divisible_by=2,"
             f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,format=yuv420p,setsar=1[v_base]"
         )
     # Blur-Pad. Фон считается на кадре 270×480 и растягивается: блюр радиуса 25 на 1080×1920 визуально тот же
     # (PSNR 41.8 dB), а рендер в ~3 раза быстрее.
     return (
-        f"[0:v]fps={FPS},split=2[bg][fg];"
+        f"[0:v]fps={FPS},{SQUARE_PIXELS},split=2[bg][fg];"
         f"[bg]scale=270:480:force_original_aspect_ratio=increase,crop=270:480,boxblur=6:5,"
         f"eq=brightness=-0.15,scale={width}:{height}:flags=bicubic[bg_blur];"
         f"[fg]scale={width}:{height}:force_original_aspect_ratio=decrease:force_divisible_by=2[fg_scaled];"
@@ -449,15 +457,18 @@ def build_ffmpeg_command(
     banner_media: BannerMedia | None = None,
     sfx: Path | None = None,
     face_cx: float | None = None,
+    threads: int | None = None,
 ) -> list[str]:
     """Команда FFmpeg: быстрый seek `-ss/-t` перед `-i`, один `filter_complex`, H.264 + AAC.
 
     Порядок входов: источник, баннер (у GIF/видео — по входу на окно), звук SFX.
+    `threads` — сколько потоков разрешено процессору контейнера (`None` — ffmpeg решает сам).
     """
-    command = [
-        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-nostats", "-progress", "pipe:1",
-        "-ss", f"{clip_start:.3f}", "-t", f"{_read_seconds(timeline):.3f}", "-i", str(source),
-    ]  # fmt: skip
+    limit = ["-threads", str(threads)] if threads else []  # ключ перед `-i` относится к декодеру этого входа
+    command = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-nostats", "-progress", "pipe:1"]
+    if threads:
+        command += ["-filter_threads", str(threads), "-filter_complex_threads", str(threads)]
+    command += [*limit, "-ss", f"{clip_start:.3f}", "-t", f"{_read_seconds(timeline):.3f}", "-i", str(source)]
     media = banner_media or BannerMedia()
     next_input = 1
     banner_idx = sfx_idx = None
@@ -466,13 +477,13 @@ def build_ffmpeg_command(
             media = probe_banner(banner)
         banner_idx = next_input
         if media.kind == "image":
-            command += ["-i", str(banner)]
+            command += [*limit, "-i", str(banner)]
             next_input += 1
         else:  # GIF и видео: свой вход на каждое окно — так каждый показ идёт с первого кадра
             for start, end in timeline.windows:
                 if media.kind == "gif":  # петля ровно на длину окна
                     command += ["-stream_loop", "-1", "-t", f"{end - start:.3f}"]
-                command += ["-i", str(banner)]
+                command += [*limit, "-i", str(banner)]
             next_input += len(timeline.windows)
     if timeline.windows and sfx is not None:
         sfx_idx = next_input
@@ -483,7 +494,10 @@ def build_ffmpeg_command(
     )  # fmt: skip
     command += [
         "-filter_complex", graph, "-map", "[v_out]", "-map", "[a_out]",
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", "-r", str(FPS),
+        *limit,
+        # superfast вместо veryfast: на замере 1080p60 в 1 ядро x264 ест больше половины времени рендера, а superfast
+        # на crf 24 даёт то же качество (SSIM ≈ 0,994) при файле на 15% больше и быстрее на четверть.
+        "-c:v", "libx264", "-preset", "superfast", "-crf", "24", "-pix_fmt", "yuv420p", "-r", str(FPS),
         "-c:a", "aac", "-b:a", "160k", "-ar", str(SAMPLE_RATE), "-ac", "2",
         "-movflags", "+faststart", "-t", f"{timeline.total_duration:.3f}", str(output),
     ]  # fmt: skip
@@ -549,7 +563,7 @@ def render_clip(
     command = build_ffmpeg_command(
         source, output, clip_start, timeline, opts,
         has_audio=info.has_audio, banner=banner, banner_media=media,
-        sfx=sfx if use_sfx else None, face_cx=face_cx,
+        sfx=sfx if use_sfx else None, face_cx=face_cx, threads=ffmpeg_threads(),
     )  # fmt: skip
     output.parent.mkdir(parents=True, exist_ok=True)
     try:
