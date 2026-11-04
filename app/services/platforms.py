@@ -5,8 +5,9 @@
 разрешили, а не по любому адресу, который пришлют.
 
 Поиск по названию (`Platform.search`) и раздел «В тренде» (`Platform.trends`) есть не у всех площадок: им нужен
-открытый API без входа в аккаунт. У VK Видео, Дзена и OK результаты видны только после входа, у Twitch и Kick
-поиск идёт по каналам, а не по словам — для них работают ссылки, скачивание берёт на себя yt-dlp.
+открытый API без входа в аккаунт. У VK Видео, Дзена и OK результаты видны только после входа, у Первого канала
+поиск работает лишь в браузере, у Twitch и Kick поиск идёт по каналам, а не по словам — для них работают ссылки,
+скачивание берёт на себя yt-dlp.
 """
 from __future__ import annotations
 
@@ -58,6 +59,13 @@ VK = Platform(
     links="видео и клипы",
     why_not_search="поиск работает только после входа в аккаунт",
 )  # fmt: skip
+FIRSTTV = Platform(
+    "firsttv", "Первый канал", "1️⃣", ("1tv.ru",),
+    # Ключом берём весь путь выпуска: у новостей последний кусок адреса — просто «14:00», у передач он длинный и часто повторяется.
+    id_patterns=(r"1tv\.ru/(?P<id>[^?]+?)/?\?",),
+    links="выпуски передач",
+    why_not_search="поиск на сайте работает только в браузере",
+)  # fmt: skip
 DZEN = Platform(
     "dzen", "Дзен", "✨", ("dzen.ru", "zen.yandex.ru"), id_patterns=(r"(?P<id>[0-9a-f]{24})",),
     links="видео",
@@ -87,12 +95,14 @@ DAILYMOTION = Platform(
     why_not_trends="русскоязычных роликов там мало",
 )  # fmt: skip
 
-PLATFORMS: tuple[Platform, ...] = (YOUTUBE, RUTUBE, VK, DZEN, OK, VKPLAY, TWITCH, KICK, DAILYMOTION)
+PLATFORMS: tuple[Platform, ...] = (YOUTUBE, RUTUBE, VK, DZEN, OK, FIRSTTV, VKPLAY, TWITCH, KICK, DAILYMOTION)
 PLATFORM_BY_ID = {platform.id: platform for platform in PLATFORMS}
 SEARCHABLE: tuple[Platform, ...] = tuple(platform for platform in PLATFORMS if platform.search)
 TRENDING: tuple[Platform, ...] = tuple(platform for platform in PLATFORMS if platform.trends)
 
 _ID_PATTERNS = {platform.id: tuple(re.compile(pattern) for pattern in platform.id_patterns) for platform in PLATFORMS}
+_KEY_LIMIT = 64  # длиннее имя файла кеша не делаем
+_HASH_LENGTH = 16
 
 
 @dataclass(frozen=True)
@@ -114,8 +124,12 @@ class Source:
         """Ключ кеша, безопасный для имени файла. У YouTube это сам 11-символьный id, у остальных `<площадка>-<id>`."""
         if self.platform is YOUTUBE:
             return self.video_id or ""
-        token = self.video_id or hashlib.sha1(self.url.split("#", 1)[0].encode(), usedforsecurity=False).hexdigest()[:16]
-        return f"{self.platform.id}-{re.sub(r'[^A-Za-z0-9_-]', '_', token)[:64]}"
+        token = self.video_id or hashlib.sha1(self.url.split("#", 1)[0].encode(), usedforsecurity=False).hexdigest()[:_HASH_LENGTH]
+        safe = re.sub(r"[^A-Za-z0-9_-]", "_", token)
+        if len(safe) > _KEY_LIMIT:  # простая обрезка склеила бы выпуски, различающиеся только концом адреса (датой)
+            digest = hashlib.sha1(token.encode(), usedforsecurity=False).hexdigest()[:_HASH_LENGTH]
+            safe = f"{safe[: _KEY_LIMIT - _HASH_LENGTH - 1]}-{digest}"
+        return f"{self.platform.id}-{safe}"
 
 
 def _host_matches(host: str, domain: str) -> bool:

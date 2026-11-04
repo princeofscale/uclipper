@@ -11,10 +11,13 @@ from app.models import JobStatus
 from app.services import capacity
 from app.services.capacity import (
     DEFAULT_CACHE_LIMIT_GB,
+    DEFAULT_DOWNLOAD_THREADS,
     DEFAULT_MAX_JOBS,
     DEFAULT_MIN_FREE_GB,
+    MAX_DOWNLOAD_THREADS,
     cache_limit_bytes_from_env,
     disk_is_low,
+    download_threads_from_env,
     free_bytes,
     jobs_limit_reached,
     max_jobs_from_env,
@@ -29,7 +32,7 @@ HOUR = 3600
 
 @pytest.fixture(autouse=True)
 def clean_env(monkeypatch):
-    for name in ("MAX_JOBS", "MIN_FREE_GB", "CACHE_LIMIT_GB"):
+    for name in ("MAX_JOBS", "MIN_FREE_GB", "CACHE_LIMIT_GB", "DOWNLOAD_THREADS"):
         monkeypatch.delenv(name, raising=False)
 
 
@@ -62,6 +65,30 @@ def test_limits_have_sane_defaults():
 def test_max_jobs_reads_the_environment(monkeypatch, raw, expected):
     monkeypatch.setenv("MAX_JOBS", raw)
     assert max_jobs_from_env() == expected
+
+
+def test_downloads_take_eight_pieces_at_a_time_by_default():
+    # замер на сервере (RuTube, 340 МБ): по одному ≈70 с, на восьми потоках ≈40 с; на 16 лучше не становится
+    assert download_threads_from_env() == DEFAULT_DOWNLOAD_THREADS == 8
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("12", 12),
+        (" 6 ", 6),
+        ("1", 1),  # по одному, как раньше
+        ("0", 1),  # «0 потоков» бессмысленно: это тот же один
+        ("-3", 1),
+        ("99", MAX_DOWNLOAD_THREADS),  # больше площадка всё равно не отдаст, а на неё сыплются отказы
+        ("много", DEFAULT_DOWNLOAD_THREADS),
+        ("", DEFAULT_DOWNLOAD_THREADS),
+        ("3,9", 3),
+    ],
+)
+def test_download_threads_read_the_environment(monkeypatch, raw, expected):
+    monkeypatch.setenv("DOWNLOAD_THREADS", raw)
+    assert download_threads_from_env() == expected
 
 
 def test_disk_limits_accept_fractions_and_zero_switches_them_off(monkeypatch):

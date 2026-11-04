@@ -7,6 +7,7 @@ from app.services.platforms import (
     DAILYMOTION,
     DZEN,
     EVERYWHERE,
+    FIRSTTV,
     KICK,
     OK,
     PLATFORM_BY_ID,
@@ -94,6 +95,8 @@ def test_everything_else_is_refused(url):
         ("https://kick.com/chan?clip=clip_01ABC", KICK, "kick-clip_01ABC"),
         ("https://www.dailymotion.com/video/x8abcd", DAILYMOTION, "dailymotion-x8abcd"),
         ("https://dai.ly/x8abcd", DAILYMOTION, "dailymotion-x8abcd"),
+        ("https://www.1tv.ru/shows/kvn/vypuski/vypusk-ot-01-11-2026", FIRSTTV, "firsttv-shows_kvn_vypuski_vypusk-ot-01-11-2026"),
+        ("https://1tv.ru/news/issue/2016-12-01/14:00", FIRSTTV, "firsttv-news_issue_2016-12-01_14_00"),
     ],
 )
 def test_links_of_other_platforms_are_recognised_with_a_per_platform_key(url, platform, key):
@@ -115,6 +118,24 @@ def test_links_of_other_platforms_are_recognised_with_a_per_platform_key(url, pl
 )
 def test_the_video_id_is_taken_from_the_link(url, video_id):
     assert identify(url).video_id == video_id
+
+
+def test_first_channel_key_comes_from_the_whole_path_not_from_tracking_marks():
+    # ссылки с сайта приходят с utm-метками и косой чертой на конце — это тот же выпуск, и в кеше он один
+    plain = identify("https://www.1tv.ru/shows/kvn/vypuski/vypusk-ot-01-11-2026")
+    marked = identify("https://www.1tv.ru/shows/kvn/vypuski/vypusk-ot-01-11-2026/?utm_source=1tv&utm_medium=promo#t=5")
+    assert plain.key == marked.key
+    # у выпусков новостей последний кусок адреса — просто «14:00»: без остального пути разные дни склеились бы
+    assert identify("https://www.1tv.ru/news/issue/2016-12-01/14:00").key != identify("https://www.1tv.ru/news/issue/2016-12-02/14:00").key
+
+
+def test_a_long_path_is_folded_into_a_hash_instead_of_being_cut():
+    # адреса выпусков бывают длинными, а различаются только датой в конце: обрезка склеила бы выпуски
+    head = "https://www.1tv.ru/shows/pust-govoryat/vypuski-i-dramatichnye-momenty/" + "ochen-dlinnoe-nazvanie-vypuska-" * 3
+    first, second = identify(head + "ot-03-11-2026"), identify(head + "ot-03-11-2025")
+    assert first.key != second.key
+    assert first.key.startswith("firsttv-") and re.fullmatch(r"[A-Za-z0-9_-]{1,100}", first.key)
+    assert first.key == identify(head + "ot-03-11-2026").key  # и ключ при этом стабилен
 
 
 def test_vk_play_is_not_mistaken_for_vk():
@@ -157,6 +178,7 @@ def test_keys_are_filename_safe_even_for_hostile_links():
         "https://twitch.tv/videos/../../etc/passwd",
         "https://kick.com/x/clips/clip_../../x",
         "https://vk.com/video-1_2/../../x",
+        "https://www.1tv.ru/shows/../../etc/" + "x" * 300,
         "https://dzen.ru/video/watch/" + "a" * 500,
         "https://rutube.ru/" + "я" * 300,
     ]

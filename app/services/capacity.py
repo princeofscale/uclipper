@@ -1,4 +1,5 @@
-"""Защита общего сервера, когда бот открыт для всех: сколько нарезок идёт одновременно и сколько осталось места.
+"""Защита общего сервера, когда бот открыт для всех: сколько нарезок идёт одновременно, сколько осталось места
+и сколько кусочков ролика качается разом.
 
 Бот живёт на одной машине с другими сервисами, нарезка грузит процессор целиком, а скачанные ролики занимают диск.
 Поэтому по умолчанию бот ведёт **один** ролик за раз: пока он не готов (клипы не дошли до чата), остальным бот
@@ -19,10 +20,13 @@ GB = 1024**3
 MAX_JOBS_ENV = "MAX_JOBS"
 MIN_FREE_ENV = "MIN_FREE_GB"
 CACHE_LIMIT_ENV = "CACHE_LIMIT_GB"
+DOWNLOAD_THREADS_ENV = "DOWNLOAD_THREADS"
 
 DEFAULT_MAX_JOBS = 1  # нарезок одновременно: один ролик за раз, остальным бот говорит «занят»
 DEFAULT_MIN_FREE_GB = 5.0  # меньше — новые задачи не берём
 DEFAULT_CACHE_LIMIT_GB = 12.0  # столько могут занимать скачанные источники
+DEFAULT_DOWNLOAD_THREADS = 8  # кусочков ролика (фрагментов HLS/DASH) за раз: RuTube, 340 МБ: по одному ≈70 с, на 8 потоках ≈40 с
+MAX_DOWNLOAD_THREADS = 16  # выше площадки отвечают отказами, а выигрыша нет
 
 
 def _number_from_env(name: str, default: float) -> float:
@@ -50,6 +54,12 @@ def min_free_bytes_from_env() -> int:
 def cache_limit_bytes_from_env() -> int:
     """Сколько байт может занимать кеш скачанных источников; 0 — без предела."""
     return int(_number_from_env(CACHE_LIMIT_ENV, DEFAULT_CACHE_LIMIT_GB) * GB)
+
+
+def download_threads_from_env() -> int:
+    """Сколько кусочков ролика качать одновременно (от 1 до `MAX_DOWNLOAD_THREADS`); 1 — по одному, как раньше."""
+    wanted = int(_number_from_env(DOWNLOAD_THREADS_ENV, DEFAULT_DOWNLOAD_THREADS))
+    return min(MAX_DOWNLOAD_THREADS, max(1, wanted))
 
 
 def free_bytes(path: Path) -> int | None:

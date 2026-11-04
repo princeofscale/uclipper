@@ -12,6 +12,7 @@ import yt_dlp
 
 from app.config import MAX_SOURCE_SECONDS
 from app.services import downloader, rutube, youtube
+from app.services.capacity import DEFAULT_DOWNLOAD_THREADS
 from app.services.downloader import (
     DownloadError,
     cached_source_path,
@@ -27,6 +28,7 @@ RUTUBE_ID = "0123456789abcdef0123456789abcdef"
 RUTUBE_URL = f"https://rutube.ru/video/{RUTUBE_ID}/"
 RUTUBE_KEY = f"rutube-{RUTUBE_ID}"
 VK_URL = "https://vk.com/video-22822305_456239018"
+FIRSTTV_URL = "https://www.1tv.ru/shows/pust-govoryat/vypuski-i-dramatichnye-momenty/vypusk-ot-03-11-2026"
 
 
 def video_info(**overrides):
@@ -134,10 +136,24 @@ def test_download_passes_the_options_from_the_spec_to_yt_dlp(ydl, tmp_path):
     )  # хвост — запасные варианты для площадок без mp4+m4a или без указанной высоты
     assert opts["merge_output_format"] == "mp4"
     assert opts["noplaylist"] is True
+    assert opts["playlistend"] == 1  # если по ссылке вдруг не один ролик, на диск не уйдёт вся передача целиком
     assert opts["outtmpl"] == str(tmp_path / f"source_{VIDEO_ID}.%(ext)s")
     # при одинаковом разрешении берём H.264, а не AV1: он декодируется везде и быстрее
     assert opts["format_sort"] == ["res", "vcodec:h264"]
     assert ydl.downloaded == [URL]
+
+
+def test_download_takes_several_stream_pieces_at_once(ydl, tmp_path, monkeypatch):
+    # HLS и DASH приходят нарезанными на куски: по одному их качать заметно дольше, чем держит канал
+    monkeypatch.delenv("DOWNLOAD_THREADS", raising=False)
+    download_video_cached(URL, cache_dir=tmp_path)
+    assert ydl.instances[0].opts["concurrent_fragment_downloads"] == DEFAULT_DOWNLOAD_THREADS
+
+
+def test_the_number_of_pieces_follows_the_environment(ydl, tmp_path, monkeypatch):
+    monkeypatch.setenv("DOWNLOAD_THREADS", "1")
+    download_video_cached(URL, cache_dir=tmp_path)
+    assert ydl.instances[0].opts["concurrent_fragment_downloads"] == 1
 
 
 def test_other_platforms_get_their_own_file_name_and_no_javascript_runtime(ydl, tmp_path):
@@ -302,7 +318,8 @@ def test_video_info_has_everything_the_ui_card_needs(ydl):
     }
     opts = ydl.instances[0].opts
     # «плоский» разбор плейлистов: ссылка на канал не раскроется в сотни роликов
-    assert (opts["quiet"], opts["no_warnings"], opts["extract_flat"], opts["playlistend"]) == (True, True, "in_playlist", 1)
+    # двух записей хватает, чтобы отличить одиночный ролик в плейлисте из одного элемента от настоящего плейлиста
+    assert (opts["quiet"], opts["no_warnings"], opts["extract_flat"], opts["playlistend"]) == (True, True, "in_playlist", 2)
     assert opts["noplaylist"] is True
 
 
@@ -328,11 +345,41 @@ def test_uploader_falls_back_to_channel_and_then_to_nothing(ydl):
     assert fetch_video_info(VK_URL)["uploader"] == ""
 
 
-@pytest.mark.parametrize("extra", [{"_type": "playlist"}, {"_type": "multi_video"}, {"entries": []}, {"entries": [{"id": "x"}]}])
+@pytest.mark.parametrize(
+    "extra",
+    [{"_type": "playlist"}, {"_type": "multi_video"}, {"entries": []}, {"entries": [{"id": "x"}, {"id": "y"}]}],
+)
 def test_channels_and_playlists_are_refused(ydl, extra):
     ydl.info = video_info(**extra)
     with pytest.raises(DownloadError, match="канал или плейлист"):
         fetch_video_info(RUTUBE_URL)
+
+
+def test_a_playlist_of_one_video_is_that_video(ydl):
+    # Первый канал отдаёт даже одиночный выпуск плейлистом из одного элемента: это обычный ролик, а не канал
+    episode = video_info(id="ep1", title="Выпуск от 3 ноября", duration=3623, uploader=None, thumbnail="https://img/ep.jpg")
+    ydl.info = {"_type": "playlist", "id": "page", "title": "Страница выпуска", "entries": [episode]}
+    info = fetch_video_info(FIRSTTV_URL)
+    assert info == {
+        "platform": "firsttv",
+        "url": FIRSTTV_URL,
+        "title": "Выпуск от 3 ноября",  # заголовок самого ролика, а не обёртки
+        "duration": 3623.0,
+        "thumbnail": "https://img/ep.jpg",
+        "uploader": "",
+    }
+
+
+def test_the_wrapper_fills_in_what_the_single_video_does_not_say(ydl):
+    ydl.info = {"_type": "playlist", "title": "Название страницы", "uploader": "Первый канал", "entries": [{"duration": 600}]}
+    info = fetch_video_info(FIRSTTV_URL)
+    assert (info["title"], info["uploader"], info["duration"]) == ("Название страницы", "Первый канал", 600.0)
+
+
+def test_a_playlist_with_a_single_live_stream_is_still_refused(ydl):
+    ydl.info = {"_type": "playlist", "entries": [video_info(is_live=True)]}
+    with pytest.raises(DownloadError, match="прямой эфир"):
+        fetch_video_info(FIRSTTV_URL)
 
 
 @pytest.mark.parametrize("extra", [{"is_live": True}, {"live_status": "is_live"}, {"live_status": "is_upcoming"}])

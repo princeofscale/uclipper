@@ -12,6 +12,7 @@ import yt_dlp
 
 from app.config import MAX_SOURCE_SECONDS, MIN_CACHE_BYTES, VIDEO_EXTS, Settings
 from app.services import rutube
+from app.services.capacity import download_threads_from_env
 from app.services.platforms import RUTUBE, YOUTUBE, Platform, Source, identify, titles
 from app.services.youtube import js_runtimes
 
@@ -101,7 +102,8 @@ def fetch_video_info(url: str) -> dict:
     """
     source = require_source(url)
     platform = source.platform
-    options = _base_options(platform) | {"quiet": True, "no_warnings": True, "extract_flat": "in_playlist", "playlistend": 1}
+    # Двух записей хватает, чтобы отличить плейлист от одиночного ролика, завёрнутого в плейлист (так отдаёт Первый канал).
+    options = _base_options(platform) | {"quiet": True, "no_warnings": True, "extract_flat": "in_playlist", "playlistend": 2}
     try:
         with yt_dlp.YoutubeDL(options) as ydl:
             info = ydl.extract_info(source.url, download=False)
@@ -110,7 +112,11 @@ def fetch_video_info(url: str) -> dict:
     if not info:
         raise DownloadError(f"{platform.title} не вернул сведений о ролике.")
     if info.get("_type") in ("playlist", "multi_video") or info.get("entries") is not None:
-        raise DownloadError("Это ссылка на канал или плейлист. Пришлите ссылку на конкретный ролик.")
+        entries = [entry for entry in (info.get("entries") or []) if entry]
+        if len(entries) != 1:
+            raise DownloadError("Это ссылка на канал или плейлист. Пришлите ссылку на конкретный ролик.")
+        wrapper = {key: value for key, value in info.items() if key not in ("_type", "entries")}
+        info = wrapper | {key: value for key, value in entries[0].items() if value is not None}  # сам ролик важнее обёртки
     if info.get("is_live") or info.get("live_status") in _LIVE_STATES:
         raise DownloadError("Это прямой эфир — нарезать можно только готовую запись. Пришлите ссылку на запись.")
     duration = float(info.get("duration") or 0)
@@ -185,6 +191,8 @@ def download_video_cached(
         "format": _format_selector(max_height),
         "format_sort": ["res", "vcodec:h264"],  # то же разрешение — H.264 раньше AV1 (быстрее и совместимее)
         "merge_output_format": "mp4",
+        "playlistend": 1,  # ссылка проверена как один ролик; если вдруг не так — вся передача на диск не уйдёт
+        "concurrent_fragment_downloads": download_threads_from_env(),  # HLS/DASH: куски идут параллельно, а не по одному
         "outtmpl": str(cache_dir / f"source_{key}.%(ext)s"),
         "quiet": False,
         "noprogress": True,
