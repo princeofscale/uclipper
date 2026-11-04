@@ -64,10 +64,16 @@ class Category:
     hint: str  # чем хороши для нарезки
     note: str = ""  # пояснение под списком роликов (если жанр на площадках ведёт себя по-разному)
     overrides: tuple[tuple[str, tuple[str, ...]], ...] = ()  # (площадка, свои слова) — где общие не подходят
+    exclude: tuple[str, ...] = ()  # слова в названии, по которым ролик не из этого жанра (строчными буквами)
 
     def queries_for(self, platform: str) -> tuple[str, ...]:
         """Слова поиска для площадки: свои, если для неё заданы, иначе общие."""
         return dict(self.overrides).get(platform, self.queries)
+
+    def rejects(self, title: str) -> bool:
+        """Название выдаёт чужой жанр (например, сборник музыки среди сериалов)."""
+        lowered = title.lower()
+        return any(word in lowered for word in self.exclude)
 
 
 CATEGORIES: tuple[Category, ...] = (
@@ -82,6 +88,8 @@ CATEGORIES: tuple[Category, ...] = (
         "разборы и мнения, а на RuTube — целые фильмы и сериалы",
         note="Больше всего целых фильмов и сериалов в VK Видео и OK. Искать там бот не умеет: найдите серию сами и пришлите ссылку.",
         overrides=(("rutube", ("русский фильм", "российский сериал", "сериал все серии")),),
+        # По этим запросам RuTube подмешивает сборники музыки и мультфильмы для малышей.
+        exclude=("музыка", "хиты", "ремикс", "песни", "для детей", "для малышей", "для мальчиков", "для девочек"),
     ),  # fmt: skip
     Category("sport", "⚽", "Спорт", ("футбол", "хоккей", "бокс"), "голы, нокауты и громкие заявления"),
 )
@@ -342,10 +350,14 @@ def fetch_rutube(queries: tuple[str, ...], limit: int = 8, *, now: float | None 
 
 FETCHERS: dict[str, Callable[[tuple[str, ...], int], list[dict]]] = {"youtube": fetch_youtube, "rutube": fetch_rutube}
 PERIOD_TEXT = {"youtube": "за неделю", "rutube": "за последнее время"}  # как называть период в подписях
+EXCLUDE_SPARE = 4  # столько лишних роликов просим у площадки, если часть выдачи отсеется по словам жанра
 
 
 def fetch_category(category: Category, platform: str = "youtube", limit: int = 8) -> list[dict]:
-    return FETCHERS[platform](category.queries_for(platform), limit)
+    if not category.exclude:
+        return FETCHERS[platform](category.queries_for(platform), limit)
+    videos = FETCHERS[platform](category.queries_for(platform), limit + EXCLUDE_SPARE)
+    return [video for video in videos if not category.rejects(video["title"])][:limit]
 
 
 # ---------------------------------------------------------------------------

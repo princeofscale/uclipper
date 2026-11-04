@@ -144,6 +144,15 @@ def test_nothing_found_on_a_chosen_platform_suggests_another(searchers):
         search_videos("интервью", platform="dailymotion")
 
 
+def test_nothing_found_on_rutube_explains_that_paid_videos_are_hidden(searchers):
+    """«Интерны 98 серия» целиком идёт по подписке PREMIER: человеку надо сказать, почему поиск пуст, а не «сломан»."""
+    with pytest.raises(DownloadError, match="На RuTube по запросу «интерны» ничего не нашлось.*по подписке.*PREMIER"):
+        search_videos("интерны", platform="rutube")
+    with pytest.raises(DownloadError) as other:
+        search_videos("интерны", platform="youtube")
+    assert "по подписке" not in str(other.value)
+
+
 @pytest.mark.parametrize("query", ["", " ", "a", None])
 def test_too_short_queries_never_reach_the_platforms(searchers, query):
     with pytest.raises(DownloadError, match="Слишком короткое"):

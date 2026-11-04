@@ -49,6 +49,10 @@ SEARCHERS: dict[str, Callable[[str, int], list[dict]]] = {
     "dailymotion": _search_dailymotion,
 }
 _SEARCH_ERRORS = (youtube.YoutubeError, rutube.RutubeError, dailymotion.DailymotionError)
+# Когда на одной площадке пусто, а причина может быть не в запросе: целые сериалы там нередко идут по подписке.
+_NOTHING_HINTS = {
+    "rutube": " Ролики RuTube по подписке (PREMIER и др.) бот не показывает: скачать их нельзя.",
+}
 
 
 def interleave(lists: list[list[dict]], limit: int) -> list[dict]:
@@ -91,7 +95,7 @@ def search_videos(query: str, limit: int = RESULTS, *, platform: str = EVERYWHER
         if only is not None:
             raise DownloadError(
                 f"На {only.title} по запросу «{text}» ничего не нашлось — попробуйте переформулировать, "
-                "выберите другую площадку или пришлите ссылку."
+                f"выберите другую площадку или пришлите ссылку.{_NOTHING_HINTS.get(only.id, '')}"
             )
         raise DownloadError(f"По запросу «{text}» ничего не нашлось — попробуйте переформулировать или пришлите ссылку.")
     return found

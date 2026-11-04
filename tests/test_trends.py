@@ -312,6 +312,39 @@ def test_fetch_category_asks_the_chosen_platform_with_the_genre_queries(monkeypa
     assert seen == [("rutube", category.queries, 5), ("youtube", category.queries, 8)]
 
 
+def test_movies_drop_music_compilations_and_kids_shows(monkeypatch):
+    """В жанре «Кино и сериалы» на RuTube попадались сборники музыки и мультфильмы для малышей."""
+    titles = [
+        "Музыка 2026: хиты и трендовые ремиксы | Топ-1 Сборник",
+        "Кухня | Сезон 1 | Серия 1 - 5",
+        "Буба - Все серии подряд. Мультфильмы для детей",
+        "МАШИНКИ - Сериал для мальчиков - Все серии подряд",
+        "Три дороги. Все серии подряд. Мелодрама",
+        "Лучшие песни из советских фильмов",
+    ]
+    asked = []
+    monkeypatch.setitem(
+        FETCHERS, "rutube", lambda queries, limit: asked.append(limit) or [{"title": title, "video_id": title} for title in titles]
+    )
+
+    found = fetch_category(CATEGORY_BY_ID["movies"], "rutube", 3)
+
+    assert [video["title"] for video in found] == ["Кухня | Сезон 1 | Серия 1 - 5", "Три дороги. Все серии подряд. Мелодрама"]
+    assert asked == [3 + trends.EXCLUDE_SPARE]  # просим с запасом: часть выдачи отсеется по словам жанра
+
+
+def test_the_exclusion_words_are_only_for_genres_that_set_them(monkeypatch):
+    monkeypatch.setitem(FETCHERS, "youtube", lambda queries, limit: [{"title": "Музыка и деньги", "video_id": "a"}])
+    assert [video["title"] for video in fetch_category(CATEGORY_BY_ID["money"], "youtube")] == ["Музыка и деньги"]
+    assert [category.id for category in CATEGORIES if category.exclude] == ["movies"]
+
+
+def test_exclusion_ignores_letter_case():
+    movies = CATEGORY_BY_ID["movies"]
+    assert movies.rejects("МУЗЫКА 2026") and movies.rejects("Лучшие ХИТЫ") and not movies.rejects("Чушпан: разбор сериала")
+    assert not CATEGORY_BY_ID["podcast"].rejects("Музыка")
+
+
 def test_every_platform_with_trends_has_a_fetcher_and_a_period_caption():
     for platform in TRENDING:
         assert platform.id in FETCHERS and platform.id in PERIOD_TEXT
