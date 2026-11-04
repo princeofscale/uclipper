@@ -17,13 +17,15 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.base import StorageKey
 
 from app.bot import keyboards, texts
+from app.bot.busy import Busy, Cause
 from app.bot.context import QUERY_KEY, SCOPE_KEY, get_draft
 from app.bot.handlers import source as source_handlers
 from app.bot.handlers import trends as trend_handlers
 from app.bot.rich import plain_text
+from app.bot.runner import RunningJob
 from app.bot.states import Flow
 from app.config import Settings
-from app.models import CutMode, FrameMode, Goal, SlicingMode
+from app.models import CutMode, FrameMode, Goal, JobStatus, SlicingMode
 from app.services import capacity
 from app.services.platforms import EVERYWHERE, SEARCHABLE
 from app.services.platforms import TRENDING as TREND_PLATFORMS
@@ -57,6 +59,8 @@ TRENDING = [
 
 WAIT = 120
 MENU_BUTTONS = ["ask:link", "ask:query", "ask:file", "screen:trends", "screen:banners", "screen:stats", "screen:help"]
+SOURCE_BUTTONS = MENU_BUTTONS[:4]  # кнопки, которые начинают новую нарезку: пока бот занят, они красные и не работают
+INFO_BUTTONS = MENU_BUTTONS[4:]  # справочные кнопки работают всегда
 SEARCH_PLATFORMS = ["all", "youtube", "rutube", "dailymotion"]  # «Везде» и площадки с поиском по названию
 PROMPT_CHIPS = [f"qp:{choice}" for choice in SEARCH_PLATFORMS]  # выбор площадки на экране «Что искать?»
 RETRY_CHIPS = [f"qs:{choice}" for choice in SEARCH_PLATFORMS]  # он же под результатами: тот же запрос на другой площадке
@@ -86,6 +90,27 @@ def _fake_search(results=None, calls: list | None = None):
 def _styles(harness) -> dict:
     """Цвет каждой кнопки последнего экрана: callback_data → стиль."""
     return {button.callback_data: button.style for row in harness.session.keyboard() for button in row}
+
+
+def _occupy(harness, user_id: int = 2, *, progress: float = 42.0, stage: str = "Рендер клипа 3 из 8", delivering: bool = False) -> str:
+    """Подкладывает нарезку, которая сейчас идёт у `user_id`: настоящая для теста бота слишком долгая.
+
+    `delivering` — клипы уже готовы, и бот досылает их в чат (задача ещё не убрана из живых).
+    """
+    manager = harness.ctx.manager
+    job_id = manager._create()  # noqa: SLF001
+    status = JobStatus.DONE if delivering else JobStatus.RUNNING
+    manager._update(job_id, status=status, progress=100.0 if delivering else progress, stage="Готово" if delivering else stage)  # noqa: SLF001
+    running = RunningJob(
+        job_id=job_id, chat_id=user_id, user_id=user_id, message=None, state=manager.get(job_id), finished=delivering
+    )
+    harness.ctx.runner._jobs[job_id] = running  # noqa: SLF001
+    return job_id
+
+
+def _release(harness, job_id: str) -> None:
+    """Задача закончилась и убрана из живых — бот снова свободен."""
+    harness.ctx.runner._jobs.pop(job_id, None)  # noqa: SLF001
 
 
 # ---------- фикстуры ----------
@@ -1460,13 +1485,15 @@ async def test_second_start_is_refused_while_a_job_runs(harness, monkeypatch):
     assert "ещё идёт" in harness.session.last_alert()
 
 
-async def test_messages_during_a_job_get_a_hint(harness, monkeypatch):
-    monkeypatch.setattr(harness.ctx.runner, "active_for_user", lambda user_id: "job-1")
+async def test_messages_during_my_own_cut_show_the_progress_and_a_stop_button(harness):
+    job = _occupy(harness, user_id=1, progress=33, stage="Рендер клипа 2 из 6")
     await _fsm(harness).set_state(Flow.running)
 
     await harness.send("привет")
 
-    assert "Сейчас идёт нарезка" in harness.session.last_text()
+    text = harness.session.last_text()
+    assert "Идёт ваша нарезка" in text and "33" in text and "Рендер клипа 2 из 6" in text
+    assert f"job:cancel:{job}" in harness.session.buttons()
 
 
 async def test_auto_plan_converts_into_a_valid_job_request(harness, monkeypatch):
@@ -1489,29 +1516,6 @@ async def test_auto_plan_converts_into_a_valid_job_request(harness, monkeypatch)
     assert await _fsm(harness).get_state() == Flow.running.state
 
 
-async def test_start_is_refused_while_the_queue_is_full(harness, monkeypatch):
-    started = []
-
-    async def start(chat_id, user_id, request, message):
-        started.append(request)
-        return "job-1"
-
-    monkeypatch.setenv("MAX_QUEUE", "2")
-    monkeypatch.setattr(harness.ctx.manager, "unfinished", lambda: 2)
-    monkeypatch.setattr(harness.ctx.runner, "start", start)
-    await _open_auto(harness, monkeypatch)
-
-    await harness.press("job:start")
-
-    assert "очередь" in harness.session.last_alert().lower() and not started
-    assert await _fsm(harness).get_state() == Flow.editing.state  # план остался на экране: можно нажать ещё раз
-    assert "job:start" in harness.session.buttons()
-
-    monkeypatch.setattr(harness.ctx.manager, "unfinished", lambda: 1)  # одно место освободилось
-    await harness.press("job:start")
-    assert len(started) == 1
-
-
 async def test_start_is_refused_when_the_disk_is_almost_full(harness, monkeypatch):
     started = []
 
@@ -1519,14 +1523,14 @@ async def test_start_is_refused_when_the_disk_is_almost_full(harness, monkeypatc
         started.append(request)
         return "job-1"
 
-    monkeypatch.setattr(capacity, "free_bytes", lambda path: 1 * 1024**3)
     monkeypatch.setattr(harness.ctx.runner, "start", start)
     await _open_auto(harness, monkeypatch)
+    monkeypatch.setattr(capacity, "free_bytes", lambda path: 1 * 1024**3)  # место кончилось, пока человек выбирал
 
     await harness.press("job:start")
 
     assert "места" in harness.session.last_alert() and not started
-    assert "job:start" in harness.session.buttons()
+    assert "job:start" in harness.session.buttons()  # план на экране остался
 
 
 async def test_the_limits_are_off_when_the_environment_says_zero(harness, monkeypatch):
@@ -1536,9 +1540,10 @@ async def test_the_limits_are_off_when_the_environment_says_zero(harness, monkey
         started.append(request)
         return "job-1"
 
-    monkeypatch.setenv("MAX_QUEUE", "0")
+    monkeypatch.setenv("MAX_JOBS", "0")
     monkeypatch.setenv("MIN_FREE_GB", "0")
-    monkeypatch.setattr(harness.ctx.manager, "unfinished", lambda: 99)
+    _occupy(harness, user_id=2)
+    _occupy(harness, user_id=3)
     monkeypatch.setattr(capacity, "free_bytes", lambda path: 0)
     monkeypatch.setattr(harness.ctx.runner, "start", start)
     await _open_auto(harness, monkeypatch)
@@ -1620,6 +1625,260 @@ async def test_link_is_accepted_right_after_a_finished_job(harness, monkeypatch)
     await harness.send(VIDEO["url"])
 
     assert "Тестовый ролик" in harness.session.last_text()
+
+
+# ---------- один ролик за раз ----------
+
+
+async def test_the_menu_is_live_while_nobody_is_cutting(harness):
+    await harness.send("/start")
+
+    styles = _styles(harness)
+    assert all(styles[data] != keyboards.DANGER for data in MENU_BUTTONS)
+    assert "menu:refresh" not in styles
+    assert "занят" not in harness.session.last_text()
+
+
+async def test_the_menu_turns_red_while_another_person_is_cutting(harness):
+    _occupy(harness, user_id=2, progress=42)
+
+    await harness.send("/start")
+
+    styles = _styles(harness)
+    assert harness.session.buttons()[:1] == ["menu:refresh"] or "menu:refresh" in styles
+    assert [styles[data] for data in SOURCE_BUTTONS] == [keyboards.DANGER] * 4
+    assert all(styles[data] != keyboards.DANGER for data in INFO_BUTTONS)
+    assert not any(data.startswith("job:cancel:") for data in styles)  # чужую нарезку не остановить
+    text = harness.session.last_text()
+    assert "Бот сейчас занят" in text and "другого человека" in text and "42" in text
+    assert "ClipBanner" not in text
+    assert_valid_rich(harness.session.htmls()[-1])
+
+
+async def test_the_menu_shows_my_own_cut_with_a_stop_button(harness):
+    job = _occupy(harness, user_id=1, progress=17, stage="Скачивание видео")
+
+    await harness.send("/start")
+
+    styles = _styles(harness)
+    assert [styles[data] for data in SOURCE_BUTTONS] == [keyboards.DANGER] * 4
+    assert styles[f"job:cancel:{job}"] == keyboards.DANGER
+    text = harness.session.last_text()
+    assert "Идёт ваша нарезка" in text and "17" in text and "Скачивание видео" in text
+    assert_valid_rich(harness.session.htmls()[-1])
+
+
+@pytest.mark.parametrize("button", SOURCE_BUTTONS)
+async def test_red_buttons_do_nothing_but_explain(harness, button):
+    await harness.send("/start")  # меню было живым...
+    _occupy(harness, user_id=2)  # ...а потом бот занялся чужим роликом
+
+    await harness.press(button)
+
+    assert "нарезает другой ролик" in harness.session.last_alert()
+    assert "Бот сейчас занят" in harness.session.last_text()  # на экране — актуальное красное меню
+    assert [_styles(harness)[data] for data in SOURCE_BUTTONS] == [keyboards.DANGER] * 4
+    assert await _fsm(harness).get_state() == Flow.waiting_link.state  # ни ссылку, ни название, ни файл не ждём
+
+
+async def test_a_link_is_not_looked_up_while_the_bot_is_busy(harness, monkeypatch):
+    def forbidden(url):
+        raise AssertionError("пока бот занят, ролик не запрашивается")
+
+    monkeypatch.setattr(source_handlers, "fetch_video_info", forbidden)
+    _occupy(harness, user_id=2)
+
+    await harness.send(VIDEO["url"])
+
+    assert "Бот сейчас занят" in harness.session.last_text()
+    assert "mode:auto" not in harness.session.buttons()
+
+
+async def test_a_title_is_not_searched_while_the_bot_is_busy(harness, monkeypatch):
+    calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(source_handlers, "search_videos", _fake_search(calls=calls))
+    _occupy(harness, user_id=2)
+
+    await harness.send("дуров интервью")
+
+    assert calls == [] and "Бот сейчас занят" in harness.session.last_text()
+
+
+async def test_a_file_is_not_downloaded_while_the_bot_is_busy(harness):
+    _occupy(harness, user_id=2)
+
+    await harness.send_file()
+
+    assert "Бот сейчас занят" in harness.session.last_text()
+    assert not harness.session.calls("getFile")
+
+
+async def test_numbers_typed_into_the_settings_are_not_swallowed_by_the_busy_notice(harness, monkeypatch):
+    await _open_manual(harness, monkeypatch)
+    await harness.press("type:num_clips")
+    _occupy(harness, user_id=2)
+
+    await harness.send("7")
+
+    assert (await _draft(harness)).settings.num_clips == 7
+
+
+async def test_start_is_refused_while_another_person_is_cutting_and_the_plan_stays(harness, monkeypatch):
+    started = []
+
+    async def start(chat_id, user_id, request, message):
+        started.append(request)
+        return "job-1"
+
+    monkeypatch.setattr(harness.ctx.runner, "start", start)
+    await _open_auto(harness, monkeypatch)
+    job = _occupy(harness, user_id=2)
+
+    await harness.press("job:start")
+
+    assert "нарезает другой ролик" in harness.session.last_alert() and not started
+    assert await _fsm(harness).get_state() == Flow.editing.state  # план остался на экране
+    assert "job:start" in harness.session.buttons()
+
+    _release(harness, job)  # чужая нарезка закончилась
+    await harness.press("job:start")
+    assert len(started) == 1
+
+
+async def test_two_people_pressing_start_at_the_same_moment_get_one_cut(harness, monkeypatch):
+    started = []
+
+    async def start(chat_id, user_id, request, message):
+        started.append(user_id)
+        await asyncio.sleep(0.05)  # пока первый запускается, второй уже нажал
+        return f"job-{user_id}"
+
+    monkeypatch.setattr(harness.ctx.runner, "start", start)
+    monkeypatch.setattr(source_handlers, "fetch_video_info", lambda url: dict(VIDEO))
+    for user in (1, 2):
+        await harness.send("/start", user_id=user)
+        await harness.send(VIDEO["url"], user_id=user)
+        await harness.press("mode:auto", user_id=user)
+
+    await asyncio.gather(harness.press("job:start", user_id=1), harness.press("job:start", user_id=2))
+
+    assert len(started) == 1
+    assert any("нарезает другой ролик" in alert for alert in harness.session.alerts())
+    assert harness.ctx.runner.in_flight() == 0  # место возвращено, когда запуск закончился
+
+
+async def test_the_place_is_returned_when_the_launch_fails(harness, monkeypatch):
+    async def broken(*args, **kwargs):
+        raise RuntimeError("не запустилось")
+
+    monkeypatch.setattr(harness.ctx.runner, "start", broken)
+    await _open_auto(harness, monkeypatch)
+
+    await harness.press("job:start")
+
+    assert harness.ctx.runner.in_flight() == 0 and harness.ctx.busy_for(1) is None
+
+
+async def test_a_second_tap_on_start_does_not_launch_twice(harness, monkeypatch):
+    started = []
+
+    async def start(chat_id, user_id, request, message):
+        started.append(user_id)
+        await asyncio.sleep(0.05)
+        return "job-1"
+
+    monkeypatch.setattr(harness.ctx.runner, "start", start)
+    await _open_auto(harness, monkeypatch)
+
+    await asyncio.gather(harness.press("job:start"), harness.press("job:start"))
+
+    assert started == [1]
+    assert any("уже запускается" in alert for alert in harness.session.alerts())
+
+
+async def test_refresh_tells_whether_the_bot_is_free_yet(harness):
+    job = _occupy(harness, user_id=2, progress=60)
+    await harness.send("/start")
+
+    await harness.press("menu:refresh")
+
+    assert "60" in harness.session.last_alert()
+    assert [_styles(harness)[data] for data in SOURCE_BUTTONS] == [keyboards.DANGER] * 4
+
+    _release(harness, job)
+    await harness.press("menu:refresh")
+
+    assert "свободен" in harness.session.last_alert()
+    assert all(_styles(harness)[data] != keyboards.DANGER for data in MENU_BUTTONS)
+    assert "Бот сейчас занят" not in harness.session.last_text()
+
+
+async def test_a_bigger_limit_lets_a_second_person_work(harness, monkeypatch):
+    monkeypatch.setenv("MAX_JOBS", "2")
+    _occupy(harness, user_id=2)
+
+    await harness.send("/start")  # пользователь 1: места ещё есть
+    assert all(_styles(harness)[data] != keyboards.DANGER for data in MENU_BUTTONS)
+
+    _occupy(harness, user_id=1)  # но своя нарезка у него всё равно одна
+    await harness.send("/start")
+    assert [_styles(harness)[data] for data in SOURCE_BUTTONS] == [keyboards.DANGER] * 4
+
+
+async def test_the_bot_stays_busy_while_the_results_are_being_delivered(harness):
+    _occupy(harness, user_id=2, delivering=True)
+    mine = _occupy(harness, user_id=1, delivering=True)
+
+    await harness.send("/start")
+
+    text = harness.session.last_text()
+    assert "Идёт ваша нарезка" in text  # свою досылку не принимаем за чужую
+    assert f"job:cancel:{mine}" not in harness.session.buttons()  # готовую задачу уже не остановить
+    assert [_styles(harness)[data] for data in SOURCE_BUTTONS] == [keyboards.DANGER] * 4
+
+
+async def test_little_free_space_turns_the_menu_red_too(harness, monkeypatch):
+    monkeypatch.setattr(capacity, "free_bytes", lambda path: 1 * 1024**3)
+
+    await harness.send("/start")
+    assert [_styles(harness)[data] for data in SOURCE_BUTTONS] == [keyboards.DANGER] * 4
+    assert "мало места" in harness.session.last_text()
+
+    await harness.press("ask:link")
+    assert "места" in harness.session.last_alert()
+
+
+async def test_noise_during_a_busy_spell_shows_the_red_menu(harness):
+    _occupy(harness, user_id=2)
+
+    await harness.send("   ")
+
+    assert [_styles(harness)[data] for data in SOURCE_BUTTONS] == [keyboards.DANGER] * 4
+    assert "Бот сейчас занят" in harness.session.last_text()
+
+
+async def test_a_stale_button_during_a_busy_spell_returns_to_the_red_menu(harness):
+    _occupy(harness, user_id=2)
+
+    await harness.press("pick:3")
+
+    assert harness.session.last_alert() == texts.STALE
+    assert [_styles(harness)[data] for data in SOURCE_BUTTONS] == [keyboards.DANGER] * 4
+
+
+def test_busy_notices_and_alerts_are_valid_and_short():
+    from tests.rich_check import assert_valid_rich
+
+    for busy in (
+        Busy(Cause.MINE, progress=55.5, stage="Рендер клипа 3 из 8", job_id="abc"),
+        Busy(Cause.MINE, progress=100, stage="Готово"),
+        Busy(Cause.OTHERS, progress=0),
+        Busy(Cause.OTHERS, progress=99.6, stage="Скачивание видео"),
+        Busy(Cause.DISK),
+    ):
+        assert_valid_rich(texts.start(busy))
+        assert len(texts.busy_alert(busy)) <= 200  # помещается в окошко Telegram
+        assert "<" not in texts.busy_alert(busy)
 
 
 # ---------- обычный HTML вместо rich ----------
@@ -1728,9 +1987,11 @@ def test_no_command_filters_at_all(bot_settings):
 def test_bot_texts_never_point_to_commands():
     command = re.compile(r"(?<![\w/:.…])/[a-z]{3,}(?![\w/])")
     screens = [
-        texts.START, texts.HELP, texts.NUDGE, texts.REQUEST_LINK, texts.request_query(), texts.REQUEST_FILE,
+        texts.start(), texts.HELP, texts.NUDGE, texts.REQUEST_LINK, texts.request_query(), texts.REQUEST_FILE,
         texts.BAD_LINK, texts.STALE, texts.NOT_ALLOWED, texts.stats_text(1, 2, 3), texts.trends_home(),
-        texts.BUSY, texts.CANCELLED, texts.FILE_TOO_BIG, texts.NOT_A_VIDEO,
+        texts.CANCELLED, texts.FILE_TOO_BIG, texts.NOT_A_VIDEO,
+        texts.start(Busy(Cause.OTHERS, progress=40)), texts.start(Busy(Cause.MINE, progress=40, job_id="x")),
+        texts.start(Busy(Cause.DISK)),
     ]  # fmt: skip
     for screen in screens:
         plain = re.sub(r"<[^>]+>", "", screen)  # теги вроде </blockquote> — не команды
@@ -1738,14 +1999,14 @@ def test_bot_texts_never_point_to_commands():
 
 
 def test_main_menu_texts_use_only_documented_rich_tags():
-    for screen in (texts.START, texts.HELP, texts.REQUEST_LINK, texts.request_query(), texts.REQUEST_FILE, texts.BAD_LINK,
-                   texts.QUEUED_TEXT, texts.NUDGE, texts.BUSY, texts.CANCELLED, texts.stats_text(1, 2, 3), texts.trends_home()):  # fmt: skip
+    for screen in (texts.start(), texts.HELP, texts.REQUEST_LINK, texts.request_query(), texts.REQUEST_FILE, texts.BAD_LINK,
+                   texts.QUEUED_TEXT, texts.NUDGE, texts.CANCELLED, texts.stats_text(1, 2, 3), texts.trends_home()):  # fmt: skip
         assert_valid_rich(screen)
 
 
 def test_the_brand_is_renamed_everywhere_in_the_user_interface():
     assert texts.NAME == "TgRader Clipper"
-    for screen in (texts.START, texts.HELP):
+    for screen in (texts.start(), texts.HELP):
         assert "ClipBanner" not in screen
 
 

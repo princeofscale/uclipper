@@ -1,8 +1,9 @@
-"""Защита общего сервера, когда бот открыт для всех: сколько задач ждёт в очереди и сколько осталось места.
+"""Защита общего сервера, когда бот открыт для всех: сколько нарезок идёт одновременно и сколько осталось места.
 
-Бот живёт на одной машине с другими сервисами, нарезка идёт в один поток, а скачанные ролики занимают диск.
-Поэтому новая задача принимается, только пока очередь не заполнена и места хватает; иначе человек сразу получает
-понятный отказ, а не ждёт часами или роняет соседей по серверу. Пределы настраиваются в `.env` (0 — не ограничивать).
+Бот живёт на одной машине с другими сервисами, нарезка грузит процессор целиком, а скачанные ролики занимают диск.
+Поэтому по умолчанию бот ведёт **один** ролик за раз: пока он не готов (клипы не дошли до чата), остальным бот
+отвечает «занят», и новая задача принимается, только когда хватает места. Человек сразу видит причину (красное меню),
+а не ждёт часами и не роняет соседей по серверу. Пределы настраиваются в `.env` (0 — не ограничивать).
 """
 from __future__ import annotations
 
@@ -15,16 +16,13 @@ log = logging.getLogger(__name__)
 
 GB = 1024**3
 
-MAX_QUEUE_ENV = "MAX_QUEUE"
+MAX_JOBS_ENV = "MAX_JOBS"
 MIN_FREE_ENV = "MIN_FREE_GB"
 CACHE_LIMIT_ENV = "CACHE_LIMIT_GB"
 
-DEFAULT_MAX_QUEUE = 6  # задач одновременно: идущая и ждущие
+DEFAULT_MAX_JOBS = 1  # нарезок одновременно: один ролик за раз, остальным бот говорит «занят»
 DEFAULT_MIN_FREE_GB = 5.0  # меньше — новые задачи не берём
 DEFAULT_CACHE_LIMIT_GB = 12.0  # столько могут занимать скачанные источники
-
-QUEUE_FULL = "Сейчас очередь заполнена — попробуйте через несколько минут."
-DISK_LOW = "На сервере сейчас мало свободного места — попробуйте чуть позже."
 
 
 def _number_from_env(name: str, default: float) -> float:
@@ -39,9 +37,9 @@ def _number_from_env(name: str, default: float) -> float:
         return default
 
 
-def max_queue_from_env() -> int:
-    """Сколько задач бот держит одновременно (идущая и ждущие); 0 — без предела."""
-    return int(_number_from_env(MAX_QUEUE_ENV, DEFAULT_MAX_QUEUE))
+def max_jobs_from_env() -> int:
+    """Сколько нарезок бот ведёт одновременно (идущие, ждущие запуска и досылающие результат); 0 — без предела."""
+    return int(_number_from_env(MAX_JOBS_ENV, DEFAULT_MAX_JOBS))
 
 
 def min_free_bytes_from_env() -> int:
@@ -62,16 +60,14 @@ def free_bytes(path: Path) -> int | None:
         return None
 
 
-def capacity_problem(unfinished: int, workspace: Path) -> str | None:
-    """Почему сейчас нельзя принять ещё одну задачу (текст для человека) или `None`, если можно.
+def jobs_limit_reached(in_flight: int) -> bool:
+    """Занято ли всё: `in_flight` нарезок уже идёт, и новую брать нельзя."""
+    limit = max_jobs_from_env()
+    return bool(limit) and in_flight >= limit
 
-    `unfinished` — сколько задач уже идёт или ждёт. Не смогли измерить диск — не мешаем работать.
-    """
-    limit = max_queue_from_env()
-    if limit and unfinished >= limit:
-        return QUEUE_FULL
+
+def disk_is_low(workspace: Path) -> bool:
+    """Мало ли места на диске для новой задачи. Не смогли измерить — не мешаем работать."""
     needed = min_free_bytes_from_env()
     free = free_bytes(workspace) if needed else None
-    if free is not None and free < needed:
-        return DISK_LOW
-    return None
+    return free is not None and free < needed

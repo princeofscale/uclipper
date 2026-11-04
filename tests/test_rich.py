@@ -160,9 +160,9 @@ def _all_static_screens() -> list[str]:
     done = JobState(id="x", status=JobStatus.DONE, archive_name="clips.zip")
     running = JobState(id="y", status=JobStatus.RUNNING, stage="Рендер <1>", progress=42, log=["a < b", "c"])
     screens = [
-        texts.START, texts.HELP, texts.REQUEST_LINK, texts.REQUEST_FILE, texts.NUDGE, texts.FETCHING,
+        texts.start(), texts.HELP, texts.REQUEST_LINK, texts.REQUEST_FILE, texts.NUDGE, texts.FETCHING,
         texts.BAD_LINK, texts.DOWNLOADING_FILE, texts.FILE_TOO_BIG, texts.FILE_BAD.format(error="ошибка"),
-        texts.NOT_A_VIDEO, texts.BUSY, texts.QUEUED_TEXT, texts.CANCELLED, texts.BANNER_EMPTY,
+        texts.NOT_A_VIDEO, texts.QUEUED_TEXT, texts.CANCELLED, texts.BANNER_EMPTY,
         texts.error_text("плохо <b>"), texts.search_cards([{"title": "A & B", "uploader": "U", "duration": 90}]),
         texts.search_cards([
             {"platform": "youtube", "title": "Один <i>", "uploader": "U & V", "duration": 90},
@@ -313,7 +313,7 @@ def test_search_cards_mark_the_platform_of_every_result():
 
 def test_start_and_help_list_every_platform():
     for platform in PLATFORMS:
-        assert platform.title in texts.START
+        assert platform.title in texts.start()
         assert platform.title in texts.HELP
         assert platform.title in texts.BAD_LINK
         assert platform.title in texts.REQUEST_LINK

@@ -28,6 +28,7 @@ from app.bot.context import (
     SEARCH_KEY,
     AppContext,
     edit_or_send,
+    refuse_busy,
     reset_dialog,
     safe_answer,
 )
@@ -89,6 +90,10 @@ async def cb_trends(callback: CallbackQuery, state: FSMContext, ctx: AppContext)
     choice = EVERYWHERE if data == "screen:trends" else data.split(":", 1)[1]
     if scope(choice, TRENDING) is None:
         await safe_answer(callback, "Такой площадки нет — выберите из кнопок", alert=True)
+        return
+    busy = ctx.busy_for(callback.from_user.id)
+    if busy is not None:  # выбрать ролик из трендов всё равно не дадут: нарезка сейчас недоступна
+        await refuse_busy(callback, state, ctx, busy)
         return
     await safe_answer(callback)
     await reset_dialog(state, ctx, callback.from_user.id)

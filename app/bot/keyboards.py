@@ -20,6 +20,7 @@ from aiogram.types import InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from app.bot import texts
+from app.bot.busy import Busy, Cause
 from app.bot.options import CHOICES
 from app.bot.steppers import Stepper
 from app.models import ClipSettings, Draft, Goal
@@ -32,6 +33,7 @@ SUCCESS = ButtonStyle.SUCCESS.value
 DANGER = ButtonStyle.DANGER.value
 
 MENU = "screen:menu"
+REFRESH = "menu:refresh"  # «Проверить»: узнать, освободился ли бот
 
 
 Chip = tuple[str, str, str | None]  # (подпись, callback_data, цвет)
@@ -63,16 +65,31 @@ def scope_chips(options: Sequence[Platform], selected: str, make_data: Callable[
 # ---------- главное меню и навигация ----------
 
 
-def main_menu() -> InlineKeyboardMarkup:
+def main_menu(busy: Busy | None = None) -> InlineKeyboardMarkup:
+    """Главное меню. Пока бот занят (`busy`), четыре кнопки нового ролика красные и с замком: нажатие только объясняет
+    причину. Справочные кнопки работают всегда, а сверху появляются «Проверить» и (для своей нарезки) «Остановить»."""
     builder = InlineKeyboardBuilder()
-    _add(builder, "🔗 Прислать ссылку", "ask:link", PRIMARY)
-    _add(builder, "🔍 Найти по названию", "ask:query")
-    _add(builder, "📁 Загрузить файл", "ask:file")
-    _add(builder, "🔥 В тренде", "screen:trends")
+    rows: list[int] = []
+    if busy is not None:
+        if busy.cause is Cause.MINE and busy.job_id:
+            _add(builder, "⏹ Остановить", f"job:cancel:{busy.job_id}", DANGER)
+        _add(builder, "🔄 Проверить", REFRESH)
+        rows.append(2 if busy.cause is Cause.MINE and busy.job_id else 1)
+
+    def source(icon: str, caption: str, data: str, *, main: bool = False) -> None:
+        if busy is None:
+            _add(builder, f"{icon} {caption}", data, PRIMARY if main else None)
+        else:
+            _add(builder, f"🔒 {caption}", data, DANGER)
+
+    source("🔗", "Прислать ссылку", "ask:link", main=True)
+    source("🔍", "Найти по названию", "ask:query")
+    source("📁", "Загрузить файл", "ask:file")
+    source("🔥", "В тренде", "screen:trends")
     _add(builder, "🎬 Баннеры", "screen:banners")
     _add(builder, "📊 Статистика", "screen:stats")
     _add(builder, "❓ Справка", "screen:help")
-    builder.adjust(1, 2, 2, 2)
+    builder.adjust(*rows, 1, 2, 2, 2)
     return builder.as_markup()
 
 

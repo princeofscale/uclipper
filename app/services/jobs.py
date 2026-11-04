@@ -110,11 +110,6 @@ class JobManager:
         self._log(job_id, "Пользователь отменил задачу")
         return True
 
-    def unfinished(self) -> int:
-        """Сколько задач ещё не закончилось: идёт сейчас или ждёт очереди."""
-        with self._lock:
-            return sum(1 for state in self._jobs.values() if state.status in (JobStatus.QUEUED, JobStatus.RUNNING))
-
     def ahead_of(self, job_id: str) -> int:
         """Сколько задач впереди этой: идущая сейчас и ждущие раньше неё. 0 — её очередь (или такой задачи нет)."""
         with self._lock:

@@ -10,20 +10,23 @@ from aiogram import Router
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 
-from app.bot import keyboards, texts
-from app.bot.context import AppContext, edit_or_send, reset_dialog, safe_answer, show
+from app.bot import texts
+from app.bot.context import AppContext, edit_or_send, menu_view, reset_dialog, safe_answer, show
 
 router = Router(name="fallback")
 
 
 @router.message()
-async def on_unknown_message(message: Message, state: FSMContext) -> None:
-    text = texts.START if await state.get_state() is None else texts.NUDGE
-    await show(message, text, keyboards.main_menu())
+async def on_unknown_message(message: Message, state: FSMContext, ctx: AppContext) -> None:
+    html, markup = menu_view(ctx, message.from_user.id)
+    if ctx.busy_for(message.from_user.id) is None and await state.get_state() is not None:
+        html = texts.NUDGE  # меню уже перед глазами у человека: коротко напоминаем про кнопки
+    await show(message, html, markup)
 
 
 @router.callback_query()
 async def on_stale_callback(callback: CallbackQuery, state: FSMContext, ctx: AppContext) -> None:
     await safe_answer(callback, texts.STALE)
     await reset_dialog(state, ctx, callback.from_user.id)
-    await edit_or_send(callback, texts.START, keyboards.main_menu())
+    html, markup = menu_view(ctx, callback.from_user.id)
+    await edit_or_send(callback, html, markup)

@@ -10,6 +10,7 @@ from aiogram.types import CallbackQuery, Message
 from app.bot import keyboards, texts
 from app.bot.context import (
     AppContext,
+    menu_view,
     need_draft,
     replace,
     safe_answer,
@@ -17,7 +18,6 @@ from app.bot.context import (
     show,
 )
 from app.bot.states import Flow
-from app.services.capacity import capacity_problem
 
 log = logging.getLogger(__name__)
 router = Router(name="jobs")
@@ -25,38 +25,43 @@ router = Router(name="jobs")
 
 @router.callback_query(F.data == "job:start")
 async def cb_start(callback: CallbackQuery, state: FSMContext, ctx: AppContext) -> None:
-    """Проверяет черновик и ставит задачу в очередь."""
+    """Проверяет черновик и запускает нарезку, если бот свободен."""
     draft = await need_draft(callback, state)
     if draft is None:
         return
     user_id = callback.from_user.id
-    if ctx.runner.active_for_user(user_id):
-        await safe_answer(callback, "Предыдущая нарезка ещё идёт — дождитесь её или нажмите «Остановить»", alert=True)
+    busy = ctx.busy_for(user_id)
+    if busy is not None:
+        # Бот ведёт один ролик за раз. План остаётся на экране: когда бот освободится, достаточно нажать ещё раз.
+        await safe_answer(callback, texts.busy_alert(busy), alert=True)
         return
     try:
         request = draft.to_request()
     except ValueError as error:
         await safe_answer(callback, str(error).split("\n")[-1], alert=True)
         return
-    # Бот открыт для всех, а сервер общий: при полной очереди или нехватке места отказываем сразу и по-человечески.
-    problem = capacity_problem(ctx.manager.unfinished(), ctx.settings.workspace_dir)
-    if problem is not None:
-        await safe_answer(callback, problem, alert=True)
-        return
 
-    await safe_answer(callback)
-    chat_id = callback.message.chat.id if callback.message is not None else user_id
-    progress = await send_html(callback.bot, chat_id, texts.QUEUED_TEXT)
-    await state.set_state(Flow.running)
+    # Место занимаем сразу, до первого `await`: пока бот отвечает Telegram, задачи ещё нет, и без заявки двое,
+    # нажавшие в один момент, прошли бы проверку оба.
+    ctx.runner.claim(user_id)
     try:
-        await ctx.runner.start(chat_id, user_id, request, progress)
-    except Exception:  # noqa: BLE001 — не оставляем пользователя без ответа
-        log.exception("Не удалось запустить задачу")
-        await replace(
-            progress, texts.error_text("Не получилось запустить нарезку. Попробуйте ещё раз."), keyboards.back_to_menu()
-        )
-        await state.set_state(Flow.editing)
-        return
+        await safe_answer(callback)
+        chat_id = callback.message.chat.id if callback.message is not None else user_id
+        progress = await send_html(callback.bot, chat_id, texts.QUEUED_TEXT)
+        await state.set_state(Flow.running)
+        try:
+            await ctx.runner.start(chat_id, user_id, request, progress)
+        except Exception:  # noqa: BLE001 — не оставляем пользователя без ответа
+            log.exception("Не удалось запустить задачу")
+            await replace(
+                progress,
+                texts.error_text("Не получилось запустить нарезку. Попробуйте ещё раз."),
+                keyboards.back_to_menu(),
+            )
+            await state.set_state(Flow.editing)
+            return
+    finally:
+        ctx.runner.release(user_id)  # задача уже занимает место сама, а при сбое место возвращается
     # Экран с планом остаётся в чате как история, но кнопки с него убираем: нажимать их уже незачем.
     if callback.message is not None:
         try:
@@ -77,6 +82,7 @@ async def _has_active_job(message: Message, ctx: AppContext) -> bool:
 
 
 @router.message(_has_active_job)
-async def on_busy_message(message: Message) -> None:
-    """Пока идёт нарезка, другие сообщения не мешают: подсказываем, как остановить."""
-    await show(message, texts.BUSY)
+async def on_busy_message(message: Message, ctx: AppContext) -> None:
+    """Пока идёт нарезка, другие сообщения не мешают: показываем, как она продвигается, и кнопку «Остановить»."""
+    html, markup = menu_view(ctx, message.from_user.id)
+    await show(message, html, markup)

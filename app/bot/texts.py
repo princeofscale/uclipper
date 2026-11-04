@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
+from app.bot.busy import Busy, Cause
 from app.bot.options import CHOICES
 from app.bot.rich import esc
 from app.bot.steppers import Stepper
@@ -29,17 +30,69 @@ MAX_HOURS = MAX_SOURCE_SECONDS // 3600
 
 # ---------- главное меню и справка ----------
 
-START = f"""\
+def start(busy: Busy | None = None) -> str:
+    """Главное меню. Когда бот занят, под вступлением стоит пояснение, почему кнопки красные (`busy_notice`)."""
+    notice = busy_notice(busy) if busy is not None else ""
+    return f"""\
 <h1>🎬 {NAME}</h1>
 <p>Нарезаю длинные ролики на вертикальные клипы <b>9:16</b> для <b>TikTok</b>, <b>Shorts</b> и <b>Reels</b> — и вклеиваю в них рекламный баннер.</p>
 <p>🌐 Работаю с: {PLATFORM_LIST}</p>
-<hr/>
+{notice}<hr/>
 <ul>
 <li>🤖 <b>Авто</b> — сам подберу число клипов, длину и самые яркие моменты</li>
 <li>🛠 <b>Вручную</b> — каждый параметр в ваших руках</li>
 <li>🔥 <b>В тренде</b> — что смотрят прямо сейчас, и сразу в нарезку</li>
 </ul>
 <blockquote>👇 Пришлите <b>ссылку</b> на ролик, <b>название</b> или <b>видеофайл</b> — дальше всё кнопками.</blockquote>"""
+
+
+
+def _busy_bar(progress: float) -> str:
+    return f"<code>{progress_bar(progress)}</code> <b>{progress:.0f}%</b>"
+
+
+def busy_notice(busy: Busy) -> str:
+    """Пояснение в главном меню: почему кнопки красные и что делать."""
+    if busy.cause is Cause.MINE:
+        if busy.job_id is None and busy.progress >= 100:
+            doing = "Отправляю готовые клипы в чат…"
+        else:
+            doing = esc(busy.stage) if busy.stage else "Работаю над вашим роликом…"
+        return (
+            "<blockquote>⏳ <b>Идёт ваша нарезка</b><br/>"
+            f"{_busy_bar(busy.progress)}<br/>{doing}<br/>"
+            "Новый ролик можно взять, когда эта закончится.</blockquote>"
+        )
+    if busy.cause is Cause.OTHERS:
+        return (
+            "<blockquote>🚧 <b>Бот сейчас занят</b><br/>"
+            f"Он нарезает ролик другого человека: {_busy_bar(busy.progress)}<br/>"
+            "Беру по одному ролику, чтобы клипы получались быстро и без сбоев. Загляните через пару минут — "
+            "кнопка «🔄 Проверить» покажет, свободно ли.</blockquote>"
+        )
+    return (
+        "<blockquote>💾 <b>На сервере мало места</b><br/>"
+        "Новые ролики пока не принимаю: нужно дождаться, пока место освободится. "
+        "Кнопка «🔄 Проверить» покажет, когда можно.</blockquote>"
+    )
+
+
+def busy_alert(busy: Busy) -> str:
+    """Всплывающая подсказка на красной кнопке (до 200 знаков, без разметки)."""
+    if busy.cause is Cause.MINE:
+        if busy.job_id is None and busy.progress >= 100:
+            return "⏳ Ваши клипы ещё отправляются — через минуту можно начинать новую нарезку."
+        if busy.job_id is None and busy.progress <= 0:
+            return "⏳ Нарезка уже запускается — ещё секунду."
+        stop = " или нажмите «⏹ Остановить» под прогрессом" if busy.job_id else ""
+        return f"⏳ Ваша нарезка ещё идёт ({busy.progress:.0f}%). Дождитесь её{stop}."
+    if busy.cause is Cause.OTHERS:
+        return (
+            f"🚧 Сейчас бот нарезает другой ролик ({busy.progress:.0f}%) — он берёт по одному. "
+            "Подождите немного и нажмите «🔄 Проверить»."
+        )
+    return "💾 На сервере сейчас мало места — попробуйте чуть позже."
+
 
 HELP = f"""\
 <h2>❓ Как это работает</h2>
@@ -107,10 +160,10 @@ DOWNLOADING_FILE = "<p>⏳ Скачиваю видеофайл…</p>"
 FILE_TOO_BIG = "<p>📦 Файл больше <b>20 МБ</b> — обычный бот такой не примет.</p><p>Пришлите ссылку на ролик: качество выберем сами.</p>"
 FILE_BAD = "<p>😕 Не получилось прочитать видеофайл: {error}</p><p>Пришлите другой файл или ссылку на ролик.</p>"
 NOT_A_VIDEO = "<p>🙅 Это не видеофайл. Подойдут <b>.mp4</b>, <b>.mov</b> и <b>.mkv</b> — или пришлите ссылку на ролик.</p>"
-BUSY = "<p>⏳ Сейчас идёт нарезка. Дождитесь результата или нажмите <b>«⏹ Остановить»</b> под прогрессом.</p>"
 
 # Короткие подсказки для всплывающих окошек (без разметки: Telegram показывает их как есть).
 STALE = "Эта кнопка уже не работает. Начнём заново 👇"
+NOW_FREE = "✅ Бот свободен — присылайте ролик!"
 LOST_DRAFT = "Ролик потерялся — пришлите его заново"
 NEED_VIDEO = "Сначала пришлите ролик — настройки применяются к нему"
 

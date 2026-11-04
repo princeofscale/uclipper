@@ -9,9 +9,10 @@ import logging
 from dataclasses import dataclass, field
 
 from aiogram.fsm.context import FSMContext
-from aiogram.types import CallbackQuery
+from aiogram.types import CallbackQuery, InlineKeyboardMarkup
 
-from app.bot import texts
+from app.bot import keyboards, texts
+from app.bot.busy import Busy, Cause
 from app.bot.render import (  # noqa: F401 — реэкспорт
     edit_html,
     edit_or_send,
@@ -23,8 +24,9 @@ from app.bot.render import (  # noqa: F401 — реэкспорт
 from app.bot.runner import JobRunner
 from app.bot.states import Flow
 from app.config import Settings
-from app.models import ClipSettings, Draft
+from app.models import ClipSettings, Draft, JobStatus
 from app.services.banner_manager import BannerInfo, default_banner
+from app.services.capacity import disk_is_low, jobs_limit_reached
 from app.services.jobs import JobManager
 from app.services.trends import TrendCache
 from app.services.user_store import UserStore
@@ -61,6 +63,32 @@ class AppContext:
         banner = self.banner()
         return banner.duration if banner is not None and banner.duration else None
 
+    def busy_for(self, user_id: int) -> Busy | None:
+        """Почему этому человеку сейчас нельзя начать нарезку, или `None`, если можно.
+
+        Бот ведёт один ролик за раз (`MAX_JOBS`), а у каждого человека не больше одной нарезки; кроме того, нарезки
+        не принимаются, пока на диске мало места. Занятость длится до тех пор, пока клипы не доставлены в чат.
+        """
+        runner = self.runner
+        job_id = runner.active_for_user(user_id)
+        if job_id is not None:
+            state = runner.state_of(job_id)
+            stoppable = state is None or state.status in (JobStatus.QUEUED, JobStatus.RUNNING)  # готовую уже не остановить
+            return Busy(
+                Cause.MINE,
+                progress=state.progress if state else 0.0,
+                stage=state.stage if state else "",
+                job_id=job_id if stoppable else None,
+            )
+        if runner.has_claim(user_id):  # нажал «Нарезать» дважды: первый запуск ещё идёт
+            return Busy(Cause.MINE, stage="Запускаю")
+        if jobs_limit_reached(runner.in_flight()):
+            state = runner.oldest_state()
+            return Busy(Cause.OTHERS, progress=state.progress if state else 0.0, stage=state.stage if state else "")
+        if disk_is_low(self.settings.workspace_dir):
+            return Busy(Cause.DISK)
+        return None
+
 
 # ---------- черновик и диалог ----------
 
@@ -95,6 +123,23 @@ async def reset_dialog(state: FSMContext, ctx: AppContext, user_id: int) -> None
     busy = ctx.runner is not None and ctx.runner.active_for_user(user_id)
     await state.clear()
     await state.set_state(Flow.running if busy else Flow.waiting_link)
+
+
+def menu_view(ctx: AppContext, user_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    """Главное меню таким, каким его сейчас надо показать: свободное или красное с пояснением, почему бот занят."""
+    busy = ctx.busy_for(user_id)
+    return texts.start(busy), keyboards.main_menu(busy)
+
+
+async def refuse_busy(callback: CallbackQuery, state: FSMContext, ctx: AppContext, busy: Busy) -> None:
+    """Нажата кнопка, которая сейчас не работает: всплывающее окно объясняет причину, на экране — актуальное меню.
+
+    Кнопка могла остаться на старом экране, пока бот был свободен, поэтому меню перерисовывается заново.
+    """
+    await safe_answer(callback, texts.busy_alert(busy), alert=True)
+    await reset_dialog(state, ctx, callback.from_user.id)
+    html, markup = menu_view(ctx, callback.from_user.id)
+    await edit_or_send(callback, html, markup)
 
 
 async def need_draft(callback: CallbackQuery, state: FSMContext) -> Draft | None:

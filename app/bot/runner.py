@@ -50,7 +50,8 @@ class JobRunner:
         self._latest: dict[str, JobState] = {}
         self._events: dict[str, asyncio.Event] = {}
         self._loop = asyncio.get_running_loop()
-        self._jobs: dict[str, RunningJob] = {}
+        self._jobs: dict[str, RunningJob] = {}  # по порядку запуска; задача уходит отсюда, когда клипы доставлены
+        self._claims: set[int] = set()  # люди, нажавшие «Нарезать»: место занято, а сама задача ещё создаётся
 
     # ---------- запуск ----------
 
@@ -89,10 +90,44 @@ class JobRunner:
         return self._manager.cancel(job_id)
 
     def active_for_user(self, user_id: int) -> str | None:
-        """id незаконченной задачи пользователя (у бота одна очередь, второй запуск не нужен)."""
+        """id нарезки человека, которая ещё не закончена: идёт сейчас или бот досылает ему готовые клипы."""
         for job_id, running in self._jobs.items():
-            if running.user_id == user_id and not running.finished:
+            if running.user_id == user_id:
                 return job_id
+        return None
+
+    # ---------- занятость: бот ведёт ограниченное число нарезок сразу (по умолчанию одну) ----------
+
+    def claim(self, user_id: int) -> None:
+        """Занимает место за человеком, нажавшим «Нарезать».
+
+        Зовётся синхронно сразу после проверки «свободно ли»: пока обработчик ждёт ответа Telegram, задачи ещё нет,
+        и без заявки двое, нажавшие одновременно, прошли бы проверку оба.
+        """
+        self._claims.add(user_id)
+
+    def release(self, user_id: int) -> None:
+        """Снимает заявку: задача уже создана (она занимает место сама) или запуск не удался."""
+        self._claims.discard(user_id)
+
+    def has_claim(self, user_id: int) -> bool:
+        return user_id in self._claims
+
+    def in_flight(self) -> int:
+        """Сколько нарезок занимают бот: идущие, досылающие клипы и только что принятые."""
+        return len(self._jobs) + len(self._claims)
+
+    def state_of(self, job_id: str) -> JobState | None:
+        """Свежее состояние живой нарезки (`None`, если такой уже нет)."""
+        running = self._jobs.get(job_id)
+        if running is None:
+            return None
+        return self._latest.get(job_id) or running.state
+
+    def oldest_state(self) -> JobState | None:
+        """Состояние самой давней из живых нарезок: её прогресс видят те, кому бот сейчас отказывает."""
+        for job_id in self._jobs:
+            return self.state_of(job_id)
         return None
 
     # ---------- слежение ----------

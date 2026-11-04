@@ -14,7 +14,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 
 from app.bot import keyboards, texts
-from app.bot.context import SCOPE_KEY, AppContext, edit_or_send, reset_dialog, safe_answer
+from app.bot.context import SCOPE_KEY, AppContext, edit_or_send, menu_view, refuse_busy, reset_dialog, safe_answer
 from app.bot.states import Flow
 from app.services.platforms import EVERYWHERE, SEARCHABLE, scope
 
@@ -23,9 +23,10 @@ router = Router(name="common")
 
 
 async def open_menu(event: Message | CallbackQuery, state: FSMContext, ctx: AppContext) -> None:
-    """Главное меню с чистого листа. Идущая нарезка не прерывается."""
+    """Главное меню с чистого листа. Идущая нарезка не прерывается; если бот занят, меню красное и объясняет почему."""
     await reset_dialog(state, ctx, event.from_user.id)
-    await edit_or_send(event, texts.START, keyboards.main_menu())
+    html, markup = menu_view(ctx, event.from_user.id)
+    await edit_or_send(event, html, markup)
 
 
 @router.message(F.text.startswith("/"))
@@ -37,6 +38,14 @@ async def on_command(message: Message, state: FSMContext, ctx: AppContext) -> No
 @router.callback_query(F.data == "screen:menu")
 async def cb_menu(callback: CallbackQuery, state: FSMContext, ctx: AppContext) -> None:
     await safe_answer(callback)
+    await open_menu(callback, state, ctx)
+
+
+@router.callback_query(F.data == keyboards.REFRESH)
+async def cb_refresh(callback: CallbackQuery, state: FSMContext, ctx: AppContext) -> None:
+    """«🔄 Проверить»: освободился ли бот. Ответ — всплывающая подсказка, а меню перерисовывается по текущему положению."""
+    busy = ctx.busy_for(callback.from_user.id)
+    await safe_answer(callback, texts.busy_alert(busy) if busy is not None else texts.NOW_FREE)
     await open_menu(callback, state, ctx)
 
 
@@ -53,11 +62,17 @@ async def cb_stats(callback: CallbackQuery, ctx: AppContext) -> None:
     await edit_or_send(callback, texts.stats_text(clips, jobs, callback.from_user.id), keyboards.back_to_menu())
 
 
-async def _ask(callback: CallbackQuery, state: FSMContext, ctx: AppContext, flow, html: str, markup=None) -> None:
+async def _ask(callback: CallbackQuery, state: FSMContext, ctx: AppContext, flow, html: str, markup=None) -> bool:
+    """Открывает экран ввода (ссылка, название, файл). `False` — бот занят: человек получил объяснение, а не экран."""
+    busy = ctx.busy_for(callback.from_user.id)
+    if busy is not None:
+        await refuse_busy(callback, state, ctx, busy)
+        return False
     await safe_answer(callback)
     await reset_dialog(state, ctx, callback.from_user.id)
     await state.set_state(flow)
     await edit_or_send(callback, html, markup or keyboards.back_to_menu())
+    return True
 
 
 @router.callback_query(F.data == "ask:link")
@@ -67,8 +82,8 @@ async def cb_ask_link(callback: CallbackQuery, state: FSMContext, ctx: AppContex
 
 async def ask_query(callback: CallbackQuery, state: FSMContext, ctx: AppContext, choice: str = EVERYWHERE) -> None:
     """Экран «Что искать?» с выбранной площадкой; выбор запоминается до следующего запроса."""
-    await _ask(callback, state, ctx, Flow.waiting_query, texts.request_query(choice), keyboards.query_prompt(choice))
-    await state.update_data({SCOPE_KEY: choice})
+    if await _ask(callback, state, ctx, Flow.waiting_query, texts.request_query(choice), keyboards.query_prompt(choice)):
+        await state.update_data({SCOPE_KEY: choice})
 
 
 @router.callback_query(F.data == "ask:query")

@@ -1,4 +1,4 @@
-"""Защита общего сервера при открытом доступе: длина очереди, место на диске, размер кеша и учёт задач."""
+"""Защита общего сервера при открытом доступе: сколько нарезок идёт сразу, место на диске, размер кеша и учёт задач."""
 from __future__ import annotations
 
 import os
@@ -11,12 +11,13 @@ from app.models import JobStatus
 from app.services import capacity
 from app.services.capacity import (
     DEFAULT_CACHE_LIMIT_GB,
-    DEFAULT_MAX_QUEUE,
+    DEFAULT_MAX_JOBS,
     DEFAULT_MIN_FREE_GB,
     cache_limit_bytes_from_env,
-    capacity_problem,
+    disk_is_low,
     free_bytes,
-    max_queue_from_env,
+    jobs_limit_reached,
+    max_jobs_from_env,
     min_free_bytes_from_env,
 )
 from app.services.janitor import enforce_cache_limit
@@ -28,7 +29,7 @@ HOUR = 3600
 
 @pytest.fixture(autouse=True)
 def clean_env(monkeypatch):
-    for name in ("MAX_QUEUE", "MIN_FREE_GB", "CACHE_LIMIT_GB"):
+    for name in ("MAX_JOBS", "MIN_FREE_GB", "CACHE_LIMIT_GB"):
         monkeypatch.delenv(name, raising=False)
 
 
@@ -49,18 +50,18 @@ def free(monkeypatch, gigabytes: float | None) -> None:
 
 
 def test_limits_have_sane_defaults():
-    assert max_queue_from_env() == DEFAULT_MAX_QUEUE == 6
+    assert max_jobs_from_env() == DEFAULT_MAX_JOBS == 1  # бот нарезает один ролик за раз
     assert min_free_bytes_from_env() == int(DEFAULT_MIN_FREE_GB * GB)
     assert cache_limit_bytes_from_env() == int(DEFAULT_CACHE_LIMIT_GB * GB)
 
 
 @pytest.mark.parametrize(
     ("raw", "expected"),
-    [("3", 3), (" 10 ", 10), ("0", 0), ("-4", 0), ("много", DEFAULT_MAX_QUEUE), ("", DEFAULT_MAX_QUEUE), ("2,9", 2)],
+    [("3", 3), (" 10 ", 10), ("0", 0), ("-4", 0), ("много", DEFAULT_MAX_JOBS), ("", DEFAULT_MAX_JOBS), ("2,9", 2)],
 )
-def test_max_queue_reads_the_environment(monkeypatch, raw, expected):
-    monkeypatch.setenv("MAX_QUEUE", raw)
-    assert max_queue_from_env() == expected
+def test_max_jobs_reads_the_environment(monkeypatch, raw, expected):
+    monkeypatch.setenv("MAX_JOBS", raw)
+    assert max_jobs_from_env() == expected
 
 
 def test_disk_limits_accept_fractions_and_zero_switches_them_off(monkeypatch):
@@ -80,61 +81,38 @@ def test_free_bytes_measures_a_real_folder_and_survives_a_missing_one(tmp_path):
 # ---------- можно ли принять ещё одну задачу ----------
 
 
-def test_there_is_no_problem_while_there_is_room(monkeypatch, tmp_path):
-    free(monkeypatch, 30)
-    assert capacity_problem(0, tmp_path) is None
-    assert capacity_problem(DEFAULT_MAX_QUEUE - 1, tmp_path) is None  # одно место ещё свободно
+def test_one_job_at_a_time_by_default():
+    assert not jobs_limit_reached(0)
+    assert jobs_limit_reached(1)  # одна уже идёт — вторую не берём
+    assert jobs_limit_reached(5)
 
 
-def test_a_full_queue_is_refused_politely(monkeypatch, tmp_path):
-    free(monkeypatch, 30)
-
-    problem = capacity_problem(DEFAULT_MAX_QUEUE, tmp_path)
-
-    assert problem and "очередь" in problem.lower() and "попробуйте" in problem
-    assert len(problem) <= 200  # помещается в окошко-оповещение Telegram
-    assert capacity_problem(DEFAULT_MAX_QUEUE + 5, tmp_path) == problem
+def test_the_jobs_limit_follows_the_environment(monkeypatch):
+    monkeypatch.setenv("MAX_JOBS", "2")
+    assert not jobs_limit_reached(1) and jobs_limit_reached(2)
+    monkeypatch.setenv("MAX_JOBS", "0")  # 0 — без предела
+    assert not jobs_limit_reached(500)
 
 
-def test_the_queue_limit_follows_the_environment(monkeypatch, tmp_path):
-    free(monkeypatch, 30)
-    monkeypatch.setenv("MAX_QUEUE", "2")
-    assert capacity_problem(1, tmp_path) is None and capacity_problem(2, tmp_path)
-    monkeypatch.setenv("MAX_QUEUE", "0")  # 0 — очередь не ограничена
-    assert capacity_problem(500, tmp_path) is None
-
-
-def test_little_free_space_is_refused_politely(monkeypatch, tmp_path):
+def test_little_free_space_is_noticed(monkeypatch, tmp_path):
     free(monkeypatch, DEFAULT_MIN_FREE_GB - 0.1)
-
-    problem = capacity_problem(0, tmp_path)
-
-    assert problem and "места" in problem and "попробуйте" in problem
-    assert len(problem) <= 200
+    assert disk_is_low(tmp_path)
     free(monkeypatch, DEFAULT_MIN_FREE_GB)  # ровно столько, сколько нужно, — ещё можно
-    assert capacity_problem(0, tmp_path) is None
+    assert not disk_is_low(tmp_path)
 
 
 def test_the_free_space_limit_can_be_switched_off(monkeypatch, tmp_path):
     free(monkeypatch, 0.1)
     monkeypatch.setenv("MIN_FREE_GB", "0")
-    assert capacity_problem(0, tmp_path) is None
+    assert not disk_is_low(tmp_path)
 
 
 def test_when_the_disk_cannot_be_measured_work_goes_on(monkeypatch, tmp_path):
     free(monkeypatch, None)
-    assert capacity_problem(0, tmp_path) is None
+    assert not disk_is_low(tmp_path)
 
 
 # ---------- учёт задач ----------
-
-
-def test_unfinished_counts_waiting_and_running_jobs(manager):
-    waiting, running, done = manager._create(), manager._create(), manager._create()  # noqa: SLF001
-    manager._update(running, status=JobStatus.RUNNING)  # noqa: SLF001
-    manager._update(done, status=JobStatus.DONE)  # noqa: SLF001
-    assert manager.get(waiting).status is JobStatus.QUEUED
-    assert manager.unfinished() == 2
 
 
 def test_ahead_of_counts_the_running_job_and_those_who_came_earlier(manager):
@@ -155,7 +133,7 @@ def test_a_delivered_job_is_forgotten_so_that_memory_does_not_grow(manager):
 
     manager.discard(job)
 
-    assert manager.get(job) is None and not folder.exists() and manager.unfinished() == 0
+    assert manager.get(job) is None and not folder.exists()
 
 
 def test_a_job_cancelled_in_the_queue_ends_at_once_and_never_runs(manager):
@@ -164,7 +142,7 @@ def test_a_job_cancelled_in_the_queue_ends_at_once_and_never_runs(manager):
     assert manager.cancel(job) is True
 
     state = manager.get(job)
-    assert state.status is JobStatus.CANCELLED and manager.unfinished() == 0
+    assert state.status is JobStatus.CANCELLED
     assert manager.cancel(job) is False  # уже закончилась
     manager._worker(None, job, None, None)  # noqa: SLF001 — дошла очередь: запрос даже не читается
     assert manager.get(job).status is JobStatus.CANCELLED

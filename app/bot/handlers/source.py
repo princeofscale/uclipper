@@ -24,6 +24,7 @@ from app.bot.context import (
     SEARCH_KEY,
     AppContext,
     edit_or_send,
+    menu_view,
     put_draft,
     replace,
     safe_answer,
@@ -115,8 +116,23 @@ async def _not_busy(message: Message, ctx: AppContext) -> bool:
     return not ctx.runner.active_for_user(message.from_user.id)
 
 
+async def _refuse_while_busy(message: Message, ctx: AppContext) -> bool:
+    """Бот ведёт чужую нарезку (или на диске мало места): ролик не принимаем, а показываем красное меню с причиной.
+
+    Диалог не сбрасывается: если человек перед этим настраивал свой ролик, черновик ждёт его на прежнем экране.
+    Числа для настроек сюда не попадают — `_accepts_source` пропускает с экрана настроек только ссылки.
+    """
+    if ctx.busy_for(message.from_user.id) is None:
+        return False
+    html, markup = menu_view(ctx, message.from_user.id)
+    await show(message, html, markup)
+    return True
+
+
 @router.message(_accepts_source, F.text)
 async def on_text(message: Message, state: FSMContext, ctx: AppContext) -> None:
+    if await _refuse_while_busy(message, ctx):
+        return
     text = (message.text or "").strip()
     source = identify(text)
     if source is not None:
@@ -247,6 +263,8 @@ async def on_pick(callback: CallbackQuery, state: FSMContext, ctx: AppContext) -
 @router.message(_not_busy, F.video | F.document | F.animation)
 async def on_file(message: Message, state: FSMContext, ctx: AppContext) -> None:
     """Приём видеофайла: до 20 МБ (лимит облачного Bot API)."""
+    if await _refuse_while_busy(message, ctx):
+        return
     media = message.video or message.document or message.animation
     if media is None:
         return
