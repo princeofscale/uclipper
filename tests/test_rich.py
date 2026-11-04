@@ -152,7 +152,7 @@ TREND_CHOICES = [EVERYWHERE, *(platform.id for platform in TRENDING)]
 
 def _all_static_screens() -> list[str]:
     draft = Draft(title="Тест <b>", uploader="Автор & Ко", duration=3725)
-    plan = plan_auto(3725, Goal.TIKTOK, ClipSettings(), banner_seconds=7.5, face_crop=True)
+    plan = plan_auto(3725, Goal.TIKTOK, ClipSettings(), banner_seconds=7.5)
 
     class Banner:
         duration, has_audio, width, height = 7.5, True, 720, 1280
@@ -191,7 +191,7 @@ def _all_static_screens() -> list[str]:
             screens.append(texts.trend_list(category, [video], choice))
             screens.append(texts.trend_list(category, [video], choice, missing=TRENDING[:1]))
     for goal in GOALS:
-        screens.append(texts.auto_screen(draft, plan_auto(900, goal, ClipSettings(), banner_seconds=None, face_crop=False), None))
+        screens.append(texts.auto_screen(draft, plan_auto(900, goal, ClipSettings(), banner_seconds=None), None))
     return screens
 
 

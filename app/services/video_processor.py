@@ -316,7 +316,11 @@ def _freeze_segments(timeline: BannerTimeline) -> list[str]:
             video += f",tpad=stop_mode=clone:stop={pause_frames}"
             audio += f",apad=pad_dur={pause_seconds}"
         chains += [f"{video}[vf{i}]", f"{audio}[af{i}]"]
-    chains.append("".join(f"[vf{i}][af{i}]" for i in range(segments)) + f"concat=n={segments}:v=1:a=1[v_cat][a_cat]")
+    chains.append("".join(f"[vf{i}][af{i}]" for i in range(segments)) + f"concat=n={segments}:v=1:a=1[v_joined][a_cat]")
+    # `tpad` в ffmpeg 7.1 (он стоит в образе бота) выдаёт все клоны стоп-кадра с ОДНОЙ меткой времени, а `overlay`
+    # подбирает кадр баннера именно по метке — и на всё окно показа брал бы первый кадр: баннер «замирал», звук шёл.
+    # Кадры идут ровно через 1/FPS без пропусков, поэтому метки пересчитываются по номеру кадра — так верно везде.
+    chains.append(f"[v_joined]setpts=N/({FPS}*TB)[v_cat]")
     return chains
 
 

@@ -18,7 +18,6 @@ from aiogram.fsm.storage.base import StorageKey
 
 from app.bot import keyboards, texts
 from app.bot.context import QUERY_KEY, SCOPE_KEY, get_draft
-from app.bot.handlers import modes as mode_handlers
 from app.bot.handlers import source as source_handlers
 from app.bot.handlers import trends as trend_handlers
 from app.bot.rich import plain_text
@@ -690,7 +689,6 @@ async def test_oversized_file_is_rejected(harness):
 
 
 async def test_auto_mode_builds_a_tiktok_plan_with_goal_buttons(harness, monkeypatch):
-    monkeypatch.setattr(mode_handlers, "_can_follow_faces", lambda: True)
     await _open_auto(harness, monkeypatch, duration=3600.0)
 
     draft = await _draft(harness)
@@ -698,7 +696,7 @@ async def test_auto_mode_builds_a_tiktok_plan_with_goal_buttons(harness, monkeyp
     assert draft.mode is CutMode.AUTO and draft.goal is Goal.TIKTOK
     assert (s.num_clips, s.clip_duration) == (8, 45.0)  # TikTok: не короче 45 с, баннер сверху не в счёт
     assert s.slicing_mode is SlicingMode.HIGHLIGHTS and s.auto_trim
-    assert s.frame_mode is FrameMode.CENTER_CROP
+    assert s.frame_mode is FrameMode.BLUR_PAD  # видео целиком по центру, сверху и снизу размытые поля
     assert s.banner_id == "TGrader-banner-7s.mp4" and s.banner_count == 1 and s.banner_sound
 
     assert harness.session.buttons() == [
@@ -710,12 +708,33 @@ async def test_auto_mode_builds_a_tiktok_plan_with_goal_buttons(harness, monkeyp
     assert_valid_rich(harness.session.htmls()[-1])
 
 
+async def test_the_auto_plan_says_the_video_goes_in_the_middle_with_blurred_fields(harness, monkeypatch):
+    await _open_auto(harness, monkeypatch, duration=3600.0)
+
+    text = harness.session.last_text()
+    assert "по центру, размытый фон" in text
+    assert "9:16, на весь экран" not in text and "на весь экран" not in text
+
+
+async def test_the_auto_plan_tells_what_it_skips_at_the_edges_of_a_long_video(harness, monkeypatch):
+    await _open_auto(harness, monkeypatch, duration=4014.0)  # серия на час: пропускается 5% в начале и 3% в конце
+
+    text = harness.session.last_text()
+    assert "Пропускаю" in text and "заставк" in text and "реклам" in text and "титры" in text
+    assert "3:20" in text and "2:00" in text  # 200 с в начале и 120 с в конце
+
+
+async def test_the_auto_plan_does_not_skip_anything_in_a_short_video(harness, monkeypatch):
+    await _open_auto(harness, monkeypatch, duration=240.0)
+
+    assert "Пропускаю" not in harness.session.last_text()
+
+
 async def test_auto_plan_is_honest_it_is_not_a_neural_network():
     assert "не нейросеть" in plain_text(texts.HELP)
 
 
 async def test_changing_the_goal_rebuilds_the_plan(harness, monkeypatch):
-    monkeypatch.setattr(mode_handlers, "_can_follow_faces", lambda: False)
     await _open_auto(harness, monkeypatch, duration=3600.0)
 
     await harness.press("goal:shorts")
@@ -767,7 +786,6 @@ async def test_auto_screen_back_goes_to_the_mode_picker(harness, monkeypatch):
 
 
 async def test_tweaking_the_auto_plan_by_hand_keeps_its_values(harness, monkeypatch):
-    monkeypatch.setattr(mode_handlers, "_can_follow_faces", lambda: False)
     await _open_auto(harness, monkeypatch, duration=3600.0)
     planned = (await _draft(harness)).settings
 
@@ -802,7 +820,6 @@ async def test_manual_screen_back_goes_to_the_mode_picker(harness, monkeypatch):
 
 
 async def test_going_back_to_auto_recomputes_the_plan(harness, monkeypatch):
-    monkeypatch.setattr(mode_handlers, "_can_follow_faces", lambda: False)
     await _open_manual(harness, monkeypatch, duration=3600.0)
     await harness.press("edit:num_clips")
     await harness.press("set:num_clips:3")
@@ -966,7 +983,7 @@ async def test_choice_screen_explains_every_option_and_marks_the_current_one(har
     await harness.press("choose:frame_mode")
 
     text = harness.session.last_text()
-    for part in ("9:16, размытый фон", "9:16, на весь экран", "16:9, как есть", "слежу за лицом"):
+    for part in ("По центру, размытый фон", "На весь экран", "16:9, как есть", "слежу за лицом", "из 720p выходит мягче"):
         assert part in text, part
     assert harness.session.button_texts()[0].startswith("✅")  # по умолчанию размытый фон
 
@@ -1165,7 +1182,6 @@ async def test_cold_trend_request_shows_a_loading_screen_first(harness, monkeypa
 
 
 async def test_picking_a_trending_video_goes_straight_to_the_tiktok_plan(harness, monkeypatch):
-    monkeypatch.setattr(mode_handlers, "_can_follow_faces", lambda: False)
     monkeypatch.setattr(trend_handlers, "fetch_category", _fake_fetch())
     await harness.press("trend:youtube:podcast")
 
@@ -1179,7 +1195,6 @@ async def test_picking_a_trending_video_goes_straight_to_the_tiktok_plan(harness
 
 
 async def test_picking_a_rutube_trend_remembers_the_platform(harness, monkeypatch):
-    monkeypatch.setattr(mode_handlers, "_can_follow_faces", lambda: False)
     videos = [dict(video, platform="rutube", url=f"https://rutube.ru/video/{'a' * 31}{index}/") for index, video in enumerate(TRENDING)]
     monkeypatch.setattr(trend_handlers, "fetch_category", _fake_fetch(videos=videos))
     await harness.press("trend:rutube:podcast")
@@ -1338,7 +1353,6 @@ async def test_the_loading_screen_for_everywhere_names_no_single_platform(harnes
 
 
 async def test_picking_a_video_from_everywhere_trends_remembers_its_platform(harness, monkeypatch):
-    monkeypatch.setattr(mode_handlers, "_can_follow_faces", lambda: False)
     answers = {"youtube": _trend_videos("youtube"), "rutube": _trend_videos("rutube")}
     monkeypatch.setattr(trend_handlers, "fetch_category", _platform_fetch(answers))
     await harness.press("trend:all:podcast")
@@ -1661,7 +1675,6 @@ async def test_edit_failure_sends_a_fresh_screen(harness, monkeypatch):
 
 async def test_a_full_tour_only_uses_valid_rich_markup(harness, monkeypatch):
     """Все основные экраны подряд: ни один не нарушает правил rich-разметки."""
-    monkeypatch.setattr(mode_handlers, "_can_follow_faces", lambda: True)
     monkeypatch.setattr(trend_handlers, "fetch_category", _fake_fetch())
     monkeypatch.setattr(source_handlers, "search_videos", _fake_search([VIDEO, dict(VIDEO, platform="rutube")]))
     await harness.send("/start")

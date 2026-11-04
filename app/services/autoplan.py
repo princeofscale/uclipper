@@ -35,19 +35,18 @@ class GoalSpec:
     minutes_per_clip: float  # один клип на столько минут исходного ролика
     max_clips: int
     banners: int  # показов баннера на клип
-    full_screen: bool  # кадр на весь экран (по лицу), если доступно
 
 
 GOALS: dict[Goal, GoalSpec] = {
     # TikTok и Shorts: клип от 45 с без баннера — короче зрителя не удержать; с баннером всё равно влезает в 59 с.
     Goal.TIKTOK: GoalSpec(
-        Goal.TIKTOK, "⚡", "TikTok", "динамичные клипы по ~45 с", 45.0, 2.0, 8, 1, True
+        Goal.TIKTOK, "⚡", "TikTok", "динамичные клипы по ~45 с", 45.0, 2.0, 8, 1
     ),
     Goal.SHORTS: GoalSpec(
-        Goal.SHORTS, "▶️", "YouTube Shorts", "подробнее: клипы по ~50 с", 50.0, 3.0, 6, 1, True
+        Goal.SHORTS, "▶️", "YouTube Shorts", "подробнее: клипы по ~50 с", 50.0, 3.0, 6, 1
     ),
     Goal.UNIVERSAL: GoalSpec(
-        Goal.UNIVERSAL, "🎯", "Универсально", "на любую площадку: ~30 с, видно весь кадр", 30.0, 4.0, 6, 2, False
+        Goal.UNIVERSAL, "🎯", "Универсально", "на любую площадку: ~30 с, два баннера", 30.0, 4.0, 6, 2
     ),
 }
 
@@ -74,12 +73,12 @@ def plan_auto(
     base: ClipSettings,
     *,
     banner_seconds: float | None,
-    face_crop: bool,
 ) -> AutoPlan:
     """План нарезки. `base` — прежние настройки человека: берём из них всё, что автоподбор не трогает.
 
-    `banner_seconds` — длина баннера (`None`, если баннера нет); `face_crop` — умеет ли эта установка
-    искать лица, без чего «на весь экран» режет по центру кадра.
+    `banner_seconds` — длина баннера (`None`, если баннера нет). Кадр всегда один: горизонтальное видео целиком по
+    центру, сверху и снизу размытое продолжение картинки. «На весь экран» растягивало бы полосу в треть кадра
+    (из 720p — 405×720 до 1080×1920), и клип выходил мыльным; это по-прежнему можно выбрать вручную.
     """
     spec = GOALS[goal]
     clip = spec.clip_seconds
@@ -98,14 +97,13 @@ def plan_auto(
     if clip > room >= MIN_CLIP_SECONDS:  # целый ролик в 52–67 с вместе с баннером вылез бы за предел
         clip = float(math.floor(room))
 
-    frame = FrameMode.CENTER_CROP if spec.full_screen and face_crop else FrameMode.BLUR_PAD
     settings = ClipSettings.model_validate(
         {
             **base.model_dump(),
             "num_clips": count,
             "clip_duration": clip,
             "slicing_mode": SlicingMode.HIGHLIGHTS,
-            "frame_mode": frame,
+            "frame_mode": FrameMode.BLUR_PAD,
             "auto_trim": True,
             "start_offset": 0.0,
             "end_offset": 0.0,

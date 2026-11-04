@@ -7,8 +7,8 @@ from app.models import BannerMode, ClipSettings, FrameMode, Goal, SlicingMode
 from app.services.autoplan import GOALS, SHORTS_LIMIT, clip_count, plan_auto
 
 
-def plan(duration, goal=Goal.TIKTOK, *, banner=7.5, face=True, base=None):
-    return plan_auto(duration, goal, base or ClipSettings(banner_id="b.mp4"), banner_seconds=banner, face_crop=face)
+def plan(duration, goal=Goal.TIKTOK, *, banner=7.5, base=None):
+    return plan_auto(duration, goal, base or ClipSettings(banner_id="b.mp4"), banner_seconds=banner)
 
 
 @pytest.mark.parametrize(
@@ -70,10 +70,11 @@ def test_universal_shows_two_banners_and_blur_pad():
     assert result.settings.banner_count == 2 and result.settings.frame_mode is FrameMode.BLUR_PAD
 
 
-@pytest.mark.parametrize("goal", [Goal.TIKTOK, Goal.SHORTS])
-def test_full_screen_only_when_faces_can_be_followed(goal):
-    assert plan(3600, goal, face=True).settings.frame_mode is FrameMode.CENTER_CROP
-    assert plan(3600, goal, face=False).settings.frame_mode is FrameMode.BLUR_PAD
+@pytest.mark.parametrize("goal", list(Goal))
+def test_auto_always_puts_the_whole_video_in_the_middle_with_blurred_fields(goal):
+    """Ошибка из жизни: «на весь экран» растягивал полосу 405×720 из 720p до 1080×1920 — мыло, а человек хотел
+    горизонтальное видео по центру с полями сверху и снизу. Авто такого больше не выбирает: вручную — пожалуйста."""
+    assert plan(3600, goal).settings.frame_mode is FrameMode.BLUR_PAD
 
 
 def test_without_a_banner_file_there_are_no_banners():

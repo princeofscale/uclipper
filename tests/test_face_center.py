@@ -12,7 +12,7 @@ import pytest
 
 cv2 = pytest.importorskip("cv2")
 
-from app.services.face_center import detect_face_center_x, face_crop_available  # noqa: E402
+from app.services.face_center import detect_face_center_x  # noqa: E402
 from tests.media_utils import luma_at  # noqa: E402
 
 
@@ -84,22 +84,6 @@ def test_none_when_opencv_is_not_installed(synthetic_video, monkeypatch):
 def test_none_when_opencv_has_no_cascade_classifier(synthetic_video, monkeypatch):
     monkeypatch.delattr(cv2, "CascadeClassifier")  # так выглядит OpenCV 5: Haar-каскады вынесены в contrib
     assert detect_face_center_x(synthetic_video, 0.0, 10.0) is None
-
-
-def test_face_crop_is_available_with_a_working_opencv():
-    if not hasattr(cv2, "CascadeClassifier"):
-        pytest.skip("OpenCV 5: каскады Хаара вынесены в contrib")
-    assert face_crop_available() is True
-
-
-def test_face_crop_is_unavailable_without_opencv(monkeypatch):
-    monkeypatch.setitem(sys.modules, "cv2", None)
-    assert face_crop_available() is False
-
-
-def test_face_crop_is_unavailable_when_opencv_has_no_cascade_classifier(monkeypatch):
-    monkeypatch.delattr(cv2, "CascadeClassifier")
-    assert face_crop_available() is False
 
 
 def test_none_when_the_video_cannot_be_read(tmp_path):

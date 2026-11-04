@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import logging
-from functools import lru_cache
 
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
@@ -32,21 +31,8 @@ log = logging.getLogger(__name__)
 router = Router(name="modes")
 
 
-@lru_cache(maxsize=1)
-def _can_follow_faces() -> bool:
-    from app.services.face_center import face_crop_available
-
-    return face_crop_available()
-
-
 def make_plan(draft: Draft, ctx: AppContext) -> AutoPlan:
-    return plan_auto(
-        draft.duration,
-        draft.goal,
-        draft.settings,
-        banner_seconds=ctx.banner_seconds(),
-        face_crop=_can_follow_faces(),
-    )
+    return plan_auto(draft.duration, draft.goal, draft.settings, banner_seconds=ctx.banner_seconds())
 
 
 def mode_view(draft: Draft):

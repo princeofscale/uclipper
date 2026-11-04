@@ -7,8 +7,8 @@ from pydantic import BaseModel, Field, model_validator
 
 
 class FrameMode(StrEnum):
-    BLUR_PAD = "blur_pad"  # 9:16, чёткий кадр по центру на размытом фоне
-    CENTER_CROP = "center_crop"  # 9:16, полный вертикальный кроп
+    BLUR_PAD = "blur_pad"  # холст 9:16: видео целиком по центру, сверху и снизу размытый фон
+    CENTER_CROP = "center_crop"  # холст 9:16 целиком занят картинкой: кроп по центру или по лицу
     ORIGINAL = "original"  # 16:9, 1920x1080
 
 

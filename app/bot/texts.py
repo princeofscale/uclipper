@@ -14,6 +14,7 @@ from app.bot.steppers import Stepper
 from app.config import MAX_SOURCE_SECONDS
 from app.models import ClipSettings, Draft, JobState, JobStatus
 from app.services.autoplan import AutoPlan
+from app.services.highlights import edge_reserve
 from app.services.platforms import EVERYWHERE, PLATFORM_BY_ID, PLATFORMS, SEARCHABLE, TRENDING, Platform
 from app.services.search import RESULTS
 from app.services.trends import CATEGORIES, PERIOD_TEXT, Category, views_text
@@ -245,6 +246,11 @@ def trim_text(s: ClipSettings) -> str:
     return ", ".join(parts) or "не обрезаю, беру целиком"
 
 
+def _rough(seconds: float) -> float:
+    """До 5 секунд: в плане стоит «≈», а 200,7 с и 3:21 выглядели бы точнее, чем это есть."""
+    return round(seconds / 5) * 5
+
+
 def _frame_text(s: ClipSettings) -> str:
     return CHOICES["frame_mode"].option(s.frame_mode).short
 
@@ -258,6 +264,13 @@ def auto_screen(draft: Draft, plan: AutoPlan, banner_seconds: float | None) -> s
         else "выключен"
     )
     short_note = "<p>ℹ️ Ролик короткий — беру его целиком.</p>" if plan.shortened else ""
+    head, tail = edge_reserve(draft.duration, s.num_clips * s.clip_duration)
+    skipped = (
+        f"<tr><td>🚫 Пропускаю</td><td>начало (≈ {duration_text(_rough(head))}) — заставка и реклама, "
+        f"конец (≈ {duration_text(_rough(tail))}) — титры</td></tr>"
+        if head or tail
+        else ""
+    )
     return f"""\
 <h2>🤖 Авто-подбор</h2>
 {_card(draft)}
@@ -266,8 +279,8 @@ def auto_screen(draft: Draft, plan: AutoPlan, banner_seconds: float | None) -> s
 <tr><td>🎞 Клипов</td><td><b>{s.num_clips}</b> по <b>{seconds_text(s.clip_duration)}</b></td></tr>
 <tr><td>⏱ Итог на клип</td><td>{_total_line(s, banner_seconds)}</td></tr>
 <tr><td>✨ Моменты</td><td>самые яркие, по звуку</td></tr>
-<tr><td>🖼 Кадр</td><td>{esc(_frame_text(s))}</td></tr>
-<tr><td>✂️ Края</td><td>уберу заставку и титры</td></tr>
+{skipped}<tr><td>🖼 Кадр</td><td>{esc(_frame_text(s))}</td></tr>
+<tr><td>✂️ Края</td><td>уберу чёрный экран и титры</td></tr>
 <tr><td>🎬 Баннер</td><td>{banner}</td></tr>
 </table>
 {short_note}<blockquote>{plan.spec.emoji} <b>{plan.spec.label}</b> — {plan.spec.blurb}</blockquote>

@@ -27,16 +27,6 @@ def _load_cascade(cv2):
     return None if cascade.empty() else cascade
 
 
-def face_crop_available() -> bool:
-    """Умеет ли эта установка искать лица (иначе режим «Face Crop» режет по центру кадра)."""
-    try:
-        import cv2
-
-        return _load_cascade(cv2) is not None
-    except Exception:  # noqa: BLE001 — нет OpenCV или он сломан: просто «недоступно»
-        return False
-
-
 def detect_face_center_x(source: Path, clip_start: float, clip_duration: float, samples: int = 8) -> float | None:
     """Горизонтальный центр лица в клипе как доля ширины кадра (0–1) или None.
 

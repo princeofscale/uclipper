@@ -24,6 +24,13 @@ LIVELY_WEIGHT = 0.7  # вес «живости» (разброса громко�
 SILENCE_PENALTY = 12.0  # штраф окну за долю тишины
 FLOOR_DB = -70.0
 
+# Края длинного ролика — заставка, реклама спонсоров, титры. Они громкие и «живые», поэтому по звуку выигрывают у
+# разговора, и первый клип раньше брали с самого начала серии. Короткие записи не трогаем: там край — это уже сам ролик.
+RESERVE_FROM = 300.0  # с какой длины ролика края не берём, с
+HEAD_SHARE, HEAD_MIN, HEAD_MAX = 0.05, 15.0, 240.0  # начало: доля ролика в пределах от 15 с до 4 минут
+TAIL_SHARE, TAIL_MIN, TAIL_MAX = 0.03, 10.0, 120.0  # конец: от 10 с до 2 минут
+ROOM_FOR_CLIPS = 1.5  # клипам должно остаться места в полтора раза больше их суммарной длины
+
 
 def loudness_profile(source: Path, start: float, end: float, *, timeout: float = 600.0) -> list[float]:
     """Громкость каждой секунды отрезка `[start, end]` источника, дБ (RMS). Пусто, если звука нет или FFmpeg не справился."""
@@ -106,3 +113,22 @@ def find_highlights(source: Path, start: float, end: float, num_clips: int, clip
     levels = loudness_profile(source, start, end)
     picked = pick_windows(levels, num_clips, clip_seconds)
     return [round(start + second, 3) for second in picked]
+
+
+def edge_reserve(length: float, needed: float) -> tuple[float, float]:
+    """Сколько секунд в начале и в конце ролика не отдавать под яркие моменты: `(начало, конец)`.
+
+    `length` — длина доступного отрезка, `needed` — сколько секунд займут все клипы вместе. Края уменьшаются, если иначе
+    клипам не хватило бы места с запасом, и пропадают совсем, когда клипы и так занимают почти весь ролик.
+    """
+    if length < RESERVE_FROM:
+        return 0.0, 0.0
+    head = min(max(length * HEAD_SHARE, HEAD_MIN), HEAD_MAX)
+    tail = min(max(length * TAIL_SHARE, TAIL_MIN), TAIL_MAX)
+    spare = length - needed * ROOM_FOR_CLIPS
+    if spare <= 0:
+        return 0.0, 0.0
+    if head + tail > spare:
+        scale = spare / (head + tail)
+        head, tail = head * scale, tail * scale
+    return head, tail

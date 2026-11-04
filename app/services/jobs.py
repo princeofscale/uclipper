@@ -19,7 +19,7 @@ from app.models import ClipResult, JobRequest, JobState, JobStatus, SlicingMode,
 from app.services.auto_trim import analyze_trim
 from app.services.banner_manager import BannerError, ensure_sfx, resolve_banner
 from app.services.downloader import DownloadError, cached_source_path, download_video_cached, resolve_upload
-from app.services.highlights import find_highlights
+from app.services.highlights import edge_reserve, find_highlights
 from app.services.platforms import identify
 from app.services.video_processor import (
     ClipSchedule,
@@ -306,6 +306,15 @@ class JobManager:
     ) -> ClipSchedule:
         """Где в источнике лежат клипы. Режим «яркие моменты» ищет их по звуку, а если не вышло — раскладывает ровно."""
         highlights = request.slicing_mode is SlicingMode.HIGHLIGHTS
+        if highlights:
+            # Заставка, реклама и титры по звуку «ярче» разговора — без этого первый клип брали с самого начала серии.
+            head, tail = edge_reserve(info.duration - start_offset - end_offset, request.num_clips * request.clip_duration)
+            if head >= 1 or tail >= 1:
+                self._log(
+                    job_id,
+                    f"Яркие моменты ищу не в первых {head:.0f} с и не в последних {tail:.0f} с: там обычно заставка, реклама и титры",
+                )
+            start_offset, end_offset = start_offset + head, end_offset + tail
         base = compute_clip_schedule(
             info.duration,
             start_offset,
