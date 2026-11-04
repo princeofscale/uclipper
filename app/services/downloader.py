@@ -11,7 +11,8 @@ from typing import BinaryIO, Callable
 import yt_dlp
 
 from app.config import MAX_SOURCE_SECONDS, MIN_CACHE_BYTES, VIDEO_EXTS, Settings
-from app.services.platforms import YOUTUBE, Platform, Source, identify, titles
+from app.services import rutube
+from app.services.platforms import RUTUBE, YOUTUBE, Platform, Source, identify, titles
 from app.services.youtube import js_runtimes
 
 _UPLOAD_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
@@ -57,14 +58,20 @@ def _base_options(platform: Platform) -> dict:
     return options
 
 
-def _explain(error: Exception, platform: Platform) -> str:
+def _explain(error: Exception, source: Source) -> str:
     text = re.sub(r"\x1b\[[0-9;]*m", "", str(error)).strip()  # без ANSI-цветов yt-dlp
     lowered = text.lower()
+    if source.platform is RUTUBE and "http error 404" in lowered:
+        # RuTube отвечает 404 и на удалённый ролик, и на ролик по подписке (PREMIER и т. п.): плеер знает разницу.
+        subscription = rutube.paywall(source.video_id)
+        if subscription is not None:
+            plan = f"подписке {subscription}" if subscription else "платной подписке"
+            return f"Этот ролик идёт на RuTube только по {plan} — скачать его нельзя."
     for needle, message in _ERROR_HINTS:
         if needle in lowered:
             return message
     first_line = text.removeprefix("ERROR: ").splitlines()[0] if text else "неизвестная ошибка"
-    return f"Не удалось получить видео с площадки {platform.title}: {first_line}"
+    return f"Не удалось получить видео с площадки {source.platform.title}: {first_line}"
 
 
 def _format_selector(max_height: int) -> str:
@@ -99,7 +106,7 @@ def fetch_video_info(url: str) -> dict:
         with yt_dlp.YoutubeDL(options) as ydl:
             info = ydl.extract_info(source.url, download=False)
     except yt_dlp.utils.YoutubeDLError as error:
-        raise DownloadError(_explain(error, platform)) from error
+        raise DownloadError(_explain(error, source)) from error
     if not info:
         raise DownloadError(f"{platform.title} не вернул сведений о ролике.")
     if info.get("_type") in ("playlist", "multi_video") or info.get("entries") is not None:
@@ -187,7 +194,7 @@ def download_video_cached(
         with yt_dlp.YoutubeDL(options) as ydl:
             ydl.download([source.url])
     except yt_dlp.utils.YoutubeDLError as error:
-        raise DownloadError(_explain(error, source.platform)) from error
+        raise DownloadError(_explain(error, source)) from error
     if on_progress is not None and reported < 1.0:
         on_progress(1.0)  # файл был один (HLS, клип): шкала «два файла» до конца не дошла сама
     return _finalize(key, cache_dir)

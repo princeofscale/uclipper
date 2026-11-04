@@ -39,11 +39,12 @@ class GoalSpec:
 
 
 GOALS: dict[Goal, GoalSpec] = {
+    # TikTok и Shorts: клип от 45 с без баннера — короче зрителя не удержать; с баннером всё равно влезает в 59 с.
     Goal.TIKTOK: GoalSpec(
-        Goal.TIKTOK, "⚡", "TikTok", "короткие и частые: ~25 с", 25.0, 2.0, 10, 1, True
+        Goal.TIKTOK, "⚡", "TikTok", "динамичные клипы по ~45 с", 45.0, 2.0, 8, 1, True
     ),
     Goal.SHORTS: GoalSpec(
-        Goal.SHORTS, "▶️", "YouTube Shorts", "подробнее: ~40 с", 40.0, 3.0, 8, 1, True
+        Goal.SHORTS, "▶️", "YouTube Shorts", "подробнее: клипы по ~50 с", 50.0, 3.0, 6, 1, True
     ),
     Goal.UNIVERSAL: GoalSpec(
         Goal.UNIVERSAL, "🎯", "Универсально", "на любую площадку: ~30 с, видно весь кадр", 30.0, 4.0, 6, 2, False
@@ -83,15 +84,19 @@ def plan_auto(
     spec = GOALS[goal]
     clip = spec.clip_seconds
     shortened = False
-    if 0 < duration < clip * 1.5:  # ролик почти как клип: берём его целиком
+    whole = 0 < duration < clip * 1.5  # ролик почти как клип: берём его целиком
+    if whole:
         clip = max(MIN_CLIP_SECONDS, float(math.floor(duration)))
         shortened = clip < spec.clip_seconds
-    count = 1 if shortened else clip_count(duration, spec, clip)
+    count = 1 if whole else clip_count(duration, spec, clip)
 
     banners = spec.banners if banner_seconds else 0
     pause = banner_seconds or 0.0
     while banners > 1 and clip + banners * pause > SHORTS_LIMIT:
         banners -= 1
+    room = SHORTS_LIMIT - banners * pause  # сколько секунд остаётся самому клипу
+    if clip > room >= MIN_CLIP_SECONDS:  # целый ролик в 52–67 с вместе с баннером вылез бы за предел
+        clip = float(math.floor(room))
 
     frame = FrameMode.CENTER_CROP if spec.full_screen and face_crop else FrameMode.BLUR_PAD
     settings = ClipSettings.model_validate(

@@ -13,6 +13,8 @@ callback_data короче 64 байт — это требование Telegram.
 """
 from __future__ import annotations
 
+from collections.abc import Callable, Sequence
+
 from aiogram.enums import ButtonStyle
 from aiogram.types import InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
@@ -22,7 +24,7 @@ from app.bot.options import CHOICES
 from app.bot.steppers import Stepper
 from app.models import ClipSettings, Draft, Goal
 from app.services.autoplan import GOALS
-from app.services.platforms import PLATFORM_BY_ID, SEARCHABLE
+from app.services.platforms import EVERYWHERE, PLATFORM_BY_ID, SEARCHABLE, TRENDING, Platform
 from app.services.trends import CATEGORIES
 
 PRIMARY = ButtonStyle.PRIMARY.value
@@ -32,8 +34,30 @@ DANGER = ButtonStyle.DANGER.value
 MENU = "screen:menu"
 
 
+Chip = tuple[str, str, str | None]  # (подпись, callback_data, цвет)
+
+
 def _add(builder: InlineKeyboardBuilder, text: str, data: str, style: str | None = None) -> None:
     builder.button(text=text, callback_data=data, style=style)
+
+
+def _rows(count: int, per_row: int) -> tuple[int, ...]:
+    """Раскладка `count` кнопок рядами по `per_row` (последний ряд может быть короче)."""
+    return (per_row,) * (count // per_row) + ((count % per_row,) if count % per_row else ())
+
+
+def chip_rows(count: int) -> tuple[int, ...]:
+    """Ряды кнопок выбора площадки: до трёх в один ряд, больше — по две."""
+    return _rows(count, 3 if count <= 3 else 2)
+
+
+def scope_chips(options: Sequence[Platform], selected: str, make_data: Callable[[str], str]) -> list[Chip]:
+    """Кнопки выбора площадки: «Везде» и каждая из `options`. Выбранная отмечена точкой и подсвечена синим."""
+    choices = [(EVERYWHERE, "🌐 Везде"), *((platform.id, f"{platform.emoji} {platform.title}") for platform in options)]
+    return [
+        (f"{'● ' if choice == selected else ''}{label}", make_data(choice), PRIMARY if choice == selected else None)
+        for choice, label in choices
+    ]
 
 
 # ---------- главное меню и навигация ----------
@@ -64,13 +88,24 @@ def cancel_only(back: str = "screen:manual") -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
-def search_results(
-    entries: list[dict],
-    *,
-    again: tuple[str, str] = ("🔄 Искать другое", "ask:query"),
-    back: tuple[str, str] = ("🏠 В начало", MENU),
+def query_prompt(choice: str = EVERYWHERE) -> InlineKeyboardMarkup:
+    """Экран «Что искать?»: сверху выбор площадки (выбранная — синяя), снизу путь в начало."""
+    builder = InlineKeyboardBuilder()
+    chips = scope_chips(SEARCHABLE, choice, lambda option: f"qp:{option}")
+    for chip in chips:
+        _add(builder, *chip)
+    _add(builder, "🏠 В начало", MENU)
+    builder.adjust(*chip_rows(len(chips)), 1)
+    return builder.as_markup()
+
+
+def _result_list(
+    entries: list[dict], *, chips: Sequence[Chip], again: tuple[str, str], back: tuple[str, str] = ("🏠 В начало", MENU)
 ) -> InlineKeyboardMarkup:
-    """Список найденных роликов: по кнопке на строку и два пути назад. Если площадок несколько, у кнопки её значок."""
+    """Список найденных роликов: по кнопке на строку, ниже выбор площадки и два пути назад.
+
+    Если в списке несколько площадок, у кнопки ролика стоит значок её площадки.
+    """
     builder = InlineKeyboardBuilder()
     mixed = len({entry.get("platform") for entry in entries}) > 1
     for index, entry in enumerate(entries):
@@ -81,10 +116,18 @@ def search_results(
             title = title[:35] + "…"
         minutes = texts.duration_text(entry.get("duration") or 0)
         _add(builder, f"{index + 1}. {badge}{title} · {minutes}", f"pick:{index}", PRIMARY if index == 0 else None)
+    for chip in chips:
+        _add(builder, *chip)
     _add(builder, *again)
     _add(builder, *back)
-    builder.adjust(*([1] * len(entries)), 2)
+    builder.adjust(*([1] * len(entries)), *chip_rows(len(chips)), 2)
     return builder.as_markup()
+
+
+def search_results(entries: list[dict], choice: str = EVERYWHERE) -> InlineKeyboardMarkup:
+    """Итог поиска по названию (и после неудачи — тогда `entries` пуст): повторить тот же запрос на другой площадке."""
+    chips = scope_chips(SEARCHABLE, choice, lambda option: f"qs:{option}")
+    return _result_list(entries, chips=chips, again=("🔄 Искать другое", f"qp:{choice}"))
 
 
 # ---------- режим нарезки ----------
@@ -237,34 +280,30 @@ def banners_screen(banner_name: str | None) -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
-def trends_home(platform_id: str) -> InlineKeyboardMarkup:
-    """Сверху переключатель площадки (выбранная — синяя), ниже жанры этой площадки."""
+def trends_home(choice: str = EVERYWHERE) -> InlineKeyboardMarkup:
+    """Сверху выбор площадки (выбранная — синяя), ниже жанры."""
     builder = InlineKeyboardBuilder()
-    for platform in SEARCHABLE:
-        selected = platform.id == platform_id
-        _add(
-            builder,
-            f"{'● ' if selected else ''}{platform.emoji} {platform.title}",
-            f"trends:{platform.id}",
-            PRIMARY if selected else None,
-        )
+    chips = scope_chips(TRENDING, choice, lambda option: f"trends:{option}")
+    for chip in chips:
+        _add(builder, *chip)
     for category in CATEGORIES:
-        _add(builder, f"{category.emoji} {category.title}", f"trend:{platform_id}:{category.id}")
+        _add(builder, f"{category.emoji} {category.title}", f"trend:{choice}:{category.id}")
     _add(builder, "🏠 В начало", MENU)
-    builder.adjust(len(SEARCHABLE), *([2] * (len(CATEGORIES) // 2)), 1)
+    builder.adjust(*chip_rows(len(chips)), *_rows(len(CATEGORIES), 2), 1)
     return builder.as_markup()
 
 
-def trend_results(videos: list[dict], platform_id: str) -> InlineKeyboardMarkup:
-    """Ролики жанра: выбрать один или вернуться к жанрам той же площадки."""
-    return search_results(videos, again=("⬅️ К жанрам", f"trends:{platform_id}"))
+def trend_results(videos: list[dict], choice: str, category_id: str) -> InlineKeyboardMarkup:
+    """Ролики жанра: выбрать один, сменить площадку (тот же жанр) или вернуться к жанрам."""
+    chips = scope_chips(TRENDING, choice, lambda option: f"trend:{option}:{category_id}")
+    return _result_list(videos, chips=chips, again=("⬅️ К жанрам", f"trends:{choice}"))
 
 
-def trends_retry(platform_id: str, category_id: str) -> InlineKeyboardMarkup:
+def trends_retry(choice: str, category_id: str) -> InlineKeyboardMarkup:
     """Не получилось загрузить тренды: повторить или вернуться."""
     builder = InlineKeyboardBuilder()
-    _add(builder, "🔄 Повторить", f"trend:{platform_id}:{category_id}", PRIMARY)
-    _add(builder, "⬅️ К жанрам", f"trends:{platform_id}")
+    _add(builder, "🔄 Повторить", f"trend:{choice}:{category_id}", PRIMARY)
+    _add(builder, "⬅️ К жанрам", f"trends:{choice}")
     builder.adjust(1, 1)
     return builder.as_markup()
 

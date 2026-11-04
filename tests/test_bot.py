@@ -17,7 +17,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.base import StorageKey
 
 from app.bot import keyboards, texts
-from app.bot.context import get_draft
+from app.bot.context import QUERY_KEY, SCOPE_KEY, get_draft
 from app.bot.handlers import modes as mode_handlers
 from app.bot.handlers import source as source_handlers
 from app.bot.handlers import trends as trend_handlers
@@ -25,7 +25,9 @@ from app.bot.rich import plain_text
 from app.bot.states import Flow
 from app.config import Settings
 from app.models import CutMode, FrameMode, Goal, SlicingMode
-from app.services.platforms import SEARCHABLE, YOUTUBE
+from app.services import capacity
+from app.services.platforms import EVERYWHERE, SEARCHABLE
+from app.services.platforms import TRENDING as TREND_PLATFORMS
 from tests.bot_fakes import Harness, _message
 from tests.media_utils import make_video
 from tests.rich_check import assert_valid_rich
@@ -56,6 +58,9 @@ TRENDING = [
 
 WAIT = 120
 MENU_BUTTONS = ["ask:link", "ask:query", "ask:file", "screen:trends", "screen:banners", "screen:stats", "screen:help"]
+SEARCH_PLATFORMS = ["all", "youtube", "rutube", "dailymotion"]  # «Везде» и площадки с поиском по названию
+PROMPT_CHIPS = [f"qp:{choice}" for choice in SEARCH_PLATFORMS]  # выбор площадки на экране «Что искать?»
+RETRY_CHIPS = [f"qs:{choice}" for choice in SEARCH_PLATFORMS]  # он же под результатами: тот же запрос на другой площадке
 
 
 def _fsm(harness, user_id: int = 1) -> FSMContext:
@@ -66,6 +71,22 @@ def _fsm(harness, user_id: int = 1) -> FSMContext:
 
 async def _draft(harness):
     return await get_draft(_fsm(harness))
+
+
+def _fake_search(results=None, calls: list | None = None):
+    """Подмена `search_videos`: запоминает (запрос, площадка) и отдаёт заданные ролики (пусто — «ничего не нашлось»)."""
+
+    def search(query, limit=8, *, platform=EVERYWHERE):
+        if calls is not None:
+            calls.append((query, platform))
+        return [dict(item) for item in (results or [])]
+
+    return search
+
+
+def _styles(harness) -> dict:
+    """Цвет каждой кнопки последнего экрана: callback_data → стиль."""
+    return {button.callback_data: button.style for row in harness.session.keyboard() for button in row}
 
 
 # ---------- фикстуры ----------
@@ -230,15 +251,15 @@ async def test_any_command_resets_the_dialog_and_shows_the_menu(harness, monkeyp
 
 
 async def test_text_after_a_command_is_not_taken_for_a_number(harness, monkeypatch):
-    calls: list[str] = []
-    monkeypatch.setattr(source_handlers, "search_videos", lambda query, limit=8: calls.append(query) or [])
+    calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(source_handlers, "search_videos", _fake_search(calls=calls))
     await _open_manual(harness, monkeypatch)
     await harness.press("type:num_clips")
     await harness.send("/start")
 
     await harness.send("7")
 
-    assert calls == ["7"]  # «7» ушло в поиск, а не в число клипов
+    assert calls == [("7", EVERYWHERE)]  # «7» ушло в поиск, а не в число клипов
 
 
 async def test_command_does_not_interrupt_a_running_job(harness, monkeypatch):
@@ -343,7 +364,7 @@ async def test_link_opens_the_mode_picker(harness, monkeypatch):
 
 async def test_search_result_opens_the_mode_picker(harness, monkeypatch):
     results = [dict(VIDEO, video_id=f"abcdefghij{n}", url=f"https://www.youtube.com/watch?v=abcdefghij{n}") for n in "12"]
-    monkeypatch.setattr(source_handlers, "search_videos", lambda query, limit=8: results)
+    monkeypatch.setattr(source_handlers, "search_videos", _fake_search(results))
 
     await harness.send("интервью дурова")
     assert harness.session.buttons()[:2] == ["pick:0", "pick:1"]
@@ -356,8 +377,7 @@ async def test_search_result_opens_the_mode_picker(harness, monkeypatch):
 
 
 async def test_picking_an_outdated_search_result_is_reported(harness, monkeypatch):
-    results = [dict(VIDEO)]
-    monkeypatch.setattr(source_handlers, "search_videos", lambda query, limit=8: results)
+    monkeypatch.setattr(source_handlers, "search_videos", _fake_search([VIDEO]))
     await harness.send("что-нибудь")
 
     await harness.press("pick:7")
@@ -369,18 +389,20 @@ async def test_short_search_query_is_reported_in_russian(harness):
     await harness.send("a")
 
     assert "Слишком короткое" in harness.session.last_text()
-    assert harness.session.buttons() == ["screen:menu"]
+    assert harness.session.buttons() == [*PROMPT_CHIPS, "screen:menu"]  # можно сразу написать запрос заново или сменить площадку
+    assert await _fsm(harness).get_state() == Flow.waiting_query.state
 
 
 async def test_search_failure_is_reported_with_a_way_back(harness, monkeypatch):
-    def boom(query, limit=8):
+    def boom(query, limit=8, *, platform=EVERYWHERE):
         raise RuntimeError("сеть упала")
 
     monkeypatch.setattr(source_handlers, "search_videos", boom)
     await harness.send("интервью")
 
     assert "Поиск не удался" in harness.session.last_text()
-    assert harness.session.buttons() == ["screen:menu"]
+    assert harness.session.buttons() == [*RETRY_CHIPS, "qp:all", "screen:menu"]  # тот же запрос — на другой площадке одной кнопкой
+    assert (await _fsm(harness).get_data())[QUERY_KEY] == "интервью"
 
 
 async def test_bad_link_says_what_is_wrong(harness):
@@ -397,7 +419,7 @@ async def test_bad_link_says_what_is_wrong(harness):
     ["https://www.youtube.com/@somechannel", "https://rutube.ru/", "https://vk.com", "vk.com.evil.com/video1_2"],
 )
 async def test_a_page_that_is_not_a_video_is_not_searched_as_a_title(harness, monkeypatch, link):
-    def forbidden(query, limit=8):
+    def forbidden(query, limit=8, *, platform=EVERYWHERE):
         raise AssertionError("ссылку нельзя искать как название")
 
     monkeypatch.setattr(source_handlers, "search_videos", forbidden)
@@ -446,7 +468,7 @@ async def test_search_results_name_the_platform_of_every_video(harness, monkeypa
         dict(VIDEO, title="Первый на ютубе"),
         dict(VIDEO, platform="rutube", title="Второй на рутубе", url="https://rutube.ru/video/" + "b" * 32 + "/"),
     ]
-    monkeypatch.setattr(source_handlers, "search_videos", lambda query, limit=8: results)
+    monkeypatch.setattr(source_handlers, "search_videos", _fake_search(results))
 
     await harness.send("интервью")
 
@@ -477,12 +499,148 @@ async def test_link_failure_is_reported_with_a_way_back(harness, monkeypatch):
 
 async def test_fresh_user_can_just_send_a_title_without_start(harness, monkeypatch):
     """После перезапуска бота состояние пустое — название всё равно уходит в поиск."""
-    calls: list[str] = []
-    monkeypatch.setattr(source_handlers, "search_videos", lambda query, limit=8: calls.append(query) or [])
+    calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(source_handlers, "search_videos", _fake_search(calls=calls))
 
     await harness.send("интервью дурова")
 
-    assert calls == ["интервью дурова"]
+    assert calls == [("интервью дурова", EVERYWHERE)]
+
+
+# ---------- выбор площадки при поиске ----------
+
+
+async def test_the_search_prompt_offers_a_choice_of_platform(harness):
+    await harness.press("ask:query")
+
+    text = harness.session.last_text()
+    assert "Что искать" in text and "Везде" in text and "только по ссылке" in text
+    assert harness.session.buttons() == [*PROMPT_CHIPS, "screen:menu"]
+    assert _styles(harness)["qp:all"] == "primary"
+    assert await _fsm(harness).get_state() == Flow.waiting_query.state
+    assert_valid_rich(harness.session.htmls()[-1])
+
+
+async def test_the_chosen_platform_is_marked_and_the_next_title_is_searched_only_there(harness, monkeypatch):
+    calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(source_handlers, "search_videos", _fake_search([VIDEO], calls))
+    await harness.press("ask:query")
+
+    await harness.press("qp:rutube")
+
+    assert "RuTube" in harness.session.last_text()
+    styles = _styles(harness)
+    assert styles["qp:rutube"] == "primary" and styles["qp:all"] is None
+    assert (await _fsm(harness).get_data())[SCOPE_KEY] == "rutube"
+    assert await _fsm(harness).get_state() == Flow.waiting_query.state
+
+    await harness.send("интервью")
+
+    assert calls == [("интервью", "rutube")]
+    assert "RuTube" in harness.session.last_text()
+    assert harness.session.buttons() == ["pick:0", *RETRY_CHIPS, "qp:rutube", "screen:menu"]
+    assert _styles(harness)["qs:rutube"] == "primary"
+    assert_valid_rich(harness.session.htmls()[-1])
+
+
+async def test_the_same_query_is_repeated_on_another_platform_with_one_button(harness, monkeypatch):
+    calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(source_handlers, "search_videos", _fake_search([VIDEO], calls))
+    await harness.send("интервью")
+
+    await harness.press("qs:dailymotion")
+
+    assert calls == [("интервью", EVERYWHERE), ("интервью", "dailymotion")]
+    data = await _fsm(harness).get_data()
+    assert data[QUERY_KEY] == "интервью" and data[SCOPE_KEY] == "dailymotion"
+    assert "Dailymotion" in harness.session.last_text()
+    assert _styles(harness)["qs:dailymotion"] == "primary"
+    assert await _fsm(harness).get_state() == Flow.choosing.state
+    shown = [plain_text(html) for html in harness.session.htmls()]
+    assert any("Ищу" in text and "Dailymotion" in text for text in shown)  # на время поиска — экран ожидания, не пустота
+
+
+async def test_a_failed_search_keeps_the_query_for_another_platform(harness, monkeypatch):
+    from app.services.downloader import DownloadError
+
+    calls: list[tuple[str, str]] = []
+
+    def search(query, limit=8, *, platform=EVERYWHERE):
+        calls.append((query, platform))
+        if platform == "youtube":
+            raise DownloadError("YouTube сейчас не отвечает — выберите другую площадку.")
+        return [dict(VIDEO, platform="rutube")]
+
+    monkeypatch.setattr(source_handlers, "search_videos", search)
+    await harness.press("qp:youtube")
+    await harness.send("кино")
+
+    assert "YouTube сейчас не отвечает" in harness.session.last_text()
+    assert harness.session.buttons() == [*RETRY_CHIPS, "qp:youtube", "screen:menu"]
+    assert _styles(harness)["qs:youtube"] == "primary"
+    assert await _fsm(harness).get_state() == Flow.waiting_query.state
+
+    await harness.press("qs:rutube")
+
+    assert calls == [("кино", "youtube"), ("кино", "rutube")]
+    assert harness.session.buttons()[0] == "pick:0" and await _fsm(harness).get_state() == Flow.choosing.state
+
+
+async def test_nothing_found_says_so_and_offers_the_other_platforms(harness, monkeypatch):
+    monkeypatch.setattr(source_handlers, "search_videos", _fake_search([]))
+
+    await harness.send("абракадабра")
+
+    assert "ничего не нашлось" in harness.session.last_text()
+    assert harness.session.buttons() == [*RETRY_CHIPS, "qp:all", "screen:menu"]
+
+
+async def test_the_search_again_button_keeps_the_chosen_platform(harness, monkeypatch):
+    monkeypatch.setattr(source_handlers, "search_videos", _fake_search([VIDEO]))
+    await harness.press("qp:rutube")
+    await harness.send("интервью")
+
+    await harness.press("qp:rutube")  # «🔄 Искать другое»
+
+    assert "Что искать" in harness.session.last_text() and _styles(harness)["qp:rutube"] == "primary"
+    assert await _fsm(harness).get_state() == Flow.waiting_query.state
+
+
+async def test_search_again_after_the_dialog_was_lost_asks_for_the_query(harness, monkeypatch):
+    calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(source_handlers, "search_videos", _fake_search([VIDEO], calls))
+
+    await harness.press("qs:rutube")  # например, бот перезапускался и память диалога пуста
+
+    assert calls == []
+    assert "Что искать" in harness.session.last_text() and _styles(harness)["qp:rutube"] == "primary"
+    assert await _fsm(harness).get_state() == Flow.waiting_query.state
+
+
+@pytest.mark.parametrize("data", ["qp:vk", "qp:nope", "qp:", "qp:youtube:x", "qs:vk", "qs:twitch", "qs:", "qs:rutube:x"])
+async def test_unknown_search_platform_is_reported(harness, data):
+    await harness.press(data)
+
+    assert harness.session.alerts() == ["Такой площадки нет — выберите из кнопок"]
+
+
+async def test_a_stale_search_scope_falls_back_to_everywhere(harness, monkeypatch):
+    calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(source_handlers, "search_videos", _fake_search([VIDEO], calls))
+    await harness.press("ask:query")
+    await _fsm(harness).update_data({SCOPE_KEY: "dzen"})  # у этой площадки поиска нет (или данные испорчены)
+
+    await harness.send("интервью")
+
+    assert calls == [("интервью", EVERYWHERE)]
+
+
+async def test_a_new_menu_search_forgets_the_previous_platform(harness, monkeypatch):
+    await harness.press("qp:rutube")
+
+    await harness.press("ask:query")
+
+    assert _styles(harness)["qp:all"] == "primary" and (await _fsm(harness).get_data())[SCOPE_KEY] == EVERYWHERE
 
 
 async def test_new_link_replaces_the_draft_and_forgets_pending_input(harness, monkeypatch):
@@ -538,7 +696,7 @@ async def test_auto_mode_builds_a_tiktok_plan_with_goal_buttons(harness, monkeyp
     draft = await _draft(harness)
     s = draft.settings
     assert draft.mode is CutMode.AUTO and draft.goal is Goal.TIKTOK
-    assert (s.num_clips, s.clip_duration) == (10, 25.0)
+    assert (s.num_clips, s.clip_duration) == (8, 45.0)  # TikTok: не короче 45 с, баннер сверху не в счёт
     assert s.slicing_mode is SlicingMode.HIGHLIGHTS and s.auto_trim
     assert s.frame_mode is FrameMode.CENTER_CROP
     assert s.banner_id == "TGrader-banner-7s.mp4" and s.banner_count == 1 and s.banner_sound
@@ -546,7 +704,7 @@ async def test_auto_mode_builds_a_tiktok_plan_with_goal_buttons(harness, monkeyp
     assert harness.session.buttons() == [
         "goal:tiktok", "goal:shorts", "goal:universal", "job:start", "mode:manual", "screen:mode",
     ]  # fmt: skip
-    assert "Нарезать 10 клипов" in " ".join(harness.session.button_texts())
+    assert "Нарезать 8 клипов" in " ".join(harness.session.button_texts())
     text = harness.session.last_text()
     assert "Авто-подбор" in text and "TikTok" in text and "Тестовый ролик" in text
     assert_valid_rich(harness.session.htmls()[-1])
@@ -563,7 +721,7 @@ async def test_changing_the_goal_rebuilds_the_plan(harness, monkeypatch):
     await harness.press("goal:shorts")
     draft = await _draft(harness)
     assert draft.goal is Goal.SHORTS
-    assert (draft.settings.num_clips, draft.settings.clip_duration) == (8, 40.0)
+    assert (draft.settings.num_clips, draft.settings.clip_duration) == (6, 50.0)
     assert "YouTube Shorts" in harness.session.last_text()
 
     await harness.press("goal:universal")
@@ -654,7 +812,7 @@ async def test_going_back_to_auto_recomputes_the_plan(harness, monkeypatch):
     await harness.press("mode:auto")
 
     draft = await _draft(harness)
-    assert draft.mode is CutMode.AUTO and draft.settings.num_clips == 10
+    assert draft.mode is CutMode.AUTO and draft.settings.num_clips == 8
 
 
 async def test_screens_without_a_draft_ask_for_a_video(harness):
@@ -917,14 +1075,15 @@ async def test_without_the_banner_file_clips_go_without_a_banner(harness, monkey
 # ---------- тренды ----------
 
 
-async def test_trends_home_lists_platforms_and_genres_and_goes_back(harness):
+async def test_trends_home_offers_a_choice_of_platform_and_genres_and_goes_back(harness):
     await harness.press("screen:trends")
 
     text = harness.session.last_text()
-    assert "В тренде" in text and "TikTok" in text and "YouTube" in text
+    assert "В тренде" in text and "TikTok" in text and "Везде" in text
     buttons = harness.session.buttons()
-    assert buttons[:2] == ["trends:youtube", "trends:rutube"]
-    assert "trend:youtube:podcast" in buttons and buttons[-1] == "screen:menu"
+    assert buttons[:3] == ["trends:all", "trends:youtube", "trends:rutube"]
+    assert "trend:all:podcast" in buttons and buttons[-1] == "screen:menu"
+    assert _styles(harness)["trends:all"] == "primary"  # по умолчанию тренды сразу со всех площадок
     assert_valid_rich(harness.session.htmls()[-1])
 
 
@@ -933,9 +1092,9 @@ async def test_the_platform_switch_marks_the_current_one_and_shows_its_genres(ha
 
     assert "RuTube" in harness.session.last_text()
     buttons = harness.session.buttons()
-    assert "trend:rutube:podcast" in buttons and "trend:youtube:podcast" not in buttons
-    styles = {button.callback_data: button.style for row in harness.session.keyboard() for button in row}
-    assert styles["trends:rutube"] == "primary" and styles["trends:youtube"] is None
+    assert "trend:rutube:podcast" in buttons and "trend:youtube:podcast" not in buttons and "trend:all:podcast" not in buttons
+    styles = _styles(harness)
+    assert styles["trends:rutube"] == "primary" and styles["trends:youtube"] is None and styles["trends:all"] is None
     assert_valid_rich(harness.session.htmls()[-1])
 
 
@@ -958,7 +1117,11 @@ async def test_trend_genre_lists_videos_and_is_cached(harness, monkeypatch):
 
     text = harness.session.last_text()
     assert "Подкаст номер 1" in text and "1,5 млн" in text and "Канал 2" in text
-    assert harness.session.buttons() == ["pick:0", "pick:1", "pick:2", "trends:youtube", "screen:menu"]
+    assert harness.session.buttons() == [
+        "pick:0", "pick:1", "pick:2", "trend:all:podcast", "trend:youtube:podcast", "trend:rutube:podcast",
+        "trends:youtube", "screen:menu",
+    ]  # fmt: skip
+    assert _styles(harness)["trend:youtube:podcast"] == "primary"  # тот же жанр на другой площадке — одной кнопкой
     assert_valid_rich(harness.session.htmls()[-1])
     assert await _fsm(harness).get_state() == Flow.choosing.state
 
@@ -1073,16 +1236,149 @@ async def test_empty_trend_list_is_not_cached(harness, monkeypatch):
     assert "Подкаст номер 1" in harness.session.last_text()
 
 
+def _trend_videos(platform: str, count: int = 3) -> list[dict]:
+    """Подборка одной площадки: у роликов её значок, название и адрес."""
+    host = "https://rutube.ru/video/" if platform == "rutube" else "https://www.youtube.com/watch?v="
+    return [
+        dict(video, platform=platform, title=f"{platform} {video['title']}", url=f"{host}{platform[0] * 31}{index}{'/' * (platform == 'rutube')}")
+        for index, video in enumerate(TRENDING[:count])
+    ]
+
+
+def _platform_fetch(per_platform: dict, calls: list | None = None):
+    """Подмена `fetch_category` с разным ответом у каждой площадки: список роликов или исключение (читается в момент вызова)."""
+
+    def fetch(category, platform="youtube", limit=8):
+        if calls is not None:
+            calls.append((platform, category.id))
+        answer = per_platform[platform]
+        if isinstance(answer, Exception):
+            raise answer
+        return [dict(item) for item in answer]
+
+    return fetch
+
+
+async def test_everywhere_trends_mix_both_platforms_and_share_the_cache(harness, monkeypatch):
+    calls: list[tuple[str, str]] = []
+    answers = {"youtube": _trend_videos("youtube"), "rutube": _trend_videos("rutube")}
+    monkeypatch.setattr(trend_handlers, "fetch_category", _platform_fetch(answers, calls))
+
+    await harness.press("trend:all:podcast")
+
+    assert sorted(calls) == [("rutube", "podcast"), ("youtube", "podcast")]
+    text = harness.session.last_text()
+    assert "youtube Подкаст номер 1" in text and "rutube Подкаст номер 1" in text and "Везде" in text
+    labels = harness.session.button_texts()
+    assert labels[0].startswith("1. ▶️") and labels[1].startswith("2. 📺")  # вперемешку: первый с одной, первый с другой…
+    assert harness.session.buttons()[:6] == [f"pick:{index}" for index in range(6)]
+    assert _styles(harness)["trend:all:podcast"] == "primary"
+    assert await _fsm(harness).get_state() == Flow.choosing.state
+    assert_valid_rich(harness.session.htmls()[-1])
+
+    await harness.press("trend:rutube:podcast")  # кеш общий с «Везде»: площадки заново не спрашиваем
+    await harness.press("trend:youtube:podcast")
+    await harness.press("trend:all:podcast")
+    assert len(calls) == 2
+
+
+async def test_everywhere_trends_show_the_survivor_when_one_platform_is_down(harness, monkeypatch):
+    from app.services.trends import TrendsError
+
+    answers = {
+        "youtube": TrendsError("YouTube сейчас не отвечает — попробуйте через пару минут."),
+        "rutube": _trend_videos("rutube"),
+    }
+    monkeypatch.setattr(trend_handlers, "fetch_category", _platform_fetch(answers))
+
+    await harness.press("trend:all:humor")
+
+    text = harness.session.last_text()
+    assert "rutube Подкаст номер 1" in text and "YouTube сейчас не ответил" in text
+    assert harness.session.buttons()[:3] == ["pick:0", "pick:1", "pick:2"]
+    assert await _fsm(harness).get_state() == Flow.choosing.state
+    assert_valid_rich(harness.session.htmls()[-1])
+
+
+async def test_everywhere_trends_report_an_error_only_when_nobody_answers(harness, monkeypatch):
+    from app.services.trends import TrendsError
+
+    answers = {"youtube": TrendsError("YouTube сейчас не отвечает."), "rutube": ValueError("внезапно")}
+    monkeypatch.setattr(trend_handlers, "fetch_category", _platform_fetch(answers))
+
+    await harness.press("trend:all:games")
+
+    text = harness.session.last_text()
+    assert "Ни одна площадка сейчас не отвечает" in text and "внезапно" not in text
+    assert harness.session.buttons() == ["trend:all:games", "trends:all"]
+    assert await _fsm(harness).get_state() != Flow.choosing.state
+
+
+async def test_everywhere_trends_do_not_cache_an_empty_platform(harness, monkeypatch):
+    calls: list[tuple[str, str]] = []
+    answers = {"youtube": [], "rutube": _trend_videos("rutube")}
+    monkeypatch.setattr(trend_handlers, "fetch_category", _platform_fetch(answers, calls))
+    await harness.press("trend:all:sport")
+    assert harness.session.buttons()[:3] == ["pick:0", "pick:1", "pick:2"]  # пока только RuTube
+
+    answers["youtube"] = _trend_videos("youtube")  # YouTube наконец ответил
+    await harness.press("trend:all:sport")
+
+    assert sorted(calls) == [("rutube", "sport"), ("youtube", "sport"), ("youtube", "sport")]  # RuTube — из кеша
+    assert "youtube Подкаст номер 1" in harness.session.last_text()
+
+
+async def test_the_loading_screen_for_everywhere_names_no_single_platform(harness, monkeypatch):
+    monkeypatch.setattr(trend_handlers, "fetch_category", _fake_fetch())
+
+    await harness.press("trend:all:humor")
+
+    shown = [plain_text(html) for html in harness.session.htmls()]
+    assert any("Смотрю, что сейчас в тренде" in text and "на всех площадках" in text for text in shown)
+
+
+async def test_picking_a_video_from_everywhere_trends_remembers_its_platform(harness, monkeypatch):
+    monkeypatch.setattr(mode_handlers, "_can_follow_faces", lambda: False)
+    answers = {"youtube": _trend_videos("youtube"), "rutube": _trend_videos("rutube")}
+    monkeypatch.setattr(trend_handlers, "fetch_category", _platform_fetch(answers))
+    await harness.press("trend:all:podcast")
+
+    await harness.press("pick:1")  # вторым в списке идёт ролик RuTube
+
+    draft = await _draft(harness)
+    assert draft.platform == "rutube" and draft.url.startswith("https://rutube.ru/video/")
+    assert draft.mode is CutMode.AUTO and draft.goal is Goal.TIKTOK
+
+
+async def test_the_movies_genre_asks_each_platform_its_own_queries(harness, monkeypatch):
+    seen: dict[str, tuple[str, ...]] = {}
+
+    def fetch(category, platform="youtube", limit=8):
+        seen[platform] = category.queries_for(platform)
+        return _trend_videos(platform)
+
+    monkeypatch.setattr(trend_handlers, "fetch_category", fetch)
+
+    await harness.press("trend:all:movies")
+
+    assert set(seen) == {"youtube", "rutube"} and seen["youtube"] != seen["rutube"]  # на RuTube — целые фильмы и сериалы
+    assert "VK Видео" in harness.session.last_text()  # и честная подсказка, где их больше всего
+
+
 @pytest.mark.parametrize(
     ("data", "alert"),
     [
         ("trend:youtube:nothing", "Такого раздела нет"),
+        ("trend:all:nothing", "Такого раздела нет"),
         ("trend:nothing", "Такого раздела нет"),
         ("trend:nope:podcast", "Такого раздела нет"),
         ("trend:vk:podcast", "Такого раздела нет"),  # у VK нет ни поиска, ни трендов
         ("trend:a:b:c", "Такого раздела нет"),
         ("trend:", "Такого раздела нет"),
         ("trends:nope", "Такой площадки нет"),
+        ("trends:all:x", "Такой площадки нет"),
+        ("trends:dailymotion", "Такой площадки нет"),  # у Dailymotion есть поиск, но нет раздела «В тренде»
+        ("trend:dailymotion:podcast", "Такого раздела нет"),
         ("trends:vk", "Такой площадки нет"),
         ("trends:", "Такой площадки нет"),
     ],
@@ -1177,6 +1473,92 @@ async def test_auto_plan_converts_into_a_valid_job_request(harness, monkeypatch)
     assert request.slicing_mode is SlicingMode.HIGHLIGHTS and request.auto_trim
     assert request.url == VIDEO["url"]
     assert await _fsm(harness).get_state() == Flow.running.state
+
+
+async def test_start_is_refused_while_the_queue_is_full(harness, monkeypatch):
+    started = []
+
+    async def start(chat_id, user_id, request, message):
+        started.append(request)
+        return "job-1"
+
+    monkeypatch.setenv("MAX_QUEUE", "2")
+    monkeypatch.setattr(harness.ctx.manager, "unfinished", lambda: 2)
+    monkeypatch.setattr(harness.ctx.runner, "start", start)
+    await _open_auto(harness, monkeypatch)
+
+    await harness.press("job:start")
+
+    assert "очередь" in harness.session.last_alert().lower() and not started
+    assert await _fsm(harness).get_state() == Flow.editing.state  # план остался на экране: можно нажать ещё раз
+    assert "job:start" in harness.session.buttons()
+
+    monkeypatch.setattr(harness.ctx.manager, "unfinished", lambda: 1)  # одно место освободилось
+    await harness.press("job:start")
+    assert len(started) == 1
+
+
+async def test_start_is_refused_when_the_disk_is_almost_full(harness, monkeypatch):
+    started = []
+
+    async def start(chat_id, user_id, request, message):
+        started.append(request)
+        return "job-1"
+
+    monkeypatch.setattr(capacity, "free_bytes", lambda path: 1 * 1024**3)
+    monkeypatch.setattr(harness.ctx.runner, "start", start)
+    await _open_auto(harness, monkeypatch)
+
+    await harness.press("job:start")
+
+    assert "места" in harness.session.last_alert() and not started
+    assert "job:start" in harness.session.buttons()
+
+
+async def test_the_limits_are_off_when_the_environment_says_zero(harness, monkeypatch):
+    started = []
+
+    async def start(chat_id, user_id, request, message):
+        started.append(request)
+        return "job-1"
+
+    monkeypatch.setenv("MAX_QUEUE", "0")
+    monkeypatch.setenv("MIN_FREE_GB", "0")
+    monkeypatch.setattr(harness.ctx.manager, "unfinished", lambda: 99)
+    monkeypatch.setattr(capacity, "free_bytes", lambda path: 0)
+    monkeypatch.setattr(harness.ctx.runner, "start", start)
+    await _open_auto(harness, monkeypatch)
+
+    await harness.press("job:start")
+
+    assert len(started) == 1
+
+
+async def test_a_waiting_job_shows_its_place_in_the_queue_and_can_be_stopped(harness, monkeypatch):
+    from app.bot import runner as runner_module
+    from app.bot.runner import RunningJob
+
+    shown = []
+
+    async def edit(message, html, markup=None):
+        shown.append((html, markup))
+
+    monkeypatch.setattr(runner_module, "edit_html", edit)
+    manager = harness.ctx.manager
+    first, second = manager._create(), manager._create()  # noqa: SLF001 — обе стоят в очереди
+
+    async def progress(job_id):
+        running = RunningJob(job_id=job_id, chat_id=1, user_id=1, message=None, state=manager.get(job_id))
+        await harness.ctx.runner._edit_progress(running)  # noqa: SLF001
+        return shown[-1]
+
+    html, markup = await progress(first)
+    assert "Перед вами" not in plain_text(html)  # он следующий — ждать некого
+    assert [button.callback_data for row in markup.inline_keyboard for button in row] == [f"job:cancel:{first}"]
+
+    html, markup = await progress(second)
+    assert "Перед вами в очереди: 1" in plain_text(html)
+    assert [button.callback_data for row in markup.inline_keyboard for button in row] == [f"job:cancel:{second}"]
 
 
 async def test_start_failure_is_reported_and_the_dialog_stays_editable(harness, monkeypatch):
@@ -1281,10 +1663,15 @@ async def test_a_full_tour_only_uses_valid_rich_markup(harness, monkeypatch):
     """Все основные экраны подряд: ни один не нарушает правил rich-разметки."""
     monkeypatch.setattr(mode_handlers, "_can_follow_faces", lambda: True)
     monkeypatch.setattr(trend_handlers, "fetch_category", _fake_fetch())
+    monkeypatch.setattr(source_handlers, "search_videos", _fake_search([VIDEO, dict(VIDEO, platform="rutube")]))
     await harness.send("/start")
+    for data in ("ask:query", "qp:rutube"):
+        await harness.press(data)
+    await harness.send("интервью")
+    await harness.press("qs:youtube")
     for data in (
         "screen:help", "screen:stats", "screen:banners", "screen:trends", "trends:rutube", "trend:rutube:podcast",
-        "screen:trends", "trend:youtube:podcast", "pick:0",
+        "trend:all:podcast", "screen:trends", "trend:youtube:podcast", "pick:0",
     ):  # fmt: skip
         await harness.press(data)
     await harness.press("mode:manual")
@@ -1328,8 +1715,8 @@ def test_no_command_filters_at_all(bot_settings):
 def test_bot_texts_never_point_to_commands():
     command = re.compile(r"(?<![\w/:.…])/[a-z]{3,}(?![\w/])")
     screens = [
-        texts.START, texts.HELP, texts.NUDGE, texts.REQUEST_LINK, texts.REQUEST_QUERY, texts.REQUEST_FILE,
-        texts.BAD_LINK, texts.STALE, texts.NOT_ALLOWED, texts.stats_text(1, 2, 3), texts.trends_home(YOUTUBE),
+        texts.START, texts.HELP, texts.NUDGE, texts.REQUEST_LINK, texts.request_query(), texts.REQUEST_FILE,
+        texts.BAD_LINK, texts.STALE, texts.NOT_ALLOWED, texts.stats_text(1, 2, 3), texts.trends_home(),
         texts.BUSY, texts.CANCELLED, texts.FILE_TOO_BIG, texts.NOT_A_VIDEO,
     ]  # fmt: skip
     for screen in screens:
@@ -1338,8 +1725,8 @@ def test_bot_texts_never_point_to_commands():
 
 
 def test_main_menu_texts_use_only_documented_rich_tags():
-    for screen in (texts.START, texts.HELP, texts.REQUEST_LINK, texts.REQUEST_QUERY, texts.REQUEST_FILE, texts.BAD_LINK,
-                   texts.QUEUED_TEXT, texts.NUDGE, texts.BUSY, texts.CANCELLED, texts.stats_text(1, 2, 3), texts.trends_home(YOUTUBE)):  # fmt: skip
+    for screen in (texts.START, texts.HELP, texts.REQUEST_LINK, texts.request_query(), texts.REQUEST_FILE, texts.BAD_LINK,
+                   texts.QUEUED_TEXT, texts.NUDGE, texts.BUSY, texts.CANCELLED, texts.stats_text(1, 2, 3), texts.trends_home()):  # fmt: skip
         assert_valid_rich(screen)
 
 
@@ -1361,8 +1748,12 @@ def _all_keyboards(harness):
     yield keyboards.main_menu()
     yield keyboards.back_to_menu()
     yield keyboards.cancel_only()
+    yield keyboards.search_results([])
     yield keyboards.search_results([dict(VIDEO), dict(VIDEO)])
-    yield keyboards.search_results([dict(VIDEO), dict(VIDEO, platform="rutube")])
+    yield keyboards.search_results([dict(VIDEO), dict(VIDEO, platform="rutube")], "rutube")
+    for choice in (EVERYWHERE, *(platform.id for platform in SEARCHABLE)):
+        yield keyboards.query_prompt(choice)
+        yield keyboards.search_results([dict(VIDEO)], choice)
     yield keyboards.mode_picker()
     for goal in Goal:
         yield keyboards.auto_screen(goal, 7)
@@ -1372,10 +1763,10 @@ def _all_keyboards(harness):
     yield keyboards.trim_screen(draft.settings)
     yield keyboards.banners_screen(banner.name)
     yield keyboards.banners_screen(None)
-    for platform in SEARCHABLE:
-        yield keyboards.trends_home(platform.id)
-        yield keyboards.trend_results(TRENDING, platform.id)
-        yield keyboards.trends_retry(platform.id, "podcast")
+    for choice in (EVERYWHERE, *(platform.id for platform in TREND_PLATFORMS)):
+        yield keyboards.trends_home(choice)
+        yield keyboards.trend_results(TRENDING, choice, "podcast")
+        yield keyboards.trends_retry(choice, "podcast")
     yield keyboards.running("abc123")
     yield keyboards.done()
     for stepper in STEPPERS.values():
@@ -1410,7 +1801,12 @@ def test_button_colors_follow_their_meaning(harness):
     assert styles(keyboards.main_menu())["ask:link"] == "primary"
     assert styles(keyboards.mode_picker())["mode:auto"] == "primary"
     chips = styles(keyboards.trends_home("rutube"))
-    assert chips["trends:rutube"] == "primary" and chips["trends:youtube"] is None
+    assert chips["trends:rutube"] == "primary" and chips["trends:youtube"] is None and chips["trends:all"] is None
+    assert styles(keyboards.trends_home())["trends:all"] == "primary"  # без выбора — «Везде»
+    prompt = styles(keyboards.query_prompt("dailymotion"))
+    assert prompt["qp:dailymotion"] == "primary" and prompt["qp:all"] is None and prompt["qp:rutube"] is None
+    again = styles(keyboards.search_results([dict(VIDEO)], "youtube"))
+    assert again["qs:youtube"] == "primary" and again["qs:rutube"] is None and again["qp:youtube"] is None
 
 
 def test_search_buttons_show_platform_badges_only_when_platforms_are_mixed():

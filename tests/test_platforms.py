@@ -6,18 +6,21 @@ import pytest
 from app.services.platforms import (
     DAILYMOTION,
     DZEN,
+    EVERYWHERE,
     KICK,
     OK,
     PLATFORM_BY_ID,
     PLATFORMS,
     RUTUBE,
     SEARCHABLE,
+    TRENDING,
     TWITCH,
     VK,
     VKPLAY,
     YOUTUBE,
     identify,
     mentions_known_site,
+    scope,
     titles,
 )
 
@@ -97,6 +100,21 @@ def test_links_of_other_platforms_are_recognised_with_a_per_platform_key(url, pl
     source = identify(url)
     assert source is not None and source.platform is platform
     assert source.key == key
+
+
+@pytest.mark.parametrize(
+    ("url", "video_id"),
+    [
+        (f"https://youtu.be/{YOUTUBE_ID}?t=5", YOUTUBE_ID),
+        (f"https://rutube.ru/video/{RUTUBE_ID}/", RUTUBE_ID),
+        (f"https://rutube.ru/video/private/{RUTUBE_ID}/?p=secret", RUTUBE_ID),
+        ("https://vk.com/video-22822305_456239018", "-22822305_456239018"),
+        ("https://www.dailymotion.com/video/x8abcd", "x8abcd"),
+        ("https://rutube.ru/channel/123/", None),  # id из адреса не достать
+    ],
+)
+def test_the_video_id_is_taken_from_the_link(url, video_id):
+    assert identify(url).video_id == video_id
 
 
 def test_vk_play_is_not_mistaken_for_vk():
@@ -183,8 +201,40 @@ def test_the_registry_is_consistent():
         assert re.fullmatch(r"[a-z]+", platform.id)  # едет в callback_data и в имя файла кеша
 
 
-def test_only_youtube_and_rutube_have_search_and_trends():
-    assert [platform.id for platform in SEARCHABLE] == ["youtube", "rutube"]
+def test_search_is_offered_where_an_open_api_exists():
+    # VK Видео, Дзен и OK не отдают результаты без входа, Twitch и Kick ищут только по каналам — у них работают ссылки
+    assert [platform.id for platform in SEARCHABLE] == ["youtube", "rutube", "dailymotion"]
+
+
+def test_trends_need_enough_russian_videos_so_dailymotion_has_none():
+    assert [platform.id for platform in TRENDING] == ["youtube", "rutube"]
+    assert set(TRENDING) <= set(SEARCHABLE)
+
+
+# ---------- выбор площадки ----------
+
+
+def test_scope_everywhere_means_every_platform_of_the_list():
+    assert scope(EVERYWHERE, SEARCHABLE) == SEARCHABLE
+    assert scope(EVERYWHERE, TRENDING) == TRENDING
+
+
+def test_scope_of_one_platform_is_just_that_platform():
+    assert scope("rutube", SEARCHABLE) == (RUTUBE,)
+    assert scope("dailymotion", SEARCHABLE) == (DAILYMOTION,)
+
+
+@pytest.mark.parametrize("choice", ["", None, "vk", "nope", "ALL", "youtube,rutube"])
+def test_scope_refuses_what_the_list_does_not_offer(choice):
+    assert scope(choice, SEARCHABLE) is None
+
+
+def test_a_platform_without_trends_cannot_be_chosen_for_trends():
+    assert scope("dailymotion", TRENDING) is None
+
+
+def test_the_everywhere_id_cannot_clash_with_a_platform():
+    assert EVERYWHERE not in PLATFORM_BY_ID
 
 
 def test_titles_lists_every_platform_for_error_messages():

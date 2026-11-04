@@ -6,19 +6,24 @@
 """
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 from app.bot.options import CHOICES
 from app.bot.rich import esc
 from app.bot.steppers import Stepper
 from app.config import MAX_SOURCE_SECONDS
 from app.models import ClipSettings, Draft, JobState, JobStatus
 from app.services.autoplan import AutoPlan
-from app.services.platforms import PLATFORM_BY_ID, PLATFORMS, Platform
+from app.services.platforms import EVERYWHERE, PLATFORM_BY_ID, PLATFORMS, SEARCHABLE, TRENDING, Platform
 from app.services.search import RESULTS
 from app.services.trends import CATEGORIES, PERIOD_TEXT, Category, views_text
 
 NAME = "TgRader Clipper"
 PLATFORM_LIST = " · ".join(f"{platform.emoji} {platform.title}" for platform in PLATFORMS)
-SEARCH_SITES = " и ".join(f"{platform.emoji} {platform.title}" for platform in PLATFORMS if platform.search)
+SEARCH_SITES = ", ".join(f"{platform.emoji} {platform.title}" for platform in SEARCHABLE)
+TREND_SITES = " и ".join(f"{platform.emoji} {platform.title}" for platform in TRENDING)
+LINK_ONLY_SITES = ", ".join(f"{platform.emoji} {platform.title}" for platform in PLATFORMS if not platform.search)
+LINK_ONLY_NOTE = f"{LINK_ONLY_SITES} — только по ссылке: искать на них бот не умеет."
 MAX_HOURS = MAX_SOURCE_SECONDS // 3600
 
 # ---------- главное меню и справка ----------
@@ -50,13 +55,14 @@ HELP = f"""\
 <details><summary>🌐 Откуда беру ролики</summary>
 <ul>
 <li>🔗 <b>По ссылке</b> — {PLATFORM_LIST}.</li>
-<li>🔍 <b>По названию</b> — ищу на {SEARCH_SITES}.</li>
-<li>🔥 <b>В тренде</b> — подборки тех же {SEARCH_SITES}.</li>
+<li>🔍 <b>По названию</b> — {SEARCH_SITES}: можно выбрать одну площадку или искать везде.</li>
+<li>🔥 <b>В тренде</b> — подборки {TREND_SITES}.</li>
 </ul>
-<p><i>Берутся только записи — не прямые эфиры, и не длиннее {MAX_HOURS} часов.</i></p>
+<p>{LINK_ONLY_NOTE}</p>
+<p><i>Берутся только записи — не прямые эфиры, не длиннее {MAX_HOURS} часов и не по платной подписке.</i></p>
 </details>
 <details><summary>🔥 Раздел «В тренде»</summary>
-<p>Самые просматриваемые свежие ролики на русском по жанрам: подкасты, юмор, игры, бизнес, кино, спорт. Площадку можно переключить. Выберите ролик — и сразу получите план нарезки под TikTok.</p>
+<p>Самые просматриваемые свежие ролики на русском по жанрам: подкасты, юмор, игры, бизнес, кино, спорт. Площадку можно выбрать — или смотреть везде сразу. Выберите ролик — и сразу получите план нарезки под TikTok.</p>
 <p><i>Данные обновляются раз в полчаса.</i></p>
 </details>
 <details><summary>🎬 Как работает баннер</summary>
@@ -78,11 +84,6 @@ REQUEST_LINK = f"""\
 <p>{PLATFORM_LIST}</p>
 <blockquote>Например: <code>https://rutube.ru/video/…</code> или <code>https://youtu.be/…</code></blockquote>"""
 
-REQUEST_QUERY = f"""\
-<h3>🔍 Что искать?</h3>
-<p>Напишите название ролика — поищу на {SEARCH_SITES} и покажу до <b>{RESULTS}</b> вариантов.</p>
-<blockquote>Можно уточнить: «дуров интервью лекс фридман»</blockquote>"""
-
 REQUEST_FILE = """\
 <h3>📁 Пришлите видеофайл</h3>
 <p>Подойдут <b>mp4</b>, <b>mov</b> и <b>mkv</b> — до <b>20 МБ</b>.</p>
@@ -91,8 +92,6 @@ REQUEST_FILE = """\
 NUDGE = "<p>👇 Выберите действие кнопкой — или пришлите <b>ссылку</b>, <b>название</b> или <b>видеофайл</b>.</p>"
 NOT_ALLOWED = "🔒 Это закрытый бот.\nВаш ID: <code>{user_id}</code> — передайте его владельцу, чтобы он добавил вас."
 
-SEARCHING = f"<p>🔍 Ищу на {SEARCH_SITES}: " + "<b>{query}</b>…</p>"
-SEARCH_NOTHING = "<p>🫥 По запросу «{query}» ничего не нашлось.</p><p>Попробуйте другое название или пришлите ссылку.</p>"
 FETCHING = "<p>⏳ Смотрю ролик…</p>"
 
 BAD_LINK = f"""\
@@ -100,7 +99,8 @@ BAD_LINK = f"""\
 <p>Беру ролики отсюда:</p>
 <p>{PLATFORM_LIST}</p>
 <p>Нужна ссылка именно на <b>ролик</b> — не на канал, плейлист или главную страницу.</p>
-<blockquote>Или просто пришлите <b>название</b> — поищу на {SEARCH_SITES}.</blockquote>"""
+<blockquote>Или просто пришлите <b>название</b> — поищу на {SEARCH_SITES}.</blockquote>
+<footer>{LINK_ONLY_NOTE}</footer>"""
 
 DOWNLOADING_FILE = "<p>⏳ Скачиваю видеофайл…</p>"
 FILE_TOO_BIG = "<p>📦 Файл больше <b>20 МБ</b> — обычный бот такой не примет.</p><p>Пришлите ссылку на ролик: качество выберем сами.</p>"
@@ -142,7 +142,27 @@ def platform_tag(platform_id: str | None) -> str:
     return f"{platform.emoji} {platform.title}" if platform else ""
 
 
-def search_cards(entries: list[dict]) -> str:
+def scope_label(choice: str) -> str:
+    """Где ищем: «🌐 Везде» или «📺 RuTube»."""
+    return "🌐 Везде" if choice == EVERYWHERE else platform_tag(choice)
+
+
+def request_query(choice: str = EVERYWHERE) -> str:
+    """Экран «Что искать?» с выбранной площадкой и честной оговоркой про площадки без поиска."""
+    where = f"{scope_label(choice)} ({SEARCH_SITES})" if choice == EVERYWHERE else scope_label(choice)
+    return f"""\
+<h3>🔍 Что искать?</h3>
+<p>Напишите название ролика — покажу до <b>{RESULTS}</b> вариантов.</p>
+<p>Где искать: <b>{where}</b>. Площадку можно сменить кнопками ниже.</p>
+<blockquote>Можно уточнить: «дуров интервью лекс фридман»</blockquote>
+<footer>{LINK_ONLY_NOTE}</footer>"""
+
+
+def searching(query: str, choice: str = EVERYWHERE) -> str:
+    return f"<p>🔍 Ищу ({scope_label(choice)}): <b>{esc(query)}</b>…</p>"
+
+
+def search_cards(entries: list[dict], choice: str = EVERYWHERE) -> str:
     items = []
     for entry in entries:
         title = esc(entry.get("title") or "Без названия")
@@ -156,7 +176,11 @@ def search_cards(entries: list[dict]) -> str:
             if part
         )
         items.append(f"<li><b>{title}</b><br/><i>{meta}</i></li>")
-    return "<h3>🔍 Нашёл такие ролики</h3><p>Выберите нужный:</p><ol>" + "".join(items) + "</ol>"
+    return (
+        "<h3>🔍 Нашёл такие ролики</h3><p>Выберите нужный:</p><ol>"
+        + "".join(items)
+        + f"</ol><footer>{scope_label(choice)} · тот же запрос на другой площадке — кнопками ниже</footer>"
+    )
 
 
 # ---------- карточка ролика ----------
@@ -348,8 +372,11 @@ def progress_bar(percent: float) -> str:
 QUEUED_TEXT = "<h3>⏳ Задача в очереди</h3><p>Начну, как только освободится сервер.</p>"
 
 
-def progress_text(state: JobState) -> str:
-    """Сообщение-прогресс: стадия, полоса, счётчик клипов и (свёрнуто) последние строки лога."""
+def progress_text(state: JobState, ahead: int = 0) -> str:
+    """Сообщение-прогресс: стадия, полоса, счётчик клипов и (свёрнуто) последние строки лога.
+
+    `ahead` — сколько задач впереди; показывается только у ждущей очереди задачи.
+    """
     head = {
         JobStatus.QUEUED: "⏳ Задача в очереди",
         JobStatus.RUNNING: f"⚙️ {esc(state.stage)}",
@@ -357,7 +384,10 @@ def progress_text(state: JobState) -> str:
         JobStatus.ERROR: "❌ Ошибка",
         JobStatus.CANCELLED: "⏹ Отменено",
     }[state.status]
-    parts = [f"<h3>{head}</h3>", f"<p><code>{progress_bar(state.progress)}</code> <b>{state.progress:.0f}%</b></p>"]
+    parts = [f"<h3>{head}</h3>"]
+    if state.status is JobStatus.QUEUED and ahead > 0:
+        parts.append(f"<p>🧍 Перед вами в очереди: <b>{ahead}</b>. Начну, как только дойдёт очередь.</p>")
+    parts.append(f"<p><code>{progress_bar(state.progress)}</code> <b>{state.progress:.0f}%</b></p>")
     if state.clips:
         parts.append(f"<p>🎞 Клипов готово: <b>{len(state.clips)}</b></p>")
     trim = state.trim
@@ -425,15 +455,16 @@ BANNER_PREVIEW_CAPTION = "<b>TGrader</b> · {seconds} · со звуком"
 # ---------- тренды ----------
 
 
-def trends_loading(category: Category, platform: Platform) -> str:
+def trends_loading(category: Category, choice: str = EVERYWHERE) -> str:
+    where = "на всех площадках" if choice == EVERYWHERE else f"на {scope_label(choice)}"
     return (
         f"<h2>{category.emoji} {esc(category.title)}</h2>"
-        f"<p>🔥 Смотрю, что сейчас в тренде на {platform.emoji} {platform.title}…</p>"
+        f"<p>🔥 Смотрю, что сейчас в тренде {where}…</p>"
         "<footer>В первый раз это занимает несколько секунд</footer>"
     )
 
 
-def trends_home(platform: Platform) -> str:
+def trends_home(choice: str = EVERYWHERE) -> str:
     items = "".join(
         f"<li>{category.emoji} <b>{esc(category.title)}</b> — {esc(category.hint)}</li>" for category in CATEGORIES
     )
@@ -441,21 +472,27 @@ def trends_home(platform: Platform) -> str:
 <h1>🔥 В тренде</h1>
 <p>Что <b>прямо сейчас</b> смотрят русскоязычные зрители. Выберите площадку и жанр — покажу самые просматриваемые ролики, которые стоит нарезать на <b>TikTok</b> и <b>Shorts</b>.</p>
 <ul>{items}</ul>
-<footer>{platform.emoji} {platform.title}: данные {PERIOD_TEXT[platform.id]} · обновляются раз в полчаса</footer>"""
+<footer>{scope_label(choice)}: данные {PERIOD_TEXT.get(choice, "за последнее время")} · обновляются раз в полчаса</footer>"""
 
 
-def trend_list(category: Category, videos: list[dict], platform: Platform) -> str:
+def trend_list(category: Category, videos: list[dict], choice: str = EVERYWHERE, *, missing: Sequence[Platform] = ()) -> str:
+    """Список трендов жанра. `missing` — площадки, которые сейчас не ответили (на них показывать нечего, но скрывать это нечестно)."""
+    head = f"<h2>{category.emoji} {esc(category.title)}</h2>"
+    notes = [f"⚠️ {platform.title} сейчас не ответил — показываю остальные." for platform in missing]
+    if category.note:
+        notes.append(category.note)
+    note = f"<footer>{'<br/>'.join(esc(line) for line in notes)}</footer>" if notes else ""
     if not videos:
         return (
-            f"<h2>{category.emoji} {esc(category.title)}</h2>"
-            f"<p>🫥 На {platform.emoji} {platform.title} сейчас ничего подходящего не нашлось. "
-            "Загляните позже, выберите другой жанр или другую площадку.</p>"
+            f"{head}<p>🫥 {scope_label(choice)}: сейчас ничего подходящего не нашлось. "
+            f"Загляните позже, выберите другой жанр или другую площадку.</p>{note}"
         )
     items = []
     for video in videos:
         meta = " · ".join(
             part
             for part in (
+                platform_tag(video.get("platform")) if choice == EVERYWHERE else "",
                 esc(video.get("uploader") or ""),
                 "⏱ " + duration_text(video.get("duration") or 0),
                 "👁 " + views_text(int(video.get("views") or 0)),
@@ -463,11 +500,13 @@ def trend_list(category: Category, videos: list[dict], platform: Platform) -> st
             if part
         )
         items.append(f"<li><b>{esc(video['title'])}</b><br/><i>{meta}</i></li>")
+    period = PERIOD_TEXT.get(choice, "за последнее время")
     return (
-        f"<h2>{category.emoji} {esc(category.title)}</h2>"
-        f"<p>{platform.emoji} <b>{platform.title}</b> · самое просматриваемое {PERIOD_TEXT[platform.id]} — {esc(category.hint)}.</p>"
+        f"{head}"
+        f"<p>{scope_label(choice)} · самое просматриваемое {period} — {esc(category.hint)}.</p>"
         f"<ol>{''.join(items)}</ol>"
         "<blockquote>Выберите ролик — сразу подберу нарезку под TikTok.</blockquote>"
+        f"{note}"
     )
 
 

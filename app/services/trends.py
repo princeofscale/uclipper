@@ -60,8 +60,14 @@ class Category:
     id: str  # короткий — он едет в callback_data
     emoji: str
     title: str
-    queries: tuple[str, ...]  # что искать на YouTube; короткие русские слова дают самую русскую выдачу
+    queries: tuple[str, ...]  # что искать; короткие русские слова дают самую русскую выдачу
     hint: str  # чем хороши для нарезки
+    note: str = ""  # пояснение под списком роликов (если жанр на площадках ведёт себя по-разному)
+    overrides: tuple[tuple[str, tuple[str, ...]], ...] = ()  # (площадка, свои слова) — где общие не подходят
+
+    def queries_for(self, platform: str) -> tuple[str, ...]:
+        """Слова поиска для площадки: свои, если для неё заданы, иначе общие."""
+        return dict(self.overrides).get(platform, self.queries)
 
 
 CATEGORIES: tuple[Category, ...] = (
@@ -69,7 +75,14 @@ CATEGORIES: tuple[Category, ...] = (
     Category("humor", "😂", "Юмор и стендап", ("стендап", "юмор"), "панчи, которые просят повторить"),
     Category("games", "🎮", "Игры и стримы", ("прохождение", "майнкрафт"), "хайлайты и неожиданные повороты"),
     Category("money", "💼", "Бизнес и деньги", ("деньги", "заработок"), "советы и разборы в паре фраз"),
-    Category("movies", "🎬", "Кино и сериалы", ("обзор фильма", "обзор сериала"), "мнения, споры и разборы сюжета"),
+    # На YouTube хороши разборы и мнения, а на RuTube «обзор фильма» находит матчи КХЛ и кулинарию — зато там лежат
+    # целые российские фильмы и сериалы (платные ролики по подписке отсеивает `rutube.video_card`).
+    Category(
+        "movies", "🎬", "Кино и сериалы", ("обзор фильма", "обзор сериала", "разбор фильма"),
+        "разборы и мнения, а на RuTube — целые фильмы и сериалы",
+        note="Больше всего целых фильмов и сериалов в VK Видео и OK. Искать там бот не умеет: найдите серию сами и пришлите ссылку.",
+        overrides=(("rutube", ("русский фильм", "российский сериал", "сериал все серии")),),
+    ),  # fmt: skip
     Category("sport", "⚽", "Спорт", ("футбол", "хоккей", "бокс"), "голы, нокауты и громкие заявления"),
 )
 CATEGORY_BY_ID = {category.id: category for category in CATEGORIES}
@@ -332,7 +345,7 @@ PERIOD_TEXT = {"youtube": "за неделю", "rutube": "за последне�
 
 
 def fetch_category(category: Category, platform: str = "youtube", limit: int = 8) -> list[dict]:
-    return FETCHERS[platform](category.queries, limit)
+    return FETCHERS[platform](category.queries_for(platform), limit)
 
 
 # ---------------------------------------------------------------------------

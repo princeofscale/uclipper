@@ -19,6 +19,8 @@ from app.bot.context import (
     ORIGIN_KEY,
     ORIGIN_SEARCH,
     ORIGIN_TREND,
+    QUERY_KEY,
+    SCOPE_KEY,
     SEARCH_KEY,
     AppContext,
     edit_or_send,
@@ -28,14 +30,14 @@ from app.bot.context import (
     show,
     update_settings,
 )
+from app.bot.handlers.common import ask_query
 from app.bot.handlers.modes import auto_view, mode_view
-from app.bot.rich import esc
 from app.bot.states import Flow
 from app.config import TELEGRAM_MAX_UPLOAD_MB, VIDEO_EXTS
 from app.models import ClipSettings, Draft, VideoInfo
 from app.services.downloader import DownloadError, fetch_video_info, save_local_upload
-from app.services.platforms import identify, mentions_known_site
-from app.services.search import search_videos
+from app.services.platforms import EVERYWHERE, SEARCHABLE, identify, mentions_known_site, scope
+from app.services.search import QueryTooShort, search_videos
 from app.services.video_processor import MediaError, probe_media
 
 log = logging.getLogger(__name__)
@@ -151,27 +153,63 @@ async def _from_url(message: Message, state: FSMContext, ctx: AppContext, url: s
 # ---------- поиск по названию ----------
 
 
-async def _search(message: Message, state: FSMContext, ctx: AppContext, query: str) -> None:
-    status = await show(message, texts.SEARCHING.format(query=esc(query)))
+async def _chosen_scope(state: FSMContext) -> str:
+    """Площадка, выбранная на экране «Что искать?»; не выбрана (или выбор устарел) — искать везде."""
+    choice = (await state.get_data()).get(SCOPE_KEY) or EVERYWHERE
+    return choice if scope(choice, SEARCHABLE) is not None else EVERYWHERE
+
+
+async def _run_search(state: FSMContext, query: str, choice: str) -> tuple[str, InlineKeyboardMarkup]:
+    """Ищет `query` там, где сказано в `choice`, запоминает итог в диалоге и возвращает экран.
+
+    Находка — список с выбором площадки под ним; неудача — причина и тот же выбор площадки (запрос запомнен,
+    так что человек одной кнопкой повторит его в другом месте). Слишком короткий запрос запоминать нечего.
+    """
+    problem: str | None = None
+    results: list[dict] = []
     try:
-        results = await asyncio.to_thread(search_videos, query)
+        results = await asyncio.to_thread(search_videos, query, platform=choice)
+        if not results:
+            raise DownloadError(f"По запросу «{query}» ничего не нашлось — попробуйте другое название или пришлите ссылку.")
+    except QueryTooShort as error:
+        await state.set_state(Flow.waiting_query)
+        return texts.error_text(str(error)), keyboards.query_prompt(choice)
     except DownloadError as error:
-        await replace(status, texts.error_text(str(error)), keyboards.back_to_menu())
-        return
-    except Exception:  # noqa: BLE001
+        problem = texts.error_text(str(error))
+    except Exception:  # noqa: BLE001 — сеть и yt-dlp могут упасть нестандартно
         log.exception("Поиск по названию упал")
-        await replace(
-            status,
-            texts.error_text("Поиск не удался. Попробуйте ещё раз или пришлите ссылку."),
-            keyboards.back_to_menu(),
-        )
-        return
-    if not results:
-        await replace(status, texts.SEARCH_NOTHING.format(query=esc(query)), keyboards.back_to_menu())
-        return
-    await state.set_data({SEARCH_KEY: results, ORIGIN_KEY: ORIGIN_SEARCH})
+        problem = texts.error_text("Поиск не удался. Попробуйте ещё раз или пришлите ссылку.")
+    if problem is not None:
+        await state.set_data({QUERY_KEY: query, SCOPE_KEY: choice})
+        await state.set_state(Flow.waiting_query)
+        return problem, keyboards.search_results([], choice)
+    await state.set_data({SEARCH_KEY: results, ORIGIN_KEY: ORIGIN_SEARCH, QUERY_KEY: query, SCOPE_KEY: choice})
     await state.set_state(Flow.choosing)
-    await replace(status, texts.search_cards(results), keyboards.search_results(results))
+    return texts.search_cards(results, choice), keyboards.search_results(results, choice)
+
+
+async def _search(message: Message, state: FSMContext, ctx: AppContext, query: str) -> None:
+    choice = await _chosen_scope(state)
+    status = await show(message, texts.searching(query, choice))
+    html, markup = await _run_search(state, query, choice)
+    await replace(status, html, markup)
+
+
+@router.callback_query(F.data.startswith("qs:"))
+async def cb_search_again(callback: CallbackQuery, state: FSMContext, ctx: AppContext) -> None:
+    """Тот же запрос на другой площадке — кнопкой под результатами."""
+    choice = (callback.data or "").split(":", 1)[1]
+    if scope(choice, SEARCHABLE) is None:
+        await safe_answer(callback, "Такой площадки нет — выберите из кнопок", alert=True)
+        return
+    query = (await state.get_data()).get(QUERY_KEY)
+    if not query:  # диалог сбросился (например, бот перезапускался): спрашиваем запрос заново
+        await ask_query(callback, state, ctx, choice)
+        return
+    await safe_answer(callback)
+    await edit_or_send(callback, texts.searching(query, choice), None)
+    html, markup = await _run_search(state, query, choice)
+    await edit_or_send(callback, html, markup)
 
 
 # ---------- выбор найденного ----------

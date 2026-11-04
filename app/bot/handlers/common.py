@@ -14,8 +14,9 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 
 from app.bot import keyboards, texts
-from app.bot.context import AppContext, edit_or_send, reset_dialog, safe_answer
+from app.bot.context import SCOPE_KEY, AppContext, edit_or_send, reset_dialog, safe_answer
 from app.bot.states import Flow
+from app.services.platforms import EVERYWHERE, SEARCHABLE, scope
 
 log = logging.getLogger(__name__)
 router = Router(name="common")
@@ -52,11 +53,11 @@ async def cb_stats(callback: CallbackQuery, ctx: AppContext) -> None:
     await edit_or_send(callback, texts.stats_text(clips, jobs, callback.from_user.id), keyboards.back_to_menu())
 
 
-async def _ask(callback: CallbackQuery, state: FSMContext, ctx: AppContext, flow, html: str) -> None:
+async def _ask(callback: CallbackQuery, state: FSMContext, ctx: AppContext, flow, html: str, markup=None) -> None:
     await safe_answer(callback)
     await reset_dialog(state, ctx, callback.from_user.id)
     await state.set_state(flow)
-    await edit_or_send(callback, html, keyboards.back_to_menu())
+    await edit_or_send(callback, html, markup or keyboards.back_to_menu())
 
 
 @router.callback_query(F.data == "ask:link")
@@ -64,9 +65,25 @@ async def cb_ask_link(callback: CallbackQuery, state: FSMContext, ctx: AppContex
     await _ask(callback, state, ctx, Flow.waiting_link, texts.REQUEST_LINK)
 
 
+async def ask_query(callback: CallbackQuery, state: FSMContext, ctx: AppContext, choice: str = EVERYWHERE) -> None:
+    """Экран «Что искать?» с выбранной площадкой; выбор запоминается до следующего запроса."""
+    await _ask(callback, state, ctx, Flow.waiting_query, texts.request_query(choice), keyboards.query_prompt(choice))
+    await state.update_data({SCOPE_KEY: choice})
+
+
 @router.callback_query(F.data == "ask:query")
 async def cb_ask_query(callback: CallbackQuery, state: FSMContext, ctx: AppContext) -> None:
-    await _ask(callback, state, ctx, Flow.waiting_query, texts.REQUEST_QUERY)
+    await ask_query(callback, state, ctx)
+
+
+@router.callback_query(F.data.startswith("qp:"))
+async def cb_query_scope(callback: CallbackQuery, state: FSMContext, ctx: AppContext) -> None:
+    """Выбор площадки на экране «Что искать?» (и «Искать другое» после результатов — с прежней площадкой)."""
+    choice = (callback.data or "").split(":", 1)[1]
+    if scope(choice, SEARCHABLE) is None:
+        await safe_answer(callback, "Такой площадки нет — выберите из кнопок", alert=True)
+        return
+    await ask_query(callback, state, ctx, choice)
 
 
 @router.callback_query(F.data == "ask:file")

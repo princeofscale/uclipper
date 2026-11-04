@@ -4,8 +4,9 @@
 подстроке: `youtube.com.evil.com` не подойдёт. Заодно это значит, что yt-dlp ходит лишь туда, куда мы
 разрешили, а не по любому адресу, который пришлют.
 
-Поиск по названию и раздел «В тренде» есть не у всех площадок (`Platform.search`): им нужен открытый
-API без входа в аккаунт. У остальных работают ссылки — скачивание берёт на себя yt-dlp.
+Поиск по названию (`Platform.search`) и раздел «В тренде» (`Platform.trends`) есть не у всех площадок: им нужен
+открытый API без входа в аккаунт. У VK Видео, Дзена и OK результаты видны только после входа, у Twitch и Kick
+поиск идёт по каналам, а не по словам — для них работают ссылки, скачивание берёт на себя yt-dlp.
 """
 from __future__ import annotations
 
@@ -17,6 +18,8 @@ from urllib.parse import ParseResult, parse_qs, urlparse
 _YOUTUBE_ID = re.compile(r"^[A-Za-z0-9_-]{11}$")
 _YOUTUBE_PATHS = frozenset({"shorts", "embed", "live", "v"})
 
+EVERYWHERE = "all"  # в кнопках выбора площадки: «везде» (это не площадка, из id площадок его не выбрать)
+
 
 @dataclass(frozen=True)
 class Platform:
@@ -24,13 +27,16 @@ class Platform:
     title: str  # как называть площадку по-русски
     emoji: str
     hosts: tuple[str, ...]  # домены; подходят и поддомены (`m.vk.com`, `clips.twitch.tv`)
-    search: bool = False  # есть поиск по названию и «В тренде»
+    search: bool = False  # есть поиск по названию
+    trends: bool = False  # есть раздел «В тренде» (нужно много свежих роликов на русском)
     id_patterns: tuple[str, ...] = ()  # как достать id ролика из адреса: именованная группа `id`
 
 
-YOUTUBE = Platform("youtube", "YouTube", "▶️", ("youtube.com", "youtu.be", "youtube-nocookie.com"), search=True)
+YOUTUBE = Platform(
+    "youtube", "YouTube", "▶️", ("youtube.com", "youtu.be", "youtube-nocookie.com"), search=True, trends=True
+)
 RUTUBE = Platform(
-    "rutube", "RuTube", "📺", ("rutube.ru",), search=True,
+    "rutube", "RuTube", "📺", ("rutube.ru",), search=True, trends=True,
     id_patterns=(r"(?:video(?:/private)?|embed)/(?P<id>[0-9a-z]{32})",),
 )  # fmt: skip
 # Адрес VK Play `live.vkvideo.ru` — поддомен `vkvideo.ru`: площадку выбирает самый длинный подошедший домен.
@@ -50,13 +56,14 @@ KICK = Platform(
     id_patterns=(r"(?:clip=|/clips/)(?P<id>clip_[\w-]+)", r"/videos/(?P<id>[0-9a-f-]{36})"),
 )  # fmt: skip
 DAILYMOTION = Platform(
-    "dailymotion", "Dailymotion", "🔵", ("dailymotion.com", "dai.ly"),
+    "dailymotion", "Dailymotion", "🔵", ("dailymotion.com", "dai.ly"), search=True,
     id_patterns=(r"(?:/video/|dai\.ly/)(?P<id>[a-z0-9]+)",),
 )  # fmt: skip
 
 PLATFORMS: tuple[Platform, ...] = (YOUTUBE, RUTUBE, VK, DZEN, OK, VKPLAY, TWITCH, KICK, DAILYMOTION)
 PLATFORM_BY_ID = {platform.id: platform for platform in PLATFORMS}
 SEARCHABLE: tuple[Platform, ...] = tuple(platform for platform in PLATFORMS if platform.search)
+TRENDING: tuple[Platform, ...] = tuple(platform for platform in PLATFORMS if platform.trends)
 
 _ID_PATTERNS = {platform.id: tuple(re.compile(pattern) for pattern in platform.id_patterns) for platform in PLATFORMS}
 
@@ -69,13 +76,18 @@ class Source:
     url: str  # адрес для yt-dlp: со схемой, без пробелов
 
     @property
+    def video_id(self) -> str | None:
+        """id ролика на площадке или `None`, если из адреса его не достать (например, ссылка на канал)."""
+        if self.platform is YOUTUBE:
+            return _youtube_id(self.url)
+        return _site_id(self.platform, self.url)
+
+    @property
     def key(self) -> str:
         """Ключ кеша, безопасный для имени файла. У YouTube это сам 11-символьный id, у остальных `<площадка>-<id>`."""
         if self.platform is YOUTUBE:
-            return _youtube_id(self.url) or ""
-        token = _site_id(self.platform, self.url) or hashlib.sha1(
-            self.url.split("#", 1)[0].encode(), usedforsecurity=False
-        ).hexdigest()[:16]
+            return self.video_id or ""
+        token = self.video_id or hashlib.sha1(self.url.split("#", 1)[0].encode(), usedforsecurity=False).hexdigest()[:16]
         return f"{self.platform.id}-{re.sub(r'[^A-Za-z0-9_-]', '_', token)[:64]}"
 
 
@@ -167,6 +179,14 @@ def mentions_known_site(text: str) -> bool:
         if parsed_token is not None and _platform_of(parsed_token[2]) is not None:
             return True
     return False
+
+
+def scope(choice: str | None, among: tuple[Platform, ...]) -> tuple[Platform, ...] | None:
+    """Где искать: `EVERYWHERE` — на всех площадках списка `among`, id площадки — только на ней. `None` — такого выбора нет."""
+    if choice == EVERYWHERE:
+        return among
+    chosen = tuple(platform for platform in among if platform.id == choice)
+    return chosen or None
 
 
 def titles() -> str:

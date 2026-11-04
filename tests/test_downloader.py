@@ -11,7 +11,7 @@ import pytest
 import yt_dlp
 
 from app.config import MAX_SOURCE_SECONDS
-from app.services import downloader, youtube
+from app.services import downloader, rutube, youtube
 from app.services.downloader import (
     DownloadError,
     cached_source_path,
@@ -221,6 +221,61 @@ def test_known_failures_are_explained_in_russian(ydl, tmp_path, raw, expected):
     ydl.error = yt_dlp.utils.DownloadError(raw)
     with pytest.raises(DownloadError, match=expected):
         download_video_cached(URL, cache_dir=tmp_path)
+
+
+RUTUBE_404 = f"ERROR: [rutube] {RUTUBE_ID}: Unable to download options JSON: HTTP Error 404: Not Found (caused by <HTTPError 404: Not Found>)"
+
+
+def test_a_rutube_video_behind_a_subscription_is_not_called_deleted(ydl, tmp_path, monkeypatch):
+    """Так выглядят ролики PREMIER: yt-dlp видит только 404, но плеер знает, что это подписка."""
+    asked = []
+    monkeypatch.setattr(rutube, "paywall", lambda video_id: asked.append(video_id) or "PREMIER")
+    ydl.error = yt_dlp.utils.DownloadError(RUTUBE_404)
+
+    with pytest.raises(DownloadError) as caught:
+        download_video_cached(RUTUBE_URL, cache_dir=tmp_path)
+
+    assert asked == [RUTUBE_ID]
+    message = str(caught.value)
+    assert "по подписке PREMIER" in message and "скачать его нельзя" in message and "удалили" not in message
+
+
+def test_the_same_explanation_is_given_when_the_link_is_first_checked(ydl, monkeypatch):
+    monkeypatch.setattr(rutube, "paywall", lambda video_id: "")
+    ydl.error = yt_dlp.utils.DownloadError(RUTUBE_404)
+
+    with pytest.raises(DownloadError, match="по платной подписке"):
+        fetch_video_info(RUTUBE_URL)
+
+
+def test_a_rutube_404_without_a_subscription_stays_a_missing_video(ydl, tmp_path, monkeypatch):
+    monkeypatch.setattr(rutube, "paywall", lambda video_id: None)
+    ydl.error = yt_dlp.utils.DownloadError(RUTUBE_404)
+
+    with pytest.raises(DownloadError, match="Такого ролика нет"):
+        download_video_cached(RUTUBE_URL, cache_dir=tmp_path)
+
+
+def test_only_rutube_failures_are_checked_for_a_subscription(ydl, tmp_path, monkeypatch):
+    def forbidden(video_id):
+        raise AssertionError("другие площадки у RuTube не спрашиваем")
+
+    monkeypatch.setattr(rutube, "paywall", forbidden)
+    ydl.error = yt_dlp.utils.DownloadError("ERROR: [youtube] x: HTTP Error 404: Not Found")
+
+    with pytest.raises(DownloadError, match="Такого ролика нет"):
+        download_video_cached(URL, cache_dir=tmp_path)
+
+
+def test_other_rutube_failures_do_not_trigger_the_subscription_check(ydl, tmp_path, monkeypatch):
+    def forbidden(video_id):
+        raise AssertionError("лишний запрос к плееру")
+
+    monkeypatch.setattr(rutube, "paywall", forbidden)
+    ydl.error = yt_dlp.utils.DownloadError("ERROR: [rutube] x: Requested format is not available")
+
+    with pytest.raises(DownloadError, match="снизить максимальное качество"):
+        download_video_cached(RUTUBE_URL, cache_dir=tmp_path)
 
 
 def test_an_unknown_failure_names_the_platform_and_hides_the_terminal_noise(ydl, tmp_path):

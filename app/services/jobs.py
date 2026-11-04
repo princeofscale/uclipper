@@ -94,15 +94,37 @@ class JobManager:
             return state.model_copy(deep=True) if state else None
 
     def cancel(self, job_id: str) -> bool:
-        """Просит задачу остановиться на ближайшей проверке. True — задача была и ещё не закончилась."""
+        """Отменяет задачу. True — задача была и ещё не закончилась.
+
+        Ждущая в очереди отменяется сразу и до выполнения не доходит; идущая останавливается на ближайшей проверке.
+        """
         with self._lock:
             state = self._jobs.get(job_id)
             if state is None or state.status in (JobStatus.DONE, JobStatus.ERROR, JobStatus.CANCELLED):
                 return False
             self._cancelled.add(job_id)
-            self._update(job_id, stage="Останавливаю")
+            if state.status is JobStatus.QUEUED:
+                self._update(job_id, status=JobStatus.CANCELLED, stage="Отменено")
+            else:
+                self._update(job_id, stage="Останавливаю")
         self._log(job_id, "Пользователь отменил задачу")
         return True
+
+    def unfinished(self) -> int:
+        """Сколько задач ещё не закончилось: идёт сейчас или ждёт очереди."""
+        with self._lock:
+            return sum(1 for state in self._jobs.values() if state.status in (JobStatus.QUEUED, JobStatus.RUNNING))
+
+    def ahead_of(self, job_id: str) -> int:
+        """Сколько задач впереди этой: идущая сейчас и ждущие раньше неё. 0 — её очередь (или такой задачи нет)."""
+        with self._lock:
+            ahead = 0
+            for other_id, state in self._jobs.items():  # словарь хранит задачи в порядке создания
+                if other_id == job_id:
+                    return ahead
+                if state.status in (JobStatus.QUEUED, JobStatus.RUNNING):
+                    ahead += 1
+            return 0
 
     def clip_path(self, job_id: str, clip: ClipResult) -> Path | None:
         """Файл готового клипа на диске."""
@@ -120,10 +142,12 @@ class JobManager:
         return archive if done and archive is not None and archive.is_file() else None
 
     def discard(self, job_id: str) -> None:
-        """Удаляет папку задачи с готовыми роликами и архивом (после того как бот их отправил)."""
+        """Забывает задачу и удаляет её папку с готовыми роликами и архивом (после того как бот их отправил)."""
         directory = self.job_dir(job_id)
         with self._lock:
             self._archives.pop(job_id, None)
+            self._cancelled.discard(job_id)
+            self._jobs.pop(job_id, None)  # иначе у бота, открытого для всех, память росла бы с каждой задачей
         if directory.is_dir():
             for path in sorted(directory.rglob("*"), reverse=True):  # сначала файлы, потом папки
                 try:
@@ -189,6 +213,10 @@ class JobManager:
         on_clip: Notify | None,
     ) -> None:
         """Обёртка задачи: превращает любое исключение в состояние ошибки и не роняет поток."""
+        with self._lock:
+            state = self._jobs.get(job_id)
+            if state is None or state.status is JobStatus.CANCELLED:
+                return  # отменена, пока ждала очереди (или забыта): выполнять нечего
         notifier = _Notifier(self, job_id, on_update)
         try:
             self._run(request, job_id, notifier, on_clip)

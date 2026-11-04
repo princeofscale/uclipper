@@ -17,6 +17,7 @@ from app.bot.context import (
     show,
 )
 from app.bot.states import Flow
+from app.services.capacity import capacity_problem
 
 log = logging.getLogger(__name__)
 router = Router(name="jobs")
@@ -36,6 +37,11 @@ async def cb_start(callback: CallbackQuery, state: FSMContext, ctx: AppContext) 
         request = draft.to_request()
     except ValueError as error:
         await safe_answer(callback, str(error).split("\n")[-1], alert=True)
+        return
+    # Бот открыт для всех, а сервер общий: при полной очереди или нехватке места отказываем сразу и по-человечески.
+    problem = capacity_problem(ctx.manager.unfinished(), ctx.settings.workspace_dir)
+    if problem is not None:
+        await safe_answer(callback, problem, alert=True)
         return
 
     await safe_answer(callback)

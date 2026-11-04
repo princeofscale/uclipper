@@ -18,7 +18,7 @@ from app.bot.rich import (
 )
 from app.models import ClipSettings, Draft, Goal, JobState, JobStatus
 from app.services.autoplan import GOALS, plan_auto
-from app.services.platforms import PLATFORMS, SEARCHABLE, YOUTUBE
+from app.services.platforms import EVERYWHERE, PLATFORMS, SEARCHABLE, TRENDING, YOUTUBE
 from app.services.trends import CATEGORIES
 from tests.rich_check import assert_valid_rich, rich_problems
 
@@ -146,6 +146,10 @@ def test_plain_text_strips_markup_and_unescapes():
 # ---------- тексты бота ----------
 
 
+SEARCH_CHOICES = [EVERYWHERE, *(platform.id for platform in SEARCHABLE)]
+TREND_CHOICES = [EVERYWHERE, *(platform.id for platform in TRENDING)]
+
+
 def _all_static_screens() -> list[str]:
     draft = Draft(title="Тест <b>", uploader="Автор & Ко", duration=3725)
     plan = plan_auto(3725, Goal.TIKTOK, ClipSettings(), banner_seconds=7.5, face_crop=True)
@@ -156,8 +160,7 @@ def _all_static_screens() -> list[str]:
     done = JobState(id="x", status=JobStatus.DONE, archive_name="clips.zip")
     running = JobState(id="y", status=JobStatus.RUNNING, stage="Рендер <1>", progress=42, log=["a < b", "c"])
     screens = [
-        texts.START, texts.HELP, texts.REQUEST_LINK, texts.REQUEST_QUERY, texts.REQUEST_FILE, texts.NUDGE,
-        texts.SEARCHING.format(query=esc("x < y")), texts.SEARCH_NOTHING.format(query=esc("x")), texts.FETCHING,
+        texts.START, texts.HELP, texts.REQUEST_LINK, texts.REQUEST_FILE, texts.NUDGE, texts.FETCHING,
         texts.BAD_LINK, texts.DOWNLOADING_FILE, texts.FILE_TOO_BIG, texts.FILE_BAD.format(error="ошибка"),
         texts.NOT_A_VIDEO, texts.BUSY, texts.QUEUED_TEXT, texts.CANCELLED, texts.BANNER_EMPTY,
         texts.error_text("плохо <b>"), texts.search_cards([{"title": "A & B", "uploader": "U", "duration": 90}]),
@@ -171,16 +174,22 @@ def _all_static_screens() -> list[str]:
         texts.manual_screen(Draft(settings=ClipSettings(banner_count=0)), None), texts.more_screen(draft.settings),
         texts.trim_screen(draft.settings), texts.banners_screen(Banner()), texts.banners_screen(None),
         texts.stats_text(3, 2, 99), texts.progress_text(running), texts.results_summary(done),
+        texts.progress_text(JobState(id="q")), texts.progress_text(JobState(id="q"), ahead=2),
         texts.video_card("T < 1", None, 0), texts.video_card("T", "U", 60, "vk"),
     ]  # fmt: skip
-    for platform in SEARCHABLE:
-        screens.append(texts.trends_home(platform))
+    for choice in SEARCH_CHOICES:
+        screens.append(texts.request_query(choice))
+        screens.append(texts.searching("x < y", choice))
+        screens.append(texts.search_cards([{"title": "A & B", "uploader": "U", "duration": 90}], choice))
+    for choice in TREND_CHOICES:
+        screens.append(texts.trends_home(choice))
         for category in CATEGORIES:
-            screens.append(texts.trends_loading(category, platform))
-            screens.append(texts.trend_list(category, [], platform))
-            screens.append(
-                texts.trend_list(category, [{"title": "A <b>", "duration": 600, "uploader": "U", "views": 12_345}], platform)
-            )
+            screens.append(texts.trends_loading(category, choice))
+            screens.append(texts.trend_list(category, [], choice))
+            screens.append(texts.trend_list(category, [], choice, missing=TRENDING))
+            video = {"platform": "rutube", "title": "A <b>", "duration": 600, "uploader": "U", "views": 12_345}
+            screens.append(texts.trend_list(category, [video], choice))
+            screens.append(texts.trend_list(category, [video], choice, missing=TRENDING[:1]))
     for goal in GOALS:
         screens.append(texts.auto_screen(draft, plan_auto(900, goal, ClipSettings(), banner_seconds=None, face_crop=False), None))
     return screens
@@ -213,18 +222,72 @@ def test_validator_catches_what_it_should():
 
 def test_trend_titles_in_lists_are_escaped_and_numbers_are_humane():
     html = texts.trend_list(
-        CATEGORIES[0], [{"title": "AC & DC <live>", "duration": 4000, "uploader": "Chan", "views": 1_340_000}], YOUTUBE
+        CATEGORIES[0], [{"title": "AC & DC <live>", "duration": 4000, "uploader": "Chan", "views": 1_340_000}], YOUTUBE.id
     )
     assert "AC &amp; DC &lt;live&gt;" in html
     assert re.search(r"1,3 млн", html)
 
 
 def test_every_trend_screen_names_its_platform():
+    for platform in TRENDING:
+        assert platform.title in texts.trends_home(platform.id)
+        assert platform.title in texts.trends_loading(CATEGORIES[0], platform.id)
+        assert platform.title in texts.trend_list(CATEGORIES[0], [], platform.id)
+        assert platform.title in texts.trend_list(CATEGORIES[0], [{"title": "x", "duration": 1}], platform.id)
+
+
+def test_trend_screens_for_everywhere_say_so_and_mark_the_platform_of_every_video():
+    assert "Везде" in texts.trends_home(EVERYWHERE) and "на всех площадках" in texts.trends_loading(CATEGORIES[0], EVERYWHERE)
+    videos = [{"platform": "youtube", "title": "Один", "duration": 600}, {"platform": "rutube", "title": "Два", "duration": 600}]
+    html = texts.trend_list(CATEGORIES[0], videos, EVERYWHERE)
+    assert "Везде" in html and "YouTube" in html and "RuTube" in html
+    one = texts.trend_list(CATEGORIES[0], videos[:1], "youtube")  # на одной площадке значок у каждой строки не нужен
+    assert one.count("YouTube") == 1  # только в шапке списка
+
+
+def test_trend_list_admits_which_platform_did_not_answer():
+    video = {"platform": "rutube", "title": "Два", "duration": 600}
+    assert "YouTube сейчас не ответил" in texts.trend_list(CATEGORIES[0], [video], EVERYWHERE, missing=[YOUTUBE])
+    assert "не ответил" not in texts.trend_list(CATEGORIES[0], [video], EVERYWHERE)
+    empty = texts.trend_list(CATEGORIES[0], [], EVERYWHERE, missing=[YOUTUBE])
+    assert "ничего подходящего" in empty and "YouTube сейчас не ответил" in empty
+
+
+def test_the_movies_note_points_to_the_platforms_the_bot_cannot_search():
+    movies = next(category for category in CATEGORIES if category.id == "movies")
+    html = texts.trend_list(movies, [{"platform": "rutube", "title": "Серия", "duration": 1500}], "rutube")
+    assert "VK Видео" in html and "ссылку" in html
+    assert "VK Видео" not in texts.trend_list(CATEGORIES[0], [], "rutube")
+
+
+def test_the_search_prompt_names_where_it_will_search_and_what_it_cannot():
+    everywhere = texts.request_query(EVERYWHERE)
     for platform in SEARCHABLE:
-        assert platform.title in texts.trends_home(platform)
-        assert platform.title in texts.trends_loading(CATEGORIES[0], platform)
-        assert platform.title in texts.trend_list(CATEGORIES[0], [], platform)
-        assert platform.title in texts.trend_list(CATEGORIES[0], [{"title": "x", "duration": 1}], platform)
+        assert platform.title in everywhere
+    only = texts.request_query("rutube")
+    assert "RuTube" in only and "YouTube" not in only.split("<footer>")[0]
+    for platform in PLATFORMS:
+        if not platform.search:
+            assert platform.title in everywhere and platform.title in only  # честно: тут искать нельзя, только по ссылке
+    assert "только по ссылке" in everywhere
+
+
+def test_search_screens_name_the_chosen_platform():
+    assert "RuTube" in texts.searching("кино", "rutube") and "Везде" in texts.searching("кино", EVERYWHERE)
+    assert "кино" in texts.searching("кино", "rutube")
+    html = texts.search_cards([{"platform": "rutube", "title": "Один", "duration": 60}], "rutube")
+    assert "RuTube" in html
+    assert "<b>x &lt; y</b>" in texts.searching("x < y", EVERYWHERE)
+
+
+def test_a_queued_job_tells_how_many_are_ahead_of_it():
+    waiting = JobState(id="q")
+    assert "Перед вами" not in plain_text(texts.progress_text(waiting))  # первому в очереди лишнего не пишем
+    html = texts.progress_text(waiting, ahead=3)
+    assert "Перед вами в очереди: 3" in plain_text(html)
+    assert_valid_rich(html)
+    running = JobState(id="r", status=JobStatus.RUNNING, stage="Рендер", progress=10)
+    assert "Перед вами" not in plain_text(texts.progress_text(running, ahead=3))  # идущей задаче очередь уже не интересна
 
 
 def test_platform_tag_names_the_source_and_stays_quiet_when_unknown():
@@ -254,6 +317,19 @@ def test_start_and_help_list_every_platform():
         assert platform.title in texts.HELP
         assert platform.title in texts.BAD_LINK
         assert platform.title in texts.REQUEST_LINK
+
+
+def test_help_is_honest_about_where_search_and_trends_work():
+    """Искать по названию и смотреть тренды бот умеет не везде: в справке сказано, где именно."""
+    help_text = texts.HELP
+    assert "только по ссылке" in help_text
+    for platform in PLATFORMS:
+        if not platform.search:
+            assert platform.title in texts.LINK_ONLY_NOTE, platform.title
+    for platform in SEARCHABLE:
+        assert platform.title not in texts.LINK_ONLY_NOTE
+    assert texts.TREND_SITES == "▶️ YouTube и 📺 RuTube"
+    assert "Dailymotion" in texts.SEARCH_SITES and "Dailymotion" not in texts.TREND_SITES
 
 
 @pytest.mark.parametrize(

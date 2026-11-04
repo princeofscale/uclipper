@@ -8,7 +8,9 @@ python-dotenv>=1.0  # чтение токена из .env
 pydantic>=2.7
 
 # --- Площадки: YouTube, RuTube, VK Видео и другие (yt-dlp + решатель JS-челленджей YouTube) ---
-yt-dlp[default]>=2025.10.22
+# curl-cffi: Dailymotion и ещё ряд площадок отдают видео только «настоящему браузеру» (имперсонация TLS);
+# без него скачивание с них падает с «impersonate targets are not available».
+yt-dlp[default,curl-cffi]>=2025.10.22
 
 # --- Видео-хелперы ---
 numpy>=1.26  # автообрезка и яркие моменты: разбор кадров и звука

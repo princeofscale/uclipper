@@ -146,11 +146,13 @@ class JobRunner:
 
     async def _edit_progress(self, running: RunningJob) -> None:
         state = running.state
-        text = texts.progress_text(state)
+        waiting = state.status is JobStatus.QUEUED
+        text = texts.progress_text(state, ahead=self._manager.ahead_of(state.id) if waiting else 0)
         if text == running.last_progress_text:
             return  # тот же процент и та же стадия — лишний запрос к Telegram не нужен
         running.last_progress_text = text
-        markup = keyboards.running(state.id) if state.status is JobStatus.RUNNING else None
+        # Уйти можно и из очереди: ждать чужие задачи никто не обязан.
+        markup = keyboards.running(state.id) if waiting or state.status is JobStatus.RUNNING else None
         try:
             await edit_html(running.message, text, markup)
         except Exception:  # noqa: BLE001 — сообщение могли удалить или текст не изменился

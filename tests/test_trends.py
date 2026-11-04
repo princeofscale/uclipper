@@ -9,7 +9,7 @@ import pytest
 
 from app.config import MAX_SOURCE_SECONDS
 from app.services import rutube, trends
-from app.services.platforms import SEARCHABLE
+from app.services.platforms import EVERYWHERE, TRENDING
 from app.services.trends import (
     CATEGORIES,
     CATEGORY_BY_ID,
@@ -312,9 +312,45 @@ def test_fetch_category_asks_the_chosen_platform_with_the_genre_queries(monkeypa
     assert seen == [("rutube", category.queries, 5), ("youtube", category.queries, 8)]
 
 
-def test_every_platform_with_search_has_a_fetcher_and_a_period_caption():
-    for platform in SEARCHABLE:
+def test_every_platform_with_trends_has_a_fetcher_and_a_period_caption():
+    for platform in TRENDING:
         assert platform.id in FETCHERS and platform.id in PERIOD_TEXT
+
+
+# ---------- запросы жанра на разных площадках ----------
+
+
+def test_a_genre_may_ask_different_words_on_a_platform():
+    movies = CATEGORY_BY_ID["movies"]
+    assert movies.queries_for("youtube") == movies.queries  # без своих слов — общие
+    assert movies.queries_for("rutube") != movies.queries
+    assert movies.queries_for("unknown") == movies.queries
+
+
+def test_other_genres_use_the_same_words_everywhere():
+    for category in CATEGORIES:
+        if category.id != "movies":
+            assert all(category.queries_for(platform.id) == category.queries for platform in TRENDING)
+
+
+def test_rutube_gets_whole_films_and_series_while_youtube_gets_reviews(monkeypatch):
+    """На RuTube «обзор фильма» находит хоккейные матчи и кулинарию, зато там лежат целые фильмы и сериалы."""
+    seen = {}
+    for platform in TRENDING:
+        monkeypatch.setitem(FETCHERS, platform.id, lambda queries, limit, name=platform.id: seen.setdefault(name, queries) and [])
+    movies = CATEGORY_BY_ID["movies"]
+
+    fetch_category(movies, "youtube")
+    fetch_category(movies, "rutube")
+
+    assert any("обзор" in query or "разбор" in query for query in seen["youtube"])
+    assert any("фильм" in query or "сериал" in query for query in seen["rutube"])
+    assert not any("обзор" in query for query in seen["rutube"])
+
+
+def test_the_movies_genre_points_to_where_whole_films_live():
+    note = CATEGORY_BY_ID["movies"].note
+    assert "VK" in note and "OK" in note and "ссылк" in note
 
 
 # ---------- фильтр поиска ----------
@@ -345,8 +381,10 @@ def test_categories_are_well_formed():
     for category in CATEGORIES:
         assert category.emoji and category.title and category.hint and category.queries
         assert all(looks_russian(query) or query for query in category.queries)
-        for platform in SEARCHABLE:  # callback_data кнопки жанра не длиннее 64 байт
-            assert len(f"trend:{platform.id}:{category.id}".encode()) <= 64
+        for platform in (*TRENDING, None):  # callback_data кнопки жанра не длиннее 64 байт
+            where = platform.id if platform else EVERYWHERE
+            assert len(f"trend:{where}:{category.id}".encode()) <= 64
+            assert category.queries_for(where)
 
 
 # ---------- кеш ----------
