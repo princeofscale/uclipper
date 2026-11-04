@@ -5,6 +5,7 @@
 """
 import pytest
 
+from app.services import auto_trim
 from app.services.auto_trim import TrimSuggestion, analyze_trim
 from app.services.video_processor import probe_media
 from tests.media_utils import make_episode
@@ -106,3 +107,40 @@ def test_an_all_black_video_is_not_reduced_to_nothing(episodes):
 def test_a_clip_too_short_to_judge_is_returned_whole(episodes):
     result = analyse(episodes("tiny", head_black=2, content=5))
     assert (result.start, result.end) == (0.0, pytest.approx(result.duration, abs=0.01))
+
+
+# ---------- скорость: чёрный экран ищется по кадрам, поэтому сначала смотрим коротко ----------
+
+
+def test_black_edges_are_first_looked_for_in_short_windows(episodes, monkeypatch):
+    """Чёрный экран ищется разбором каждого кадра: у FullHD60 на сервере 40 с начала и 60 с конца — две минуты из пяти,
+    которые анализ делал до первого клипа. Обычный ролик не начинается и не кончается чёрным, ему хватает короткого окна.
+    """
+    calls = []
+    real = auto_trim._black_intervals
+
+    def spy(path, start, length):
+        calls.append((start, length))
+        return real(path, start, length)
+
+    monkeypatch.setattr(auto_trim, "_black_intervals", spy)
+
+    result = analyse(episodes("plain_long", content=120))
+
+    assert result.start == 0.0 and result.end == pytest.approx(120.0, abs=0.5)
+    assert sum(length for _, length in calls) <= 25, calls
+
+
+def test_a_black_lead_in_longer_than_the_first_window_is_still_cut_whole(episodes):
+    result = analyse(episodes("long_lead_in", head_black=15, content=60))
+
+    assert result.start == pytest.approx(15.0, abs=0.6)
+    assert "чёрн" in result.head
+
+
+def test_a_black_tail_longer_than_the_first_window_is_still_cut_whole(episodes):
+    result = analyse(episodes("long_black_tail", content=60, tail_black=25))
+
+    assert result.end == pytest.approx(60.0, abs=0.6)
+    assert "чёрн" in result.tail
+

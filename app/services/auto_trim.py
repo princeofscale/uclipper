@@ -24,6 +24,11 @@ from app.services.video_processor import MediaError, MediaInfo, probe_media
 MIN_ANALYSED_SECONDS = 10.0  # совсем короткий ролик не анализируем
 HEAD_SCAN = 40.0  # сколько секунд с начала смотрим на чёрный экран и тишину
 TAIL_SCAN = 60.0  # и с конца
+# Чёрный экран ищется разбором каждого кадра — это самая дорогая часть анализа. Обычный ролик не начинается и не
+# кончается чёрным, поэтому сначала смотрим коротко и расширяем окно до HEAD_SCAN/TAIL_SCAN, только если чёрное
+# упёрлось в границу окна.
+HEAD_BLACK_FIRST = 8.0
+TAIL_BLACK_FIRST = 12.0
 CREDITS_SCAN = 600.0  # на сколько секунд от конца ищем титры...
 CREDITS_SCAN_SHARE = 0.50  # ...но не больше этой доли ролика (больше половины всё равно не режем)
 MIN_CREDITS = 12.0  # короче — это не титры
@@ -72,6 +77,23 @@ def _black_intervals(path: Path, start: float, length: float) -> list[tuple[floa
         "-an", "-vf", "scale=160:-2,blackdetect=d=0.2:pix_th=0.10:pic_th=0.98", "-f", "null", "-",
     ])  # fmt: skip
     return [(start + float(a), start + float(b)) for a, b in _BLACK.findall(_stderr(result))]
+
+
+def _black_at_edge(path: Path, duration: float, *, head: bool) -> list[tuple[float, float]]:
+    """Участки чёрного экрана у начала (`head`) или у конца ролика; окно растёт, пока чёрное упирается в его границу."""
+    limit = min(HEAD_SCAN if head else TAIL_SCAN, duration)
+    first = min(HEAD_BLACK_FIRST if head else TAIL_BLACK_FIRST, limit)
+    intervals: list[tuple[float, float]] = []
+    for length in dict.fromkeys((first, limit)):
+        start = 0.0 if head else duration - length
+        intervals = _black_intervals(path, start, length)
+        if head:  # чёрное идёт с самого начала и не кончилось до конца окна — дальше может быть ещё
+            runs_on = any(begin <= EDGE_TOLERANCE and stop >= length - EDGE_TOLERANCE for begin, stop in intervals)
+        else:
+            runs_on = any(stop >= duration - EDGE_TOLERANCE and begin <= start + EDGE_TOLERANCE for begin, stop in intervals)
+        if not runs_on:
+            break
+    return intervals
 
 
 def _silence_intervals(path: Path, start: float, length: float) -> list[tuple[float, float]]:
@@ -166,8 +188,8 @@ def _analyze(path_text: str, size: int, mtime_ns: int, info: MediaInfo | None) -
 
     head_scan = min(HEAD_SCAN, duration)
     tail_scan = min(TAIL_SCAN, duration)
-    black_head = _black_intervals(path, 0.0, head_scan)
-    black_tail = _black_intervals(path, duration - tail_scan, tail_scan)
+    black_head = _black_at_edge(path, duration, head=True)
+    black_tail = _black_at_edge(path, duration, head=False)
     silence_head = _silence_intervals(path, 0.0, head_scan) if info.has_audio else []
     silence_tail = _silence_intervals(path, duration - tail_scan, tail_scan) if info.has_audio else []
 
