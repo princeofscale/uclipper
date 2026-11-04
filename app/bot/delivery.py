@@ -2,9 +2,13 @@
 
 Лимиты обычного бота: отдать файл можно до 50 МБ. Если клип больше — перекодируем его в 720×1280
 с разумным битрейтом: качество остаётся приемлемым, а вес падает в разы.
+
+К каждому ролику бот прикладывает настоящие размеры и обложку: без них Telegram сам угадывает форму предпросмотра,
+и вертикальное видео иногда показывается в чате сплюснутым.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import subprocess
 from dataclasses import dataclass
@@ -23,11 +27,14 @@ from app.config import (
     TELEGRAM_MAX_DOWNLOAD_MB,
 )
 from app.models import ClipResult, JobState
+from app.services.video_processor import MediaError, probe_media
 
 log = logging.getLogger(__name__)
 
 MAX_BYTES = TELEGRAM_MAX_DOWNLOAD_MB * 1024 * 1024
 SHRINK_PREFIX = "tg_"
+COVER_SIDE = 320  # Bot API: ширина и высота обложки не больше 320 пикселей
+COVER_MAX_BYTES = 200 * 1024  # и вес не больше 200 КБ
 
 
 @dataclass(frozen=True)
@@ -80,6 +87,33 @@ def prepare_for_telegram(path: Path, work_dir: Path) -> tuple[Path, bool]:
     return target, True
 
 
+def make_cover(video: Path, target: Path) -> Path | None:
+    """Обложка клипа — JPEG-кадр из его начала, длинная сторона не больше 320 пикселей. `None`, если не получилось."""
+    scale = f"scale={COVER_SIDE}:{COVER_SIDE}:force_original_aspect_ratio=decrease"
+    for second in ("1", "0"):  # у совсем короткого ролика секунды может не быть — тогда берём самый первый кадр
+        command = [
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-ss", second, "-i", str(video), "-frames:v", "1", "-vf", scale, "-q:v", "5", str(target),
+        ]  # fmt: skip
+        try:
+            subprocess.run(command, capture_output=True, timeout=60)
+        except (OSError, subprocess.SubprocessError):
+            break
+        if 0 < _size(target) <= COVER_MAX_BYTES:
+            return target
+    target.unlink(missing_ok=True)
+    return None
+
+
+def _video_size(path: Path) -> tuple[int, int] | None:
+    """Ширина и высота файла, каким он уйдёт в Telegram (после сжатия — уже сжатого)."""
+    try:
+        info = probe_media(path)
+    except MediaError:
+        return None
+    return (info.width, info.height) if info.width > 0 and info.height > 0 else None
+
+
 async def send_clip(
     bot: Bot,
     chat_id: int,
@@ -90,11 +124,13 @@ async def send_clip(
     total: int,
 ) -> bool:
     """Отправляет один ролик. `False` — не получилось даже после сжатия."""
-    file, shrunk = prepare_for_telegram(path, work_dir)
+    file, shrunk = await asyncio.to_thread(prepare_for_telegram, path, work_dir)  # ffmpeg не должен вешать бота
     caption = f"🎬 <b>Клип {clip.index} из {total}</b> · ⏱ {texts.duration_text(clip.duration)}"
     if shrunk:
         caption += "\n<i>Сжал до 720p, чтобы влез в лимит Telegram.</i>"
     caption = caption[:TELEGRAM_CAPTION_LIMIT]
+    size = await asyncio.to_thread(_video_size, file)
+    cover = await asyncio.to_thread(make_cover, file, work_dir / f"cover_{file.stem}.jpg")
     try:
         await bot.send_video(
             chat_id=chat_id,
@@ -102,6 +138,9 @@ async def send_clip(
             caption=caption,
             supports_streaming=True,
             duration=round(clip.duration),
+            width=size[0] if size else None,
+            height=size[1] if size else None,
+            thumbnail=FSInputFile(cover) if cover else None,
         )
         return True
     except TelegramEntityTooLarge:
