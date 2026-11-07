@@ -547,3 +547,79 @@ def test_platform_failure_does_not_break_the_job(monkeypatch):
     monkeypatch.setattr(downloader.yt_dlp, "YoutubeDL", Broken)
 
     assert downloader.fetch_subtitles(YT) is None  # клип просто выйдет без субтитров
+
+
+# ---------- скачивание только окна ----------
+
+YT2 = "https://www.youtube.com/watch?v=aaaaaaaaaaa"
+
+
+def test_a_section_is_asked_with_the_download_ranges_option(monkeypatch, tmp_path):
+    """Окно просят у площадки штатным `download_ranges` — тем же механизмом, что `--download-sections`."""
+    from app.services import downloader
+
+    seen: dict = {}
+
+    class Recording(_FakeYdl):
+        def __init__(self, options, *args, **kwargs):
+            seen.update(options)
+
+        def download(self, urls):
+            # площадка «отдала» файл нужного размера
+            target = Path(seen["outtmpl"].replace(".%(ext)s", ".mp4"))
+            target.write_bytes(b"x" * (downloader.MIN_CACHE_BYTES + 1))
+
+    monkeypatch.setattr(downloader.yt_dlp, "YoutubeDL", Recording)
+
+    result = downloader.download_section(YT2, 61.0, 106.0, "youtube-aaa", cache_dir=tmp_path)
+
+    assert result is not None and result.name == "section_youtube-aaa_61.0-106.0.mp4"
+    ranges = list(seen["download_ranges"]({"id": "x", "duration": 1000}, None))
+    assert ranges == [{"start_time": 61.0, "end_time": 106.0}]
+
+
+def test_a_section_already_in_cache_is_not_downloaded_again(monkeypatch, tmp_path):
+    from app.services import downloader
+
+    cached = downloader.section_path("youtube-aaa", 61.0, 106.0, tmp_path)
+    cached.write_bytes(b"x" * (downloader.MIN_CACHE_BYTES + 1))
+    monkeypatch.setattr(downloader.yt_dlp, "YoutubeDL", pytest.fail)
+
+    assert downloader.download_section(YT2, 61.0, 106.0, "youtube-aaa", cache_dir=tmp_path) == cached
+
+
+def test_a_failed_section_download_returns_none_so_the_caller_fetches_the_whole_file(monkeypatch, tmp_path):
+    from app.services import downloader
+
+    class Broken(_FakeYdl):
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def download(self, urls):
+            raise downloader.yt_dlp.utils.YoutubeDLError("площадка не умеет секции")
+
+    monkeypatch.setattr(downloader.yt_dlp, "YoutubeDL", Broken)
+
+    assert downloader.download_section(YT2, 61.0, 106.0, "youtube-aaa", cache_dir=tmp_path) is None
+
+
+def test_audio_is_downloaded_with_the_audio_only_format(monkeypatch, tmp_path):
+    """Звук качается отдельно и перекладывается в `audio_<ключ>.m4a` — по нему считаются окна клипов."""
+    from app.services import downloader
+
+    seen: dict = {}
+
+    class Recording(_FakeYdl):
+        def __init__(self, options, *args, **kwargs):
+            seen.update(options)
+
+        def download(self, urls):
+            Path(seen["outtmpl"].replace(".%(ext)s", ".webm")).write_bytes(b"x" * (downloader.MIN_CACHE_BYTES + 1))
+
+    monkeypatch.setattr(downloader.yt_dlp, "YoutubeDL", Recording)
+    monkeypatch.setattr(downloader, "_remux_to_mp4", lambda source, target: target.write_bytes(b"y" * 200_000) or True)
+
+    result = downloader.download_audio(YT2, "youtube-aaa", cache_dir=tmp_path)
+
+    assert seen["format"].startswith("bestaudio")
+    assert result == downloader.audio_path("youtube-aaa", tmp_path)

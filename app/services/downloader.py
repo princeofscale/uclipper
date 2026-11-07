@@ -261,6 +261,100 @@ def download_video_cached(
     return _finalize(key, cache_dir)
 
 
+def section_path(key: str, start: float, end: float, cache_dir: Path) -> Path:
+    """Файл окна в кеше. В имени — границы с точностью до десятых: иначе вернулось бы чужое окно."""
+    return cache_dir / f"section_{key}_{start:.1f}-{end:.1f}.mp4"
+
+
+def download_section(
+    url: str,
+    start: float,
+    end: float,
+    key: str,
+    *,
+    max_height: int = 1080,
+    cache_dir: Path | None = None,
+) -> Path | None:
+    """Скачивает только кусок ролика `[start, end]` — без остального видео.
+
+    Зачем: двухчасовой подкаст целиком — это гигабайт трафика и десятки минут, а в клипы уйдут
+    две-три минуты. `download_ranges` (тот же механизм, что `--download-sections` в CLI) экономит
+    трафик только у фрагментированных потоков (HLS/DASH) — у обычного mp4 площадка отдаст файл целиком,
+    поэтому вызывающий обязан уметь откатиться на полную загрузку.
+
+    `None` — окно скачать не удалось (площадка не поддержала, сеть, отмена): вызывающий берёт полный файл.
+    """
+    source = require_source(url)
+    cache_dir = cache_dir or Settings.default().cache_dir
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    target = section_path(key, start, end, cache_dir)
+    if target.is_file() and target.stat().st_size > MIN_CACHE_BYTES:
+        return target
+    options = _base_options(source.platform) | {
+        "format": _format_selector(max_height),
+        "format_sort": ["res", "vcodec:h264"],
+        "merge_output_format": "mp4",
+        "download_ranges": yt_dlp.utils.download_range_func(None, [(max(0.0, start), end)]),
+        "outtmpl": str(target.with_suffix(".%(ext)s")),
+        "quiet": True,
+        "noprogress": True,
+    }
+    try:
+        with yt_dlp.YoutubeDL(options) as ydl:
+            ydl.download([source.url])
+    except yt_dlp.utils.YoutubeDLError:
+        log.warning("Не удалось скачать окно %.1f–%.1f с ролика %s", start, end, url, exc_info=True)
+        return None
+    if target.is_file() and target.stat().st_size > MIN_CACHE_BYTES:
+        return target
+    leftovers = sorted(cache_dir.glob(f"section_{key}_{start:.1f}-{end:.1f}.*"))
+    for left in leftovers:  # формат мог прийти не mp4: пробуем переложить
+        if left.suffix.lower() not in _TEMP_SUFFIXES and _remux_to_mp4(left, target):
+            left.unlink(missing_ok=True)
+            return target
+    return None
+
+
+def audio_path(key: str, cache_dir: Path) -> Path:
+    """Звук ролика в кеше: по нему считаются «яркие моменты» без скачивания видео."""
+    return cache_dir / f"audio_{key}.m4a"
+
+
+def download_audio(url: str, key: str, *, cache_dir: Path | None = None) -> Path | None:
+    """Качает **только звук** ролика — для анализа. `None`, если не вышло.
+
+    Двухчасовой ролик: звук ~100 МБ вместо гигабайта видео. По нему бот находит окна клипов,
+    и только потом качает сами окна (`download_section`).
+    """
+    source = require_source(url)
+    cache_dir = cache_dir or Settings.default().cache_dir
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    target = audio_path(key, cache_dir)
+    if target.is_file() and target.stat().st_size > MIN_CACHE_BYTES:
+        return target
+    options = _base_options(source.platform) | {
+        "format": "bestaudio/best",
+        "outtmpl": str(cache_dir / f"audio_{key}.%(ext)s"),
+        "quiet": True,
+        "noprogress": True,
+    }
+    try:
+        with yt_dlp.YoutubeDL(options) as ydl:
+            ydl.download([source.url])
+    except yt_dlp.utils.YoutubeDLError:
+        log.warning("Не удалось скачать звук ролика %s", url, exc_info=True)
+        return None
+    for left in sorted(cache_dir.glob(f"audio_{key}.*")):
+        if left.suffix.lower() in _TEMP_SUFFIXES:
+            continue
+        if left == target:
+            return target
+        if _remux_to_mp4(left, target):
+            left.unlink(missing_ok=True)
+            return target
+    return None
+
+
 def _finalize(key: str, cache_dir: Path) -> Path:
     """Гарантирует, что результат лежит именно в `source_<ключ>.mp4` (формат `/best` может отдать mkv/webm)."""
     target = cache_dir / f"source_{key}.mp4"
