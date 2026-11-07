@@ -27,9 +27,11 @@ from app.bot.handlers import (
 )
 from app.bot.runner import JobRunner
 from app.config import Settings
+from app.services import capacity
 from app.services.banner_manager import ensure_banners, ensure_sfx
 from app.services.janitor import max_age_days_from_env, sweep_forever
 from app.services.jobs import JobManager
+from app.services.video_processor import has_libass
 from app.services.user_store import UserStore
 
 log = logging.getLogger(__name__)
@@ -103,6 +105,24 @@ async def _on_error(event: ErrorEvent) -> bool:
     except Exception:  # noqa: BLE001 — уведомить не вышло, ошибка уже в логе
         log.debug("Не удалось сообщить пользователю об ошибке", exc_info=True)
     return True
+
+
+def describe_capacity() -> str:
+    """Одна строка о действующих пределах — по логам видно, с чем именно работает сервер.
+
+    Без неё «почему медленно» и «почему не берёт вторую задачу» каждый раз выясняется заново.
+    """
+    cores = capacity.cpu_limit()
+    jobs = capacity.max_jobs_from_env()
+    threads = capacity.ffmpeg_threads(jobs)
+    parts = [
+        f"ядер у контейнера: {cores if cores is not None else 'не ограничено'}",
+        f"нарезок сразу: {jobs or 'без предела'}",
+        f"потоков ffmpeg на задачу: {threads if threads is not None else 'решает ffmpeg'}",
+        f"выравнивание звука: {'вкл' if capacity.normalize_audio_from_env() else 'выкл'}",
+        f"субтитры (libass): {'есть' if has_libass() else 'нет'}",
+    ]
+    return " · ".join(parts)
 
 
 def build_dispatcher(ctx: AppContext | None = None, allowed_users: frozenset[int] = frozenset()) -> Dispatcher:
@@ -191,6 +211,7 @@ async def run() -> None:
         f", доступ: {len(allowed)} чел." if allowed else ", доступ открыт для всех",
         ", через прокси" if proxy else "",
     )
+    log.info("Режим работы: %s", describe_capacity())
     sweeper = asyncio.create_task(sweep_forever(ctx.settings, max_age_days_from_env()))
     try:
         await dispatcher.start_polling(bot, allowed_updates=dispatcher.resolve_used_update_types())

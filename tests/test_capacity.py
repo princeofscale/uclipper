@@ -353,3 +353,12 @@ def test_soft_stop_of_a_waiting_job_cancels_it_outright(manager):
 
     state = manager.get(job)
     assert state.status is JobStatus.CANCELLED and manager.soft_stopped(job) is False
+
+
+def test_the_startup_line_names_the_effective_limits():
+    """По логам при старте должно быть видно, с чем именно работает сервер."""
+    from app.bot.app import describe_capacity
+
+    line = describe_capacity()
+
+    assert "нарезок сразу" in line and "потоков ffmpeg" in line and "выравнивание звука" in line
