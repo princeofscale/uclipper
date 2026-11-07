@@ -257,7 +257,7 @@ class JobManager:
 
     def _run(self, request: JobRequest, job_id: str, notifier: "_Notifier", on_clip: Notify | None) -> None:
         settings = self._settings
-        self._update(job_id, status=JobStatus.RUNNING, stage="Подготовка", progress=0.0)
+        self._update(job_id, status=JobStatus.RUNNING, stage="Подготовка", progress=0.0, preview=request.preview)
         notifier.touch()
 
         # Сначала дешёвые проверки: плохой баннер не должен всплыть после долгого скачивания.
@@ -294,6 +294,7 @@ class JobManager:
             banner_scale=request.banner_scale,
             banner_sound=request.banner_sound,
             enable_sfx=request.enable_sfx,
+            preview=request.preview,
         )
         clips = self._render_all(
             job_id, job_dir, source, info, schedule.starts, schedule.clip_duration, options,

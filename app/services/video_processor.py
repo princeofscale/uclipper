@@ -19,6 +19,7 @@ from app.services.capacity import ffmpeg_threads
 from app.models import BannerMode, BannerPosition, FrameMode, SlicingMode
 from app.services.face_center import detect_face_center_x
 
+PREVIEW_SIZE = (540, 960)  # черновик: вчетверо меньше пикселей, чем 1080×1920
 MIN_CLIP_SECONDS = 1.0
 SAMPLE_RATE = 44100
 READ_MARGIN = 0.5  # источник читается на полсекунды дольше клипа: точный конец задаёт trim в графе
@@ -249,6 +250,7 @@ class RenderOptions:
     banner_scale: int = 85  # % короткой стороны кадра (в вертикальных режимах это ширина)
     banner_sound: bool = True  # слышен ли звук видео-баннера
     enable_sfx: bool = False
+    preview: bool = False  # черновик: кадр уменьшается до 540×960 и рендер идёт на ultrafast
 
 
 # У анаморфных роликов и записей старого ТВ пиксель не квадратный (SAR ≠ 1:1): на экране кадр шире (или уже), чем
@@ -409,6 +411,15 @@ def _audio_mix(timeline: BannerTimeline, audio: str, *, sfx_idx: int | None, ban
     return chains
 
 
+def _preview_scaled(graph: str) -> str:
+    """Добавляет в конец графа уменьшение до `PREVIEW_SIZE`. Вся геометрия (баннер, паузы, затемнение)
+    считается как для боевого клипа — уменьшается только итоговый кадр, поэтому черновик показывает
+    ровно то, что выйдет в 1080p.
+    """
+    width, height = PREVIEW_SIZE
+    return f"{graph};[v_out]scale={width}:{height}:flags=bilinear[v_preview]"
+
+
 def build_filter_graph(
     timeline: BannerTimeline,
     opts: RenderOptions,
@@ -477,6 +488,9 @@ def build_ffmpeg_command(
     Порядок входов: источник, баннер (у GIF/видео — по входу на окно), звук SFX.
     `threads` — сколько потоков разрешено процессору контейнера (`None` — ffmpeg решает сам).
     """
+    # Черновик: ultrafast и crf 30 — вчетверо меньше пикселей и самый быстрый пресет. Боевой рендер:
+    # superfast crf 24 (замер: то же качество по SSIM, на четверть быстрее veryfast).
+    preview_encoder = ["-preset", "ultrafast", "-crf", "30"] if opts.preview else ["-preset", "superfast", "-crf", "24"]
     limit = ["-threads", str(threads)] if threads else []  # ключ перед `-i` относится к декодеру этого входа
     command = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-nostats", "-progress", "pipe:1"]
     if threads:
@@ -505,14 +519,18 @@ def build_ffmpeg_command(
         timeline, opts, has_audio=has_audio, banner_idx=banner_idx, sfx_idx=sfx_idx, face_cx=face_cx,
         banner=media,
     )  # fmt: skip
+    video_label = "[v_out]"
+    if opts.preview:  # черновик: тот же граф, но итоговый кадр вчетверо меньше
+        graph = _preview_scaled(graph)
+        video_label = "[v_preview]"
     command += [
-        "-filter_complex", graph, "-map", "[v_out]", "-map", "[a_out]",
+        "-filter_complex", graph, "-map", video_label, "-map", "[a_out]",
         *limit,
         # superfast вместо veryfast: на замере 1080p60 в 1 ядро x264 ест больше половины времени рендера, а superfast
         # на crf 24 даёт то же качество (SSIM ≈ 0,994) при файле на 15% больше и быстрее на четверть.
         # `-r` не задаём: частоту кадров уже выставил фильтр `fps` в начале графа, а второй пересчёт только
         # пересобирает кадры и добавляет дрожание на стыках сегментов.
-        "-c:v", "libx264", "-preset", "superfast", "-crf", "24", "-pix_fmt", "yuv420p",
+        *preview_encoder, "-c:v", "libx264", "-pix_fmt", "yuv420p",
         # Ключевой кадр каждые 2 секунды: платформа и плеер нормально перематывают и режут клип,
         # цена — 2–5% битрейта.
         "-g", str(FPS * 2), "-keyint_min", str(FPS),

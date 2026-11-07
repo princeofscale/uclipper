@@ -140,3 +140,28 @@ def test_ffmpeg_failure_is_reported_and_leaves_no_partial_file(tmp_path):
     with pytest.raises(MediaError, match="missing.mp4"):
         render_clip(tmp_path / "missing.mp4", tmp_path / "x.mp4", 0.0, 5.0, RenderOptions(banner_count=0), info=info)
     assert not (tmp_path / "x.mp4").exists()
+
+
+# ---------- черновик ----------
+
+
+def test_preview_renders_the_same_clip_at_half_resolution(synthetic_video, tmp_path):
+    """Черновик считается тем же графом (баннер, паузы, затемнение) — уменьшается только итоговый кадр."""
+    info = probe_media(synthetic_video)
+    options = RenderOptions(banner_count=0, preview=True)
+
+    timeline = render_clip(synthetic_video, tmp_path / "draft.mp4", CLIP_START, 4.0, options, info=info)
+
+    rendered = probe_media(tmp_path / "draft.mp4")
+    assert (rendered.width, rendered.height) == (540, 960)
+    assert rendered.duration == pytest.approx(timeline.total_duration, abs=0.2)
+    assert rendered.has_audio
+
+
+def test_full_quality_render_stays_1080x1920(synthetic_video, tmp_path):
+    info = probe_media(synthetic_video)
+
+    render_clip(synthetic_video, tmp_path / "full.mp4", CLIP_START, 4.0, RenderOptions(banner_count=0), info=info)
+
+    rendered = probe_media(tmp_path / "full.mp4")
+    assert (rendered.width, rendered.height) == (1080, 1920)

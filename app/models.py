@@ -78,6 +78,7 @@ class ClipSettings(BaseModel):
     enable_sfx: bool = False
 
     max_height: int = Field(1080, ge=144, le=2160)  # потолок качества при скачивании
+    preview: bool = False  # черновик: рендер 540p на ultrafast — вчетверо быстрее, чтобы проверить моменты
 
 
 class VideoInfo(BaseModel):
@@ -201,6 +202,7 @@ class JobState(BaseModel):
     log: list[str] = Field(default_factory=list)
     clips: list[ClipResult] = Field(default_factory=list)
     total_clips: int = 0  # сколько клипов решено сделать (известно после расчёта плана; 0 — ещё считаем)
+    preview: bool = False  # клипы этой задачи — черновик 540p (предупредим в итоге)
     trim: TrimInfo | None = None  # None, если начало и конец не обрезались
     archive_name: str | None = None  # имя ZIP-архива в папке задачи
     error: str | None = None

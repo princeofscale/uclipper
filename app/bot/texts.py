@@ -540,8 +540,10 @@ def more_screen(s: ClipSettings) -> str:
 <table compact>
 <tr><td>📥 Качество скачивания</td><td><b>{CHOICES["max_height"].option(s.max_height).short}</b></td></tr>
 <tr><td>🔔 Сигнал перед баннером</td><td><b>{"включён" if s.enable_sfx else "выключен"}</b></td></tr>
+<tr><td>🎯 Черновик 540p</td><td><b>{"включён" if s.preview else "выключен"}</b></td></tr>
 </table>
-<blockquote>Чем выше качество, тем чётче клипы — но дольше скачивание и тяжелее файлы. Сигнал — короткий «бульк» за мгновение до баннера.</blockquote>"""
+<blockquote>Чем выше качество, тем чётче клипы — но дольше скачивание и тяжелее файлы. Сигнал — короткий «бульк» за мгновение до баннера.</blockquote>
+<blockquote>🎯 <b>Черновик</b> — быстрый прогон в 540p: рендер вчетверо быстрее, чтобы проверить, те ли моменты выбраны. Для публикации выключите: черновик по качеству не для площадок.</blockquote>"""
 
 
 def trim_screen(s: ClipSettings) -> str:
@@ -658,6 +660,11 @@ def results_summary(state: JobState) -> str:
         if state.archive_name
         else "<p><i>ZIP не помещается в лимит 50 МБ — ролики отправлены по отдельности.</i></p>"
     )
+    if state.preview:  # черновик — не для публикации: об этом нужно сказать там, где человек смотрит итог
+        note = (
+            "<blockquote>🎯 Это <b>черновик 540p</b>: для публикации выключите «Черновик» в "
+            "«⚙️ Дополнительно» и нарежьте заново.</blockquote>" + note
+        )
     return f"<h2>✅ Готово!</h2><table bordered compact>{''.join(rows)}</table>{note}"
 
 

@@ -284,8 +284,14 @@ def more_settings(s: ClipSettings) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     _add(builder, CHOICES["max_height"].caption(s.max_height), "choose:max_height")
     _add(builder, f"🔔 Сигнал перед баннером: {'вкл' if s.enable_sfx else 'выкл'}", "toggle:enable_sfx:more", SUCCESS if s.enable_sfx else None)
+    _add(
+        builder,
+        f"{'🎯' if s.preview else '⬜'} Черновик 540p: {'вкл' if s.preview else 'выкл'}",
+        "toggle:preview:more",
+        PRIMARY if s.preview else None,
+    )
     _add(builder, "⬅️ Назад", "screen:manual")
-    builder.adjust(1, 1, 1)
+    builder.adjust(1, 1, 1, 1)
     return builder.as_markup()
 
 

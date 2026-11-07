@@ -2467,3 +2467,18 @@ async def test_quick_start_goes_from_the_link_to_rendering_in_one_tap(harness, m
     assert "Задача в очереди" in shown or "Готово" in shown or "%" in shown
     await _wait_finished(harness)  # задача настоящая: дожидаемся, чтобы она не жила после теста
     assert harness.session.calls("sendVideo"), "клип должен был дойти до чата"
+
+
+# ---------- черновик 540p ----------
+
+
+async def test_preview_toggle_lives_in_the_extra_settings(harness, monkeypatch):
+    await _open_manual(harness, monkeypatch)
+
+    await harness.press("screen:more")
+    assert "Черновик 540p" in harness.session.last_text()
+
+    await harness.press("toggle:preview:more")
+
+    settings = (await _fsm(harness).get_data())["draft"]["settings"]
+    assert settings["preview"] is True and "Черновик" in harness.session.last_alert()
