@@ -431,7 +431,9 @@ async def test_link_opens_the_mode_picker(harness, monkeypatch):
     text = harness.session.last_text()
     assert "Тестовый ролик" in text and "Автор" in text and "2:00" in text
     assert "Авто" in text and "Вручную" in text
-    assert harness.session.buttons() == ["mode:auto", "mode:manual", "screen:menu"]
+    assert harness.session.buttons() == [
+        "mode:quick", "mode:auto", "mode:presets", "mode:manual", "screen:menu"
+    ]  # fmt: skip
     draft = await _draft(harness)
     assert draft is not None and draft.title == "Тестовый ролик" and draft.mode is None
     assert await _fsm(harness).get_state() == Flow.editing.state
@@ -447,7 +449,9 @@ async def test_search_result_opens_the_mode_picker(harness, monkeypatch):
 
     await harness.press("pick:1")
 
-    assert harness.session.buttons() == ["mode:auto", "mode:manual", "screen:menu"]
+    assert harness.session.buttons() == [
+        "mode:quick", "mode:auto", "mode:presets", "mode:manual", "screen:menu"
+    ]  # fmt: skip
     assert (await _draft(harness)).url.endswith("abcdefghij2")
 
 
@@ -525,7 +529,9 @@ async def test_links_of_other_platforms_open_the_mode_picker_and_name_the_platfo
 
     text = harness.session.last_text()
     assert asked == [link] and "Тестовый ролик" in text and texts.platform_tag(platform) in text
-    assert harness.session.buttons() == ["mode:auto", "mode:manual", "screen:menu"]
+    assert harness.session.buttons() == [
+        "mode:quick", "mode:auto", "mode:presets", "mode:manual", "screen:menu"
+    ]  # fmt: skip
     assert (await _draft(harness)).platform == platform
 
 
@@ -727,7 +733,9 @@ async def test_new_link_replaces_the_draft_and_forgets_pending_input(harness, mo
 
     assert (await _draft(harness)).title == "Другой ролик"
     assert not (await _fsm(harness).get_data()).get("input_field")
-    assert harness.session.buttons() == ["mode:auto", "mode:manual", "screen:menu"]
+    assert harness.session.buttons() == [
+        "mode:quick", "mode:auto", "mode:presets", "mode:manual", "screen:menu"
+    ]  # fmt: skip
 
 
 async def test_title_with_markup_characters_is_escaped(harness, monkeypatch):
@@ -745,7 +753,9 @@ async def test_uploaded_file_opens_the_mode_picker(harness, tmp_path):
     await harness.send_file(file_name="myvideo.mp4", file_size=source.stat().st_size)
 
     assert "myvideo" in harness.session.last_text()
-    assert harness.session.buttons() == ["mode:auto", "mode:manual", "screen:menu"]
+    assert harness.session.buttons() == [
+        "mode:quick", "mode:auto", "mode:presets", "mode:manual", "screen:menu"
+    ]  # fmt: skip
     assert (await _draft(harness)).upload_id
 
 
@@ -857,7 +867,9 @@ async def test_auto_screen_back_goes_to_the_mode_picker(harness, monkeypatch):
 
     await harness.press("screen:mode")
 
-    assert harness.session.buttons() == ["mode:auto", "mode:manual", "screen:menu"]
+    assert harness.session.buttons() == [
+        "mode:quick", "mode:auto", "mode:presets", "mode:manual", "screen:menu"
+    ]  # fmt: skip
     assert await _fsm(harness).get_state() == Flow.editing.state
 
 
@@ -892,7 +904,9 @@ async def test_manual_screen_back_goes_to_the_mode_picker(harness, monkeypatch):
     assert harness.session.buttons()[-1] == "screen:mode"
     await harness.press("screen:mode")
 
-    assert harness.session.buttons() == ["mode:auto", "mode:manual", "screen:menu"]
+    assert harness.session.buttons() == [
+        "mode:quick", "mode:auto", "mode:presets", "mode:manual", "screen:menu"
+    ]  # fmt: skip
 
 
 async def test_going_back_to_auto_recomputes_the_plan(harness, monkeypatch):
@@ -2412,3 +2426,44 @@ async def test_repeat_takes_the_numbers_from_the_last_cut(harness, monkeypatch):
     settings = (await _fsm(harness).get_data())["draft"]["settings"]
     assert settings["num_clips"] == 3 and settings["banner_count"] == 1
     assert 66.0 < settings["clip_duration"] < 68.0
+
+
+# ---------- быстрый старт и пресеты ----------
+
+
+async def test_presets_apply_numbers_and_open_the_manual_screen(harness, monkeypatch):
+    await _open_video(harness, monkeypatch)
+
+    await harness.press("mode:presets")
+    assert "Пресеты" in harness.session.last_text() and "Хук для TikTok" in harness.session.last_text()
+
+    await harness.press("preset:hook")
+
+    text = harness.session.last_text()
+    assert "Ручная настройка" in text and "3" in text  # пресет «хук» — три клипа
+    settings = (await _fsm(harness).get_data())["draft"]["settings"]
+    assert settings["num_clips"] == 3 and settings["clip_duration"] == 25.0
+
+
+async def test_unknown_preset_is_reported(harness, monkeypatch):
+    await _open_video(harness, monkeypatch)
+
+    await harness.press("preset:nope")
+
+    assert harness.session.alerts() == ["Такого набора нет — выберите из кнопок"]
+
+
+async def test_quick_start_goes_from_the_link_to_rendering_in_one_tap(harness, monkeypatch, tmp_path):
+    """«🚀 Нарезать сразу»: один тап — и задача уже идёт, без экранов «Авто/Вручную»."""
+    source = make_video(tmp_path / "src.mp4", size="640x360", seconds=8)
+    harness.session.stream_bytes = source.read_bytes()
+    await harness.send("/start")
+    await harness.send_file(file_name="myvideo.mp4", file_size=Path(source).stat().st_size)
+
+    await harness.press("mode:quick")
+
+    # Экран «Как будем нарезать?» пройден одним нажатием: сразу пошло сообщение о задаче.
+    shown = " ".join(plain_text(html) for html in harness.session.htmls())
+    assert "Задача в очереди" in shown or "Готово" in shown or "%" in shown
+    await _wait_finished(harness)  # задача настоящая: дожидаемся, чтобы она не жила после теста
+    assert harness.session.calls("sendVideo"), "клип должен был дойти до чата"

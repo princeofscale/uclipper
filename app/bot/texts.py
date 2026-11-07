@@ -20,6 +20,7 @@ from app.services.highlights import edge_reserve
 from app.services.history import Record
 from app.services.platforms import EVERYWHERE, PLATFORM_BY_ID, PLATFORMS, SEARCHABLE, TRENDING, Platform
 from app.services import publishing
+from app.services.presets import PRESETS
 from app.services.search import RESULTS
 from app.services.trends import CATEGORIES, PERIOD_TEXT, Category, views_text
 
@@ -346,6 +347,18 @@ def video_card(title: str, uploader: str | None, duration: float, platform: str 
 
 def _card(draft: Draft) -> str:
     return video_card(draft.title, draft.uploader, draft.duration, draft.platform)
+
+
+def presets_screen() -> str:
+    """Экран пресетов: три готовых набора с числами, чтобы было видно, что именно подставится."""
+    items = "".join(
+        f"<li>{preset.emoji} <b>{esc(preset.title)}</b> — {esc(preset.blurb)}</li>" for preset in PRESETS
+    )
+    return f"""\
+<h2>⚡ Пресеты</h2>
+<p>Готовые наборы под жанр ролика. Нажатие подставляет числа и открывает ручную настройку — там всё можно поправить.</p>
+<ul>{items}</ul>
+<blockquote>Все три укладываются в <b>{publishing.LIMIT_SECONDS:.0f} с</b> вместе с баннером: такие клипы не блокируются в Shorts.</blockquote>"""
 
 
 def mode_screen(draft: Draft, *, repeat: bool = False) -> str:

@@ -27,6 +27,7 @@ from app.bot.handlers.settings_screen import render_manual
 from app.bot.states import Flow
 from app.models import ClipSettings, CutMode, Draft, Goal
 from app.services.autoplan import AutoPlan, plan_auto
+from app.services.presets import PRESET_BY_ID, settings_for as preset_settings
 
 log = logging.getLogger(__name__)
 router = Router(name="modes")
@@ -136,6 +137,52 @@ async def cb_repeat(callback: CallbackQuery, state: FSMContext, ctx: AppContext)
     draft.mode = CutMode.MANUAL
     await put_draft(state, draft)
     await safe_answer(callback, "Взял числа из прошлой нарезки")
+    await render_manual(callback, state, ctx)
+
+
+@router.callback_query(F.data == "mode:quick")
+async def cb_quick(callback: CallbackQuery, state: FSMContext, ctx: AppContext) -> None:
+    """«🚀 Нарезать сразу»: один тап от ролика до готовых клипов — автоплан и сразу запуск."""
+    from app.bot.handlers.jobs import start_cut  # локальный импорт: jobs сам импортирует контекст
+
+    draft = await need_draft(callback, state)
+    if draft is None:
+        return
+    plan = make_plan(draft, ctx)
+    draft.settings = plan.settings
+    draft.mode = CutMode.AUTO
+    await put_draft(state, draft)
+    await start_cut(callback, state, ctx, draft)
+
+
+@router.callback_query(F.data == "mode:presets")
+async def cb_presets(callback: CallbackQuery, state: FSMContext, ctx: AppContext) -> None:
+    """Экран пресетов: три готовых набора вместо ручной настройки всех полей."""
+    if await need_draft(callback, state) is None:
+        return
+    await safe_answer(callback)
+    await edit_or_send(callback, texts.presets_screen(), keyboards.presets_screen())
+
+
+@router.callback_query(F.data.startswith("preset:"))
+async def cb_preset(callback: CallbackQuery, state: FSMContext, ctx: AppContext) -> None:
+    """Выбран пресет: подставляем его числа и открываем ручную настройку — человек видит, что получилось."""
+    draft = await need_draft(callback, state)
+    if draft is None:
+        return
+    preset = PRESET_BY_ID.get((callback.data or "preset:").split(":", 1)[1])
+    if preset is None:
+        await safe_answer(callback, "Такого набора нет — выберите из кнопок", alert=True)
+        return
+    draft.settings = preset_settings(
+        preset,
+        draft.settings,
+        ctx.banner_seconds(draft.settings.banner_id),
+        source_seconds=draft.duration or None,
+    )
+    draft.mode = CutMode.MANUAL
+    await put_draft(state, draft)
+    await safe_answer(callback, f"Набор «{preset.title}» применён")
     await render_manual(callback, state, ctx)
 
 

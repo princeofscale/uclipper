@@ -24,16 +24,16 @@ log = logging.getLogger(__name__)
 router = Router(name="jobs")
 
 
-@router.callback_query(F.data == "job:start")
-async def cb_start(callback: CallbackQuery, state: FSMContext, ctx: AppContext) -> None:
-    """Проверяет черновик и запускает нарезку, если бот свободен."""
-    draft = await need_draft(callback, state)
-    if draft is None:
-        return
+async def start_cut(callback: CallbackQuery, state: FSMContext, ctx: AppContext, draft) -> None:
+    """Запускает нарезку по готовому черновику. Общая часть для «🚀 Нарезать» и «🚀 Нарезать сразу».
+
+    Проверяет занятость, занимает место до первого `await` (иначе двое, нажавшие одновременно, прошли бы
+    проверку оба), отвечает ровно один раз — тихо или предупреждением о длине клипа.
+    """
     user_id = callback.from_user.id
     busy = ctx.busy_for(user_id)
     if busy is not None:
-        # Бот ведёт один ролик за раз. План остаётся на экране: когда бот освободится, достаточно нажать ещё раз.
+        # План остаётся на экране: когда бот освободится, достаточно нажать ещё раз.
         await safe_answer(callback, texts.busy_alert(busy), alert=True)
         return
     try:
@@ -42,14 +42,10 @@ async def cb_start(callback: CallbackQuery, state: FSMContext, ctx: AppContext) 
         await safe_answer(callback, str(error).split("\n")[-1], alert=True)
         return
 
-    # Место занимаем сразу, до первого `await`: пока бот отвечает Telegram, задачи ещё нет, и без заявки двое,
-    # нажавшие в один момент, прошли бы проверку оба.
     ctx.runner.claim(user_id)
     banner_seconds = ctx.banner_seconds(draft.settings.banner_id)
     fits = publishing.fits(draft.settings, banner_seconds)
     try:
-        # Ответ у Telegram ровно один: либо тихо, либо предупреждением о длине (нарезку всё равно запускаем —
-        # человек мог сознательно делать клип для другой площадки).
         if fits:
             await safe_answer(callback)
         else:
@@ -76,6 +72,15 @@ async def cb_start(callback: CallbackQuery, state: FSMContext, ctx: AppContext) 
             await callback.message.edit_reply_markup(reply_markup=None)
         except Exception:  # noqa: BLE001
             pass
+
+
+@router.callback_query(F.data == "job:start")
+async def cb_start(callback: CallbackQuery, state: FSMContext, ctx: AppContext) -> None:
+    """Проверяет черновик и запускает нарезку, если бот свободен."""
+    draft = await need_draft(callback, state)
+    if draft is None:
+        return
+    await start_cut(callback, state, ctx, draft)
 
 
 @router.callback_query(F.data.startswith("job:cancel:"))

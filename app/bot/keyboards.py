@@ -28,6 +28,7 @@ from app.services.autoplan import GOALS
 from app.services.banner_manager import BannerInfo
 from app.services.history import Record
 from app.services.platforms import EVERYWHERE, PLATFORM_BY_ID, SEARCHABLE, TRENDING, Platform
+from app.services.presets import PRESETS
 from app.services.trends import CATEGORIES
 
 PRIMARY = ButtonStyle.PRIMARY.value
@@ -153,17 +154,30 @@ def search_results(entries: list[dict], choice: str = EVERYWHERE) -> InlineKeybo
 
 
 def mode_picker(*, repeat: bool = False) -> InlineKeyboardMarkup:
-    """Выбор режима. `repeat` — есть прошлая нарезка, и её числа можно взять одной кнопкой."""
+    """Выбор режима. `repeat` — есть прошлая нарезка, и её числа можно взять одной кнопкой.
+
+    Первой стоит «Нарезать сразу»: это один тап от ссылки до готового клипа — бот считает автоплан
+    и тут же запускает нарезку. Кто хочет разобраться — идёт в «Авто» или «Вручную» ниже.
+    """
     builder = InlineKeyboardBuilder()
+    _add(builder, "🚀 Нарезать сразу", "mode:quick", SUCCESS)
     _add(builder, "🤖 Авто — подберу сам", "mode:auto", PRIMARY)
+    _add(builder, "⚡ Пресеты: хук, подкаст, стрим", "mode:presets")
     _add(builder, "🛠 Вручную — настрою сам", "mode:manual")
     if repeat:
         _add(builder, "🔁 Как в прошлый раз", "mode:repeat")
-        _add(builder, "🏠 В начало", MENU)
-        builder.adjust(1, 1, 1, 1)
-        return builder.as_markup()
     _add(builder, "🏠 В начало", MENU)
-    builder.adjust(1, 1, 1)
+    builder.adjust(*([1] * (6 if repeat else 5)))
+    return builder.as_markup()
+
+
+def presets_screen() -> InlineKeyboardMarkup:
+    """Три готовых набора: нажатие подставляет числа и открывает ручную настройку."""
+    builder = InlineKeyboardBuilder()
+    for preset in PRESETS:
+        _add(builder, f"{preset.emoji} {preset.title} — {preset.blurb}", f"preset:{preset.id}", PRIMARY)
+    _add(builder, "⬅️ Назад", "screen:mode")
+    builder.adjust(*([1] * (len(PRESETS) + 1)))
     return builder.as_markup()
 
 
