@@ -47,9 +47,9 @@ def video_card(item: dict) -> dict | None:
     }
 
 
-def search(query: str, limit: int = FETCH) -> list[dict]:
-    """Ролики по запросу в порядке релевантности."""
-    params = {"search": query, "fields": FIELDS, "limit": min(limit, MAX_LIMIT), "sort": "relevance"}
+def search(query: str, limit: int = FETCH, *, sort: str = "relevance") -> list[dict]:
+    """Ролики по запросу. `sort="trending"` — то же, но в порядке «сейчас смотрят»: так площадка идёт в «В тренде»."""
+    params = {"search": query, "fields": FIELDS, "limit": min(limit, MAX_LIMIT), "sort": sort}
     if _CYRILLIC.search(query):
         params["language"] = "ru"
     request = urllib.request.Request(

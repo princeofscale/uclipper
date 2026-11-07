@@ -345,8 +345,8 @@ def test_help_is_honest_about_where_search_and_trends_work():
             assert platform.title in texts.LINK_ONLY_NOTE, platform.title
     for platform in SEARCHABLE:
         assert platform.title not in texts.LINK_ONLY_NOTE
-    assert texts.TREND_SITES == "▶️ YouTube и 📺 RuTube"
-    assert "Dailymotion" in texts.SEARCH_SITES and "Dailymotion" not in texts.TREND_SITES
+    assert all(platform.title in texts.TREND_SITES for platform in TRENDING)  # тренды — все, кто умеет искать
+    assert "Dailymotion" in texts.SEARCH_SITES and "Dailymotion" in texts.TREND_SITES
 
 
 # ---------- /start: красивее и честно про площадки ----------
@@ -372,13 +372,10 @@ def test_start_groups_platforms_by_what_the_bot_can_do_with_them():
     plain = plain_text(texts.start())
     link_only = _position(plain, "Только по ссылке")
     both = _position(plain, "Поиск, тренды и ссылки")
-    search_only = _position(plain, "Поиск и ссылки")
     for platform in PLATFORMS:
         place = _position(plain, platform.title)
         if platform.search and platform.trends:
-            assert both < place < search_only, platform.title
-        elif platform.search:
-            assert search_only < place < link_only, platform.title
+            assert both < place < link_only, platform.title
         else:
             assert place > link_only, platform.title
 

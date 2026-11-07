@@ -1213,7 +1213,7 @@ async def test_trend_genre_lists_videos_and_is_cached(harness, monkeypatch):
     assert "Подкаст номер 1" in text and "1,5 млн" in text and "Канал 2" in text
     assert harness.session.buttons() == [
         "pick:0", "pick:1", "pick:2", "trend:all:podcast", "trend:youtube:podcast", "trend:rutube:podcast",
-        "trends:youtube", "screen:menu",
+        "trend:dailymotion:podcast", "trends:youtube", "screen:menu",
     ]  # fmt: skip
     assert _styles(harness)["trend:youtube:podcast"] == "primary"  # тот же жанр на другой площадке — одной кнопкой
     assert_valid_rich(harness.session.htmls()[-1])
@@ -1343,7 +1343,7 @@ def _platform_fetch(per_platform: dict, calls: list | None = None):
     def fetch(category, platform="youtube", limit=8):
         if calls is not None:
             calls.append((platform, category.id))
-        answer = per_platform[platform]
+        answer = per_platform.get(platform, [])
         if isinstance(answer, Exception):
             raise answer
         return [dict(item) for item in answer]
@@ -1353,12 +1353,16 @@ def _platform_fetch(per_platform: dict, calls: list | None = None):
 
 async def test_everywhere_trends_mix_both_platforms_and_share_the_cache(harness, monkeypatch):
     calls: list[tuple[str, str]] = []
-    answers = {"youtube": _trend_videos("youtube"), "rutube": _trend_videos("rutube")}
+    answers = {
+        "youtube": _trend_videos("youtube"),
+        "rutube": _trend_videos("rutube"),
+        "dailymotion": _trend_videos("dailymotion"),
+    }
     monkeypatch.setattr(trend_handlers, "fetch_category", _platform_fetch(answers, calls))
 
     await harness.press("trend:all:podcast")
 
-    assert sorted(calls) == [("rutube", "podcast"), ("youtube", "podcast")]
+    assert sorted(calls) == [("dailymotion", "podcast"), ("rutube", "podcast"), ("youtube", "podcast")]
     text = harness.session.last_text()
     assert "youtube Подкаст номер 1" in text and "rutube Подкаст номер 1" in text and "Везде" in text
     labels = harness.session.button_texts()
@@ -1371,7 +1375,7 @@ async def test_everywhere_trends_mix_both_platforms_and_share_the_cache(harness,
     await harness.press("trend:rutube:podcast")  # кеш общий с «Везде»: площадки заново не спрашиваем
     await harness.press("trend:youtube:podcast")
     await harness.press("trend:all:podcast")
-    assert len(calls) == 2
+    assert len(calls) == 3  # по разу на площадку: дальше всё из общего кеша
 
 
 async def test_everywhere_trends_show_the_survivor_when_one_platform_is_down(harness, monkeypatch):
@@ -1380,6 +1384,7 @@ async def test_everywhere_trends_show_the_survivor_when_one_platform_is_down(har
     answers = {
         "youtube": TrendsError("YouTube сейчас не отвечает — попробуйте через пару минут."),
         "rutube": _trend_videos("rutube"),
+        "dailymotion": _trend_videos("dailymotion"),
     }
     monkeypatch.setattr(trend_handlers, "fetch_category", _platform_fetch(answers))
 
@@ -1395,7 +1400,11 @@ async def test_everywhere_trends_show_the_survivor_when_one_platform_is_down(har
 async def test_everywhere_trends_report_an_error_only_when_nobody_answers(harness, monkeypatch):
     from app.services.trends import TrendsError
 
-    answers = {"youtube": TrendsError("YouTube сейчас не отвечает."), "rutube": ValueError("внезапно")}
+    answers = {
+        "youtube": TrendsError("YouTube сейчас не отвечает."),
+        "rutube": ValueError("внезапно"),
+        "dailymotion": TrendsError("Dailymotion сейчас не отвечает."),
+    }
     monkeypatch.setattr(trend_handlers, "fetch_category", _platform_fetch(answers))
 
     await harness.press("trend:all:games")
@@ -1408,15 +1417,21 @@ async def test_everywhere_trends_report_an_error_only_when_nobody_answers(harnes
 
 async def test_everywhere_trends_do_not_cache_an_empty_platform(harness, monkeypatch):
     calls: list[tuple[str, str]] = []
-    answers = {"youtube": [], "rutube": _trend_videos("rutube")}
+    answers = {"youtube": [], "rutube": _trend_videos("rutube"), "dailymotion": _trend_videos("dailymotion")}
     monkeypatch.setattr(trend_handlers, "fetch_category", _platform_fetch(answers, calls))
     await harness.press("trend:all:sport")
-    assert harness.session.buttons()[:3] == ["pick:0", "pick:1", "pick:2"]  # пока только RuTube
+    assert harness.session.buttons()[:3] == ["pick:0", "pick:1", "pick:2"]  # пока RuTube и Dailymotion
 
     answers["youtube"] = _trend_videos("youtube")  # YouTube наконец ответил
     await harness.press("trend:all:sport")
 
-    assert sorted(calls) == [("rutube", "sport"), ("youtube", "sport"), ("youtube", "sport")]  # RuTube — из кеша
+    # RuTube и Dailymotion берутся из кеша, заново спрашиваем только YouTube
+    assert sorted(calls) == [
+        ("dailymotion", "sport"),
+        ("rutube", "sport"),
+        ("youtube", "sport"),
+        ("youtube", "sport"),
+    ]
     assert "youtube Подкаст номер 1" in harness.session.last_text()
 
 
@@ -1452,7 +1467,8 @@ async def test_the_movies_genre_asks_each_platform_its_own_queries(harness, monk
 
     await harness.press("trend:all:movies")
 
-    assert set(seen) == {"youtube", "rutube"} and seen["youtube"] != seen["rutube"]  # на RuTube — целые фильмы и сериалы
+    assert set(seen) == {"youtube", "rutube", "dailymotion"}
+    assert seen["youtube"] != seen["rutube"]  # на RuTube — целые фильмы и сериалы, а на YouTube — разборы
     assert "VK Видео" in harness.session.last_text()  # и честная подсказка, где их больше всего
 
 
@@ -1468,9 +1484,8 @@ async def test_the_movies_genre_asks_each_platform_its_own_queries(harness, monk
         ("trend:", "Такого раздела нет"),
         ("trends:nope", "Такой площадки нет"),
         ("trends:all:x", "Такой площадки нет"),
-        ("trends:dailymotion", "Такой площадки нет"),  # у Dailymotion есть поиск, но нет раздела «В тренде»
-        ("trend:dailymotion:podcast", "Такого раздела нет"),
-        ("trends:vk", "Такой площадки нет"),
+        ("trends:vk", "Такой площадки нет"),  # у VK Видео нет ни поиска, ни трендов
+        ("trend:vk:podcast", "Такого раздела нет"),
         ("trends:", "Такой площадки нет"),
     ],
 )

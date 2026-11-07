@@ -491,3 +491,67 @@ async def test_failure_is_remembered_briefly_and_then_retried():
     clock.now += trends.FAILURE_SECONDS + 1
     assert await cache.cached("k", flaky) == ["ok"]
     assert len(attempts) == 2
+
+
+# ---------- Dailymotion ----------
+
+
+def dailymotion_card(video_id, days_ago, views=10_000, title=None, **extra):
+    return card(
+        video_id, title or f"Подкаст выпуск {video_id}", views=views, uploader=f"Канал {video_id}",
+        platform="dailymotion", published=NOW - days_ago * DAY,
+        url=f"https://www.dailymotion.com/video/{video_id}", thumbnail="", **extra,
+    )  # fmt: skip
+
+
+def test_fetch_dailymotion_takes_the_fresh_first_then_the_most_viewed(monkeypatch):
+    cards = [
+        dailymotion_card("old", 200, views=9_000_000),  # старше квартала — не берём
+        dailymotion_card("month", 20, views=900_000),
+        dailymotion_card("weekLow", 3, views=5_000),
+        dailymotion_card("weekTop", 5, views=70_000),
+    ]
+    monkeypatch.setattr(trends, "_search_dailymotion_all", lambda queries: (cards, True))
+
+    result = trends.fetch_dailymotion(("подкаст",), limit=10, now=NOW)
+
+    assert [video["video_id"] for video in result] == ["weekTop", "weekLow", "month"]
+    assert {video["platform"] for video in result} == {"dailymotion"}
+
+
+def test_fetch_dailymotion_says_so_when_the_platform_is_silent(monkeypatch):
+    monkeypatch.setattr(trends, "_search_dailymotion_all", lambda queries: ([], False))
+
+    with pytest.raises(TrendsError):
+        trends.fetch_dailymotion(("подкаст",), now=NOW)
+
+
+def test_dailymotion_search_asks_the_api_for_trending(monkeypatch):
+    """Поиск идёт с сортировкой «сейчас смотрят», а не по релевантности, и только по русским роликам."""
+    from app.services import dailymotion
+
+    asked = {}
+
+    class Answer:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self, limit):
+            return b'{"list": []}'
+
+    def fake_urlopen(request, timeout=0):
+        asked["url"] = request.full_url
+        return Answer()
+
+    monkeypatch.setattr(dailymotion.urllib.request, "urlopen", fake_urlopen)
+
+    assert dailymotion.search("подкаст", sort="trending") == []
+    assert "sort=trending" in asked["url"] and "language=ru" in asked["url"]
+
+
+def test_dailymotion_is_offered_in_the_trends_section():
+    assert "dailymotion" in [platform.id for platform in TRENDING]
+    assert "dailymotion" in FETCHERS and PERIOD_TEXT["dailymotion"]

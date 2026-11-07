@@ -228,9 +228,10 @@ def test_search_is_offered_where_an_open_api_exists():
     assert [platform.id for platform in SEARCHABLE] == ["youtube", "rutube", "dailymotion"]
 
 
-def test_trends_need_enough_russian_videos_so_dailymotion_has_none():
-    assert [platform.id for platform in TRENDING] == ["youtube", "rutube"]
-    assert set(TRENDING) <= set(SEARCHABLE)
+def test_every_platform_with_search_also_has_trends():
+    """«В тренде» умеют все площадки, где вообще есть открытый поиск: YouTube, RuTube и Dailymotion."""
+    assert [platform.id for platform in TRENDING] == ["youtube", "rutube", "dailymotion"]
+    assert set(TRENDING) == set(SEARCHABLE)
 
 
 # ---------- выбор площадки ----------
@@ -252,7 +253,7 @@ def test_scope_refuses_what_the_list_does_not_offer(choice):
 
 
 def test_a_platform_without_trends_cannot_be_chosen_for_trends():
-    assert scope("dailymotion", TRENDING) is None
+    assert scope("vk", TRENDING) is None  # у VK Видео открытого поиска и трендов нет
 
 
 def test_the_everywhere_id_cannot_clash_with_a_platform():

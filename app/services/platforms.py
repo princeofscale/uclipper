@@ -89,10 +89,9 @@ KICK = Platform(
     why_not_search=WHY_BY_CHANNEL,
 )  # fmt: skip
 DAILYMOTION = Platform(
-    "dailymotion", "Dailymotion", "🔵", ("dailymotion.com", "dai.ly"), search=True,
+    "dailymotion", "Dailymotion", "🔵", ("dailymotion.com", "dai.ly"), search=True, trends=True,
     id_patterns=(r"(?:/video/|dai\.ly/)(?P<id>[a-z0-9]+)",),
     links="ролики",
-    why_not_trends="русскоязычных роликов там мало",
 )  # fmt: skip
 
 PLATFORMS: tuple[Platform, ...] = (YOUTUBE, RUTUBE, VK, DZEN, OK, FIRSTTV, VKPLAY, TWITCH, KICK, DAILYMOTION)

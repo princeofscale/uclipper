@@ -31,7 +31,7 @@ from dataclasses import dataclass
 from typing import TypeVar
 
 from app.config import MAX_SOURCE_SECONDS
-from app.services import rutube, youtube
+from app.services import dailymotion, rutube, youtube
 
 T = TypeVar("T")
 
@@ -345,11 +345,58 @@ def fetch_rutube(queries: tuple[str, ...], limit: int = 8, *, now: float | None 
 
 
 # ---------------------------------------------------------------------------
+# Dailymotion
+# ---------------------------------------------------------------------------
+
+
+def _search_dailymotion_all(queries: tuple[str, ...]) -> tuple[list[dict], bool]:
+    """Ответы Dailymotion по всем запросам, без повторов. Сортировка — «сейчас смотрят», а не релевантность."""
+
+    def one(query: str) -> list[dict] | None:
+        try:
+            return dailymotion.search(query, sort="trending")
+        except dailymotion.DailymotionError:
+            return None
+
+    with ThreadPoolExecutor(max_workers=len(queries)) as pool:
+        answers = list(pool.map(one, queries))
+    merged: dict[str, dict] = {}
+    for cards in answers:
+        for card in cards or []:
+            merged.setdefault(card["video_id"], card)
+    return list(merged.values()), any(cards is not None for cards in answers)
+
+
+def fetch_dailymotion(queries: tuple[str, ...], limit: int = 8, *, now: float | None = None) -> list[dict]:
+    """Свежие русскоязычные ролики Dailymotion, самые просматриваемые первыми.
+
+    У площадки нет «ленты трендов», зато есть сортировка `trending` у поиска, поэтому идём тем же путём,
+    что и на RuTube: свежие (неделя → месяц → квартал) и по просмотрам. Пустой список — ничего подходящего;
+    `TrendsError` — площадка не ответила.
+    """
+    cards, answered = _search_dailymotion_all(queries)
+    if not answered:
+        raise TrendsError("Dailymotion сейчас не отвечает — попробуйте через пару минут.")
+    moment = time.time() if now is None else now
+    fresh = [card for card in cards if freshness_rank(card.get("published"), moment) < len(FRESH_DAYS)]
+    fresh.sort(key=lambda card: (freshness_rank(card.get("published"), moment), -card["views"]))
+    return pick_videos(fresh, limit)
+
+
+# ---------------------------------------------------------------------------
 # Подборка по жанру
 # ---------------------------------------------------------------------------
 
-FETCHERS: dict[str, Callable[[tuple[str, ...], int], list[dict]]] = {"youtube": fetch_youtube, "rutube": fetch_rutube}
-PERIOD_TEXT = {"youtube": "за неделю", "rutube": "за последнее время"}  # как называть период в подписях
+FETCHERS: dict[str, Callable[[tuple[str, ...], int], list[dict]]] = {
+    "youtube": fetch_youtube,
+    "rutube": fetch_rutube,
+    "dailymotion": fetch_dailymotion,
+}
+PERIOD_TEXT = {  # как называть период в подписях
+    "youtube": "за неделю",
+    "rutube": "за последнее время",
+    "dailymotion": "за последнее время",
+}
 EXCLUDE_SPARE = 4  # столько лишних роликов просим у площадки, если часть выдачи отсеется по словам жанра
 
 
