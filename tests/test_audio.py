@@ -251,3 +251,15 @@ def test_limit_file_returns_false_for_non_media(ffmpeg_tools, tmp_path: Path) ->
     broken.write_bytes(b"this is definitely not a media file")
     assert limit_file(broken) is False
     assert broken.read_bytes() == b"this is definitely not a media file"
+
+
+def test_audio_already_at_target_is_left_alone(ffmpeg_tools, tmp_path: Path) -> None:
+    """Если громкость уже в норме, перекодировать звук незачем: это лишний проход по файлу."""
+    clip = clip_with_tone(tmp_path / "ok_clip.mp4", volume_db=-6.0)
+    assert normalize_file(clip) is True  # сначала приводим к цели
+    before_mtime = clip.stat().st_mtime_ns
+    audio_before = stream(clip, "audio")
+
+    assert normalize_file(clip) is False, "второй раз нормализовать нечего"
+    assert clip.stat().st_mtime_ns == before_mtime, "файл не должен был измениться"
+    assert stream(clip, "audio") == audio_before

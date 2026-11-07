@@ -345,7 +345,7 @@ class JobManager:
         )
         clips = self._render_all(
             job_id, job_dir, source, info, schedule.starts, schedule.clip_duration, options,
-            banner, sfx, render_start, notifier, on_clip, captions=captions,
+            banner, sfx, render_start, notifier, on_clip, captions=captions, preview=request.preview,
         )  # fmt: skip
 
         render_seconds = time.monotonic() - started - fetch_seconds
@@ -506,6 +506,7 @@ class JobManager:
         notifier: "_Notifier",
         on_clip: Notify | None,
         captions: dict | None = None,
+        preview: bool = False,
     ) -> list[ClipResult]:
         total = len(starts)
         self._update(job_id, total_clips=total)
@@ -539,7 +540,8 @@ class JobManager:
                 info=info, banner=banner, sfx=sfx, on_progress=on_progress,
                 threads=ffmpeg_threads(self.running_count()),
             )  # fmt: skip
-            if self._normalize_audio:  # замерено: баннер громче контента на 2–8 дБ, а клип тише нормы платформ
+            # Черновик нормализацию пропускает: он для проверки моментов, а лишний проход по звуку — время.
+            if self._normalize_audio and not preview:  # замерено: баннер громче контента на 2–8 дБ
                 self._check_not_stopping(job_id)
                 if normalize_loudness(job_dir / filename):
                     self._log(job_id, f"Клип {number}: звук выровнен до −14 LUFS")

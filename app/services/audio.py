@@ -46,6 +46,7 @@ AUDIO_CODEC = "aac"
 AUDIO_BITRATE = "160k"
 AUDIO_RATE = 44100
 AUDIO_CHANNELS = 2
+CLOSE_ENOUGH_LU = 0.5  # ближе этого к цели перекодировать звук бессмысленно: слух разницы не слышит
 
 # Сводка ebur128 идёт в stderr последними строками; якорь `^` с MULTILINE отсекает бегущие строки вида
 # `t: 1.2 ... I: -41.8 LUFS ...` — они приходят на каждом кадре и могут нести промежуточные значения.
@@ -135,6 +136,10 @@ def normalize_file(
     """
     if not path.is_file():
         log.warning("Нормализация: файла нет — %s", path)
+        return False
+    current = measure(path)  # дешёвый проход ebur128: если уже в норме, перекодировать звук незачем
+    if current is not None and abs(current.integrated - target_i) <= CLOSE_ENOUGH_LU and current.true_peak <= target_tp:
+        log.info("Звук уже в норме (%.1f LUFS): %s", current.integrated, path)
         return False
     measured = _loudnorm_measure(path, target_i, target_tp, target_lra)
     if measured is None:
