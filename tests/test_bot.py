@@ -142,7 +142,10 @@ def no_platform_traffic(monkeypatch):
 
 
 @pytest.fixture
-async def harness(bot_settings):
+async def harness(bot_settings, monkeypatch):
+    # Сценарии «бот занят» описывают предел в одну нарезку: по умолчанию бот ведёт столько, сколько ядер.
+    # Отдельный тест про параллельные места выставляет MAX_JOBS сам.
+    monkeypatch.setenv("MAX_JOBS", "1")
     fake = Harness(bot_settings)
     yield fake
     await fake.close()
@@ -205,12 +208,12 @@ async def test_help_explains_modes_trends_and_limits(harness):
     assert harness.session.buttons() == ["screen:menu"]
 
 
-async def test_stats_start_at_zero_and_show_the_user_id(harness):
+async def test_history_starts_empty_and_shows_the_user_id(harness):
     await harness.send("/start", user_id=777)
     await harness.press("screen:stats", user_id=777)
 
     text = harness.session.last_text()
-    assert "Роликов нарезано" in text and "0" in text
+    assert "История нарезок" in text and "Пока пусто" in text and "777" in text
     assert "777" in text
     assert "<code>777</code>" in harness.session.htmls()[-1]
 

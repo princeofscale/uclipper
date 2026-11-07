@@ -180,7 +180,7 @@ async def run() -> None:
     proxy = (os.getenv(PROXY_ENV) or "").strip()
     session = AiohttpSession(proxy=proxy) if proxy else None
     bot = Bot(token=token, session=session, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-    ctx.runner = JobRunner(bot, manager, ctx.store)
+    ctx.runner = JobRunner(bot, manager, ctx.store, history=ctx.history)
     dispatcher["ctx"] = ctx
     await prepare_bot(bot)
     me = await bot.me()

@@ -18,6 +18,7 @@ from app.bot.context import (
     show,
 )
 from app.bot.states import Flow
+from app.services import publishing
 
 log = logging.getLogger(__name__)
 router = Router(name="jobs")
@@ -44,8 +45,15 @@ async def cb_start(callback: CallbackQuery, state: FSMContext, ctx: AppContext) 
     # Место занимаем сразу, до первого `await`: пока бот отвечает Telegram, задачи ещё нет, и без заявки двое,
     # нажавшие в один момент, прошли бы проверку оба.
     ctx.runner.claim(user_id)
+    banner_seconds = ctx.banner_seconds(draft.settings.banner_id)
+    fits = publishing.fits(draft.settings, banner_seconds)
     try:
-        await safe_answer(callback)
+        # Ответ у Telegram ровно один: либо тихо, либо предупреждением о длине (нарезку всё равно запускаем —
+        # человек мог сознательно делать клип для другой площадки).
+        if fits:
+            await safe_answer(callback)
+        else:
+            await safe_answer(callback, texts.publish_warning(draft.settings, banner_seconds), alert=True)
         chat_id = callback.message.chat.id if callback.message is not None else user_id
         progress = await send_html(callback.bot, chat_id, texts.QUEUED_TEXT)
         await state.set_state(Flow.running)

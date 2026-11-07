@@ -20,7 +20,8 @@ WAIT_SECONDS = 180
 @pytest.fixture
 def manager(settings, banner_id):
     ensure_sfx(settings.sfx_dir)
-    jobs = JobManager(settings)
+    # Один работник: эти тесты проверяют сам конвейер, а не параллельность (для неё есть отдельный тест).
+    jobs = JobManager(settings, max_workers=1)
     yield jobs
     jobs.shutdown()
 
@@ -152,6 +153,31 @@ def test_jobs_run_one_after_another(manager, upload_id):
             break
         time.sleep(0.02)
     assert (manager.get(first).status, manager.get(second).status) == (JobStatus.DONE, JobStatus.DONE)
+
+
+def test_two_jobs_can_render_at_the_same_time(settings, banner_id, upload_id):
+    """Многопоточность: пока один человек ждёт свой клип, второй не стоит в очереди."""
+    ensure_sfx(settings.sfx_dir)
+    jobs = JobManager(settings, max_workers=2)
+    try:
+        quick = dict(num_clips=1, clip_duration=6, banner_count=0)
+        first = jobs.submit(request_for(upload_id, **quick))
+        second = jobs.submit(request_for(upload_id, **quick))
+        saw_two_running = False
+        deadline = time.monotonic() + WAIT_SECONDS
+        while time.monotonic() < deadline:
+            states = (jobs.get(first), jobs.get(second))
+            if states[0] is not None and states[1] is not None:
+                running = [state.status is JobStatus.RUNNING for state in states]
+                saw_two_running = saw_two_running or all(running)
+                if all(state.status in (JobStatus.DONE, JobStatus.ERROR) for state in states):
+                    break
+            time.sleep(0.01)
+        assert (jobs.get(first).status, jobs.get(second).status) == (JobStatus.DONE, JobStatus.DONE)
+        assert saw_two_running, "с двумя работниками нарезки должны идти одновременно"
+        assert jobs.max_parallel() == 2
+    finally:
+        jobs.shutdown()
 
 
 def test_progress_only_moves_forward_and_ends_at_100(manager, upload_id):

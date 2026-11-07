@@ -126,11 +126,22 @@ class Draft(BaseModel):
         return cls(source_type=SourceType.UPLOAD, upload_id=upload_id, title=title, duration=duration, settings=settings)
 
     def to_request(self) -> "JobRequest":
-        """Превращает черновик в запрос для менеджера задач."""
+        """Превращает черновик в запрос для менеджера задач.
+
+        Название, площадка и ключ источника едут вместе с задачей: по ним пишется история нарезок, чтобы потом
+        можно было показать «что резали» и предложить «нарезать иначе» без повторного поиска ролика.
+        """
+        from app.services.platforms import identify  # локальный импорт: сервисы сами импортируют модели
+
+        source = identify(self.url or "") if self.source_type is SourceType.LINK else None
         return JobRequest(
             source_type=self.source_type,
             url=self.url,
             upload_id=self.upload_id,
+            title=self.title,
+            platform=self.platform,
+            source_key=source.key if source is not None else (self.upload_id or ""),
+            mode=self.mode.value if self.mode else "",
             **self.settings.model_dump(),
         )
 
@@ -141,6 +152,10 @@ class JobRequest(ClipSettings):
     source_type: SourceType = SourceType.LINK
     url: str | None = None
     upload_id: str | None = None
+    title: str = ""  # название ролика: нужно истории и итогам, на саму нарезку не влияет
+    platform: str | None = None  # id площадки из `app.services.platforms`
+    source_key: str = ""  # ключ источника в кеше (`platforms.Source.key`) или id загрузки
+    mode: str = ""  # «auto» или «manual»: чем человек резал (для истории)
 
     @model_validator(mode="after")
     def _check_source_and_banner(self) -> "JobRequest":
@@ -163,6 +178,7 @@ class ClipResult(BaseModel):
     duration: float  # длительность готового файла (с учётом пауз под баннер)
     banner_points: list[float] = Field(default_factory=list)  # секунды КЛИПА, где видео встаёт под баннер
     banner_windows: list[tuple[float, float]] = Field(default_factory=list)  # окна показа на таймлайне ролика
+    render_seconds: float = 0.0  # сколько секунд занял рендер этого клипа (для истории и поиска деградации)
 
 
 class TrimInfo(BaseModel):

@@ -2,9 +2,9 @@
 и сколько кусочков ролика качается разом.
 
 Бот живёт на одной машине с другими сервисами, нарезка грузит процессор целиком, а скачанные ролики занимают диск.
-Поэтому по умолчанию бот ведёт **один** ролик за раз: пока он не готов (клипы не дошли до чата), остальным бот
-отвечает «занят», и новая задача принимается, только когда хватает места. Человек сразу видит причину (красное меню),
-а не ждёт часами и не роняет соседей по серверу. Пределы настраиваются в `.env` (0 — не ограничивать).
+Поэтому нарезок одновременно столько, сколько ядер разрешено контейнеру (по умолчанию две на двух ядрах,
+не больше трёх), а каждая получает свою долю потоков ffmpeg. Лишние задачи встают в очередь, и человек видит,
+сколько задач перед ним. Настройка — `MAX_JOBS` в `.env` (0 — не ограничивать).
 """
 from __future__ import annotations
 
@@ -23,13 +23,15 @@ MIN_FREE_ENV = "MIN_FREE_GB"
 CACHE_LIMIT_ENV = "CACHE_LIMIT_GB"
 DOWNLOAD_THREADS_ENV = "DOWNLOAD_THREADS"
 FFMPEG_THREADS_ENV = "FFMPEG_THREADS"
+AUDIO_NORMALIZE_ENV = "AUDIO_NORMALIZE"
 CGROUP_DIR = Path("/sys/fs/cgroup")
 
-DEFAULT_MAX_JOBS = 1  # нарезок одновременно: один ролик за раз, остальным бот говорит «занят»
+DEFAULT_MAX_JOBS = 1  # подставляется ниже: сколько нарезок бот ведёт одновременно
 DEFAULT_MIN_FREE_GB = 5.0  # меньше — новые задачи не берём
 DEFAULT_CACHE_LIMIT_GB = 12.0  # столько могут занимать скачанные источники
 DEFAULT_DOWNLOAD_THREADS = 8  # кусочков ролика (фрагментов HLS/DASH) за раз: RuTube, 340 МБ: по одному ≈70 с, на 8 потоках ≈40 с
 MAX_DOWNLOAD_THREADS = 16  # выше площадки отвечают отказами, а выигрыша нет
+PARALLEL_CAP = 3  # больше трёх нарезок на двух ядрах только мешают друг другу: каждая получает меньше потока
 
 
 def _number_from_env(name: str, default: float) -> float:
@@ -44,9 +46,18 @@ def _number_from_env(name: str, default: float) -> float:
         return default
 
 
+def default_max_jobs() -> int:
+    """Сколько нарезок вести одновременно, если человек не задал `MAX_JOBS`: по одной на ядро, но не больше трёх.
+
+    На двух ядрах это две нарезки: каждая получает по одному потоку ffmpeg, и суммарно выходит почти та же
+    скорость, что у одной нарезки с двумя потоками (2,0× против 2,29×), зато двое людей не ждут друг друга.
+    """
+    return max(1, min(PARALLEL_CAP, cpu_limit() or 2))
+
+
 def max_jobs_from_env() -> int:
     """Сколько нарезок бот ведёт одновременно (идущие, ждущие запуска и досылающие результат); 0 — без предела."""
-    return int(_number_from_env(MAX_JOBS_ENV, DEFAULT_MAX_JOBS))
+    return int(_number_from_env(MAX_JOBS_ENV, default_max_jobs()))
 
 
 def min_free_bytes_from_env() -> int:
@@ -78,17 +89,21 @@ def cpu_limit(cgroup_dir: Path = CGROUP_DIR) -> int | None:
     return max(1, math.ceil(cores)) if cores > 0 else None
 
 
-def ffmpeg_threads() -> int | None:
+def ffmpeg_threads(jobs: int = 1) -> int | None:
     """Сколько потоков отдать ffmpeg; `None` — пусть выберет сам.
 
-    ffmpeg видит все ядра хоста, а контейнеру разрешено меньше (на сервере — одно): лишние потоки не получают
-    процессора, мешают друг другу и съедают четверть времени. Поэтому потоков столько, сколько разрешено контейнеру.
+    ffmpeg видит все ядра хоста, а контейнеру разрешено меньше (на сервере — два): лишние потоки не получают
+    процессора, мешают друг другу и съедают четверть времени. Поэтому потоков столько, сколько разрешено контейнеру,
+    **делённое на число одновременных нарезок**: двум задачам по одному потоку лучше, чем двум по два.
     `FFMPEG_THREADS` в `.env` важнее: число — столько потоков, 0 — не ограничивать.
     """
     wanted = _number_from_env(FFMPEG_THREADS_ENV, -1)
-    if wanted < 0:
-        return cpu_limit()
-    return int(wanted) or None
+    if wanted >= 0:
+        return int(wanted) or None
+    cores = cpu_limit()
+    if cores is None:
+        return None
+    return max(1, cores // max(1, jobs))
 
 
 def free_bytes(path: Path) -> int | None:
@@ -110,3 +125,13 @@ def disk_is_low(workspace: Path) -> bool:
     needed = min_free_bytes_from_env()
     free = free_bytes(workspace) if needed else None
     return free is not None and free < needed
+
+
+def normalize_audio_from_env() -> bool:
+    """Выравнивать ли громкость готовых клипов (по умолчанию да).
+
+    Замерено на нашем сервере: баннер громче контента на 2–8 дБ, а сам клип тише платформенной нормы.
+    Выключить можно `AUDIO_NORMALIZE=0` — например, если нужно отдать файл ровно как смонтировали.
+    """
+    raw = (os.getenv(AUDIO_NORMALIZE_ENV) or "").strip().lower()
+    return raw not in ("0", "no", "off", "false", "нет")

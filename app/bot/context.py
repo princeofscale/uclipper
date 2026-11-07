@@ -27,6 +27,7 @@ from app.config import Settings
 from app.models import ClipSettings, Draft, JobStatus
 from app.services.banner_manager import BannerInfo, catalog_banners, default_banner, find_banner
 from app.services.capacity import disk_is_low, jobs_limit_reached
+from app.services.history import History
 from app.services.jobs import JobManager
 from app.services.trends import TrendCache
 from app.services.user_store import UserStore
@@ -53,6 +54,14 @@ class AppContext:
     runner: JobRunner
     trends: TrendCache = field(default_factory=TrendCache)
     banner_previews: dict[str, str] = field(default_factory=dict)  # file_id отправленных превью по id баннера
+    _history: History | None = field(default=None, repr=False)
+
+    @property
+    def history(self) -> History:
+        """История нарезок: файл читается по первому обращению, чтобы не трогать диск без нужды."""
+        if self._history is None:
+            self._history = History(self.settings.workspace_dir)
+        return self._history
 
     def banners(self) -> list[BannerInfo]:
         """Баннеры проекта, которые сейчас лежат в папке (TGrader и TgRader v2)."""

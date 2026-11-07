@@ -544,8 +544,12 @@ def render_clip(
     banner: Path | None = None,
     sfx: Path | None = None,
     on_progress: Callable[[float], None] | None = None,
+    threads: int | None = None,
 ) -> BannerTimeline:
-    """Рендерит один вертикальный клип за один проход FFmpeg и возвращает его таймлайн."""
+    """Рендерит один вертикальный клип за один проход FFmpeg и возвращает его таймлайн.
+
+    `threads` — сколько потоков отдать ffmpeg этой задачи: когда нарезок несколько, менеджер делит ядра между ними.
+    """
     wants_banner = opts.banner_count > 0
     if wants_banner and banner is None:
         raise MediaError("Для показа баннера нужен файл баннера — выберите баннер или поставьте 0 показов.")
@@ -563,7 +567,8 @@ def render_clip(
     command = build_ffmpeg_command(
         source, output, clip_start, timeline, opts,
         has_audio=info.has_audio, banner=banner, banner_media=media,
-        sfx=sfx if use_sfx else None, face_cx=face_cx, threads=ffmpeg_threads(),
+        sfx=sfx if use_sfx else None, face_cx=face_cx,
+        threads=threads if threads is not None else ffmpeg_threads(),
     )  # fmt: skip
     output.parent.mkdir(parents=True, exist_ok=True)
     try:

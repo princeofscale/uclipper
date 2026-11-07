@@ -17,7 +17,9 @@ from app.models import ClipSettings, Draft, JobState, JobStatus
 from app.services.autoplan import AutoPlan
 from app.services.banner_manager import BannerInfo
 from app.services.highlights import edge_reserve
+from app.services.history import Record
 from app.services.platforms import EVERYWHERE, PLATFORM_BY_ID, PLATFORMS, SEARCHABLE, TRENDING, Platform
+from app.services import publishing
 from app.services.search import RESULTS
 from app.services.trends import CATEGORIES, PERIOD_TEXT, Category, views_text
 
@@ -90,8 +92,8 @@ def busy_notice(busy: Busy) -> str:
         return (
             "<blockquote>🚧 <b>Бот сейчас занят</b><br/>"
             f"Он нарезает ролик другого человека: {_busy_bar(busy.progress)}<br/>"
-            "Беру по одному ролику, чтобы клипы получались быстро и без сбоев. Загляните через пару минут — "
-            "кнопка «🔄 Проверить» покажет, свободно ли.</blockquote>"
+            "Все места заняты — бот ведёт несколько нарезок сразу, чтобы никто не ждал впустую. "
+            "Загляните через пару минут: кнопка «🔄 Проверить» покажет, свободно ли.</blockquote>"
         )
     return (
         "<blockquote>💾 <b>На сервере мало места</b><br/>"
@@ -111,7 +113,7 @@ def busy_alert(busy: Busy) -> str:
         return f"⏳ Ваша нарезка ещё идёт ({busy.progress:.0f}%). Дождитесь её{stop}."
     if busy.cause is Cause.OTHERS:
         return (
-            f"🚧 Сейчас бот нарезает другой ролик ({busy.progress:.0f}%) — он берёт по одному. "
+            f"🚧 Бот сейчас занят: нарезает другой ролик ({busy.progress:.0f}%), и все места заняты. "
             "Подождите немного и нажмите «🔄 Проверить»."
         )
     return "💾 На сервере сейчас мало места — попробуйте чуть позже."
@@ -354,9 +356,22 @@ def mode_screen(draft: Draft) -> str:
 
 def clip_total(settings: ClipSettings, banner_seconds: float | None) -> float:
     """Длина готового клипа: видео плюс паузы под баннер (если он останавливает клип)."""
-    if settings.banner_count and banner_seconds and settings.banner_mode.value == "freeze":
-        return settings.clip_duration + settings.banner_count * banner_seconds
-    return settings.clip_duration
+    return publishing.total_seconds(settings, banner_seconds)
+
+
+def publish_line(settings: ClipSettings, banner_seconds: float | None) -> str:
+    """Строка «влезает / не влезает» для экранов плана и ручной настройки."""
+    fits = publishing.fits(settings, banner_seconds)
+    return f"{'✅' if fits else '⚠️'} {esc(publishing.verdict(settings, banner_seconds))}"
+
+
+def publish_warning(settings: ClipSettings, banner_seconds: float | None) -> str:
+    """Короткая подсказка для всплывающего окна (без разметки, до 200 знаков)."""
+    total = publishing.total_seconds(settings, banner_seconds)
+    return (
+        f"⚠️ Клип выйдет {total:.0f} с — в Shorts такой блокируют при копирайт-претензии. "
+        f"Лучше до {publishing.LIMIT_SECONDS:.0f} с."
+    )
 
 
 def _total_line(settings: ClipSettings, banner_seconds: float | None) -> str:
@@ -414,6 +429,7 @@ def auto_screen(draft: Draft, plan: AutoPlan, banner: BannerInfo | None) -> str:
 <table bordered>
 <tr><td>🎞 Клипов</td><td><b>{s.num_clips}</b> по <b>{seconds_text(s.clip_duration)}</b></td></tr>
 <tr><td>⏱ Итог на клип</td><td>{_total_line(s, seconds)}</td></tr>
+<tr><td>📏 Публикация</td><td>{publish_line(s, seconds)}</td></tr>
 <tr><td>✨ Моменты</td><td>самые яркие, по звуку</td></tr>
 {skipped}<tr><td>🖼 Кадр</td><td>{esc(_frame_text(s))}</td></tr>
 <tr><td>✂️ Края</td><td>уберу чёрный экран и титры</td></tr>
@@ -452,7 +468,7 @@ def manual_screen(draft: Draft, banner: BannerInfo | None) -> str:
 <tr><td>Края ролика</td><td>{trim_text(s)}</td></tr>
 </table>
 {banner_block}
-<footer>⏱ Каждый клип выйдет {_total_line(s, seconds)} · качество скачивания до {s.max_height}p</footer>"""
+<footer>{publish_line(s, seconds)}<br/>⏱ Каждый клип выйдет {_total_line(s, seconds)} · качество скачивания до {s.max_height}p</footer>"""
 
 
 def choice_screen(field: str, current: object) -> str:
@@ -540,6 +556,21 @@ def elapsed_text(seconds: float) -> str:
     if hours:
         return f"{hours} ч {minutes} мин" if minutes else f"{hours} ч"
     return f"{minutes} мин"
+
+
+def _eta_text(progress: float, elapsed: float) -> str:
+    """Заготовка прогноза «осталось ≈ N» — пока не используется.
+
+    Показывать его в прогрессе нельзя без переделки: сейчас текст правится только когда меняется стадия
+    или процент (иначе Telegram получает правку каждую секунду), а прогноз меняется от каждой секунды
+    и сломал бы это правило. Вернуться к нему стоит вместе с переходом на правки по времени.
+    """
+    if progress < 5 or elapsed < 20:
+        return ""
+    left = elapsed * 100 / progress - elapsed
+    if left < 30:
+        return ""
+    return f" · осталось ≈ {elapsed_text(left)}"
 
 
 def progress_text(state: JobState, ahead: int = 0, *, elapsed: float | None = None, quiet: float = 0.0) -> str:
@@ -723,3 +754,44 @@ def stats_text(clips: int, jobs: int, user_id: int) -> str:
 <tr><td>✅ Задач выполнено</td><td><b>{jobs}</b></td></tr>
 </table>
 <footer>Ваш ID: <code>{user_id}</code></footer>"""
+
+
+def _history_when(ts: str) -> str:
+    """«07.11 21:40» из ISO-времени записи. Нераспознанное время не выдумываем — показываем как есть."""
+    if len(ts) >= 16 and ts[4] == "-" and ts[10] in "T ":
+        return f"{ts[8:10]}.{ts[5:7]} {ts[11:16]}"
+    return ts
+
+
+def _history_rating(record: Record) -> str:
+    return {"up": " 👍", "down": " 👎"}.get(record.rating or "", "")
+
+
+def history_screen(records: Sequence[Record], summary: dict[str, int], user_id: int) -> str:
+    """История нарезок: что резали, когда, как и что из этого понравилось.
+
+    Показывает не «сколько всего», а последние нарезки — по ним видно, что переделывать, а что повторять.
+    """
+    marks = f"👍 {summary.get('up', 0)} · 👎 {summary.get('down', 0)}"
+    head = (
+        "<h2>🕘 История нарезок</h2>"
+        f"<p>Всего: <b>{summary.get('clips', 0)}</b> клипов из <b>{summary.get('jobs', 0)}</b> задач · {marks}</p>"
+    )
+    if not records:
+        return (
+            f"{head}<p>Пока пусто. Пришлите ролик — и первая нарезка появится здесь.</p>"
+            f"<footer>Ваш ID: <code>{user_id}</code></footer>"
+        )
+    items = []
+    for record in records:
+        length = seconds_text(round(record.clip_len, 1))
+        mode = "авто" if record.mode == "auto" else "вручную"
+        items.append(
+            f"<li><b>{esc(shorten(record.title or 'Без названия', 60))}</b>{_history_rating(record)}<br/>"
+            f"<i>{_history_when(record.ts)} · {mode} · клип {record.index} из {record.of} · {length}</i></li>"
+        )
+    return (
+        f"{head}<ol>{''.join(items)}</ol>"
+        "<blockquote>Оцените клип кнопками ниже: 👍 или 👎. По оценкам видно, какие моменты бот выбирает зря.</blockquote>"
+        f"<footer>Ваш ID: <code>{user_id}</code></footer>"
+    )

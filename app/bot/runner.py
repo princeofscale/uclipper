@@ -18,6 +18,7 @@ from app.bot import keyboards, texts
 from app.bot.delivery import cleanup_job, deliver_results, send_clip
 from app.bot.render import edit_html, send_html
 from app.models import JobRequest, JobState, JobStatus
+from app.services.history import History, Record
 from app.services.jobs import JobManager
 from app.services.user_store import UserStore
 
@@ -46,10 +47,11 @@ class RunningJob:
 class JobRunner:
     """Запускает задачи и общается с пользователем: прогресс, отдельные ролики, итог, отмена."""
 
-    def __init__(self, bot: Bot, manager: JobManager, store: UserStore) -> None:
+    def __init__(self, bot: Bot, manager: JobManager, store: UserStore, history: History | None = None) -> None:
         self._bot = bot
         self._manager = manager
         self._store = store
+        self._history = history
         self._lock = asyncio.Lock()
         self._events: dict[str, asyncio.Event] = {}
         self._loop = asyncio.get_running_loop()
@@ -209,6 +211,40 @@ class JobRunner:
         except Exception:  # noqa: BLE001
             await send_html(self._bot, running.chat_id, html, markup)
 
+    def _remember_history(self, running: RunningJob, request: JobRequest, state: JobState) -> None:
+        """Дописывает готовые клипы в историю нарезок (`workspace/history.jsonl`).
+
+        Файл нужен не «для отчётности»: из него берутся экран «🕘 История», оценки 👍/👎 и будущая кнопка
+        «нарезать иначе». Размер файла берём до уборки папки задачи — после неё файлов уже нет.
+        """
+        if self._history is None:
+            return
+        now = time.strftime("%Y-%m-%dT%H:%M")
+        total = max(state.total_clips, len(state.clips))
+        for clip in state.clips:
+            path = self._manager.clip_path(state.id, clip)
+            size_mb = round(path.stat().st_size / 1024 / 1024, 1) if path is not None else 0.0
+            self._history.append(
+                Record(
+                    ts=now,
+                    user_id=running.user_id,
+                    job_id=state.id,
+                    index=clip.index,
+                    of=total,
+                    platform=request.platform,
+                    source=request.source_key,
+                    title=request.title,
+                    mode=request.mode or "manual",
+                    start=clip.source_start,
+                    end=clip.source_end,
+                    clip_len=clip.duration,
+                    banner=request.banner_id,
+                    banner_count=request.banner_count,
+                    render_s=clip.render_seconds,
+                    size_mb=size_mb,
+                )
+            )
+
     async def _finish(self, running: RunningJob, request: JobRequest) -> None:
         """Финальный экран, досылка оставшихся клипов и архив, уборка за собой."""
         job_id = running.job_id
@@ -246,6 +282,7 @@ class JobRunner:
             self._store.count_job(running.user_id, len(state.clips))
             self._store.remember_settings(running.user_id, request)
             self._store.save()
+            await asyncio.to_thread(self._remember_history, running, request, state)
         finally:
             # Задачу убираем из живых при любом исходе: иначе отменённые и упавшие копятся в памяти.
             cleanup_job(self._manager, job_id)

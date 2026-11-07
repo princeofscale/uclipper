@@ -12,11 +12,11 @@ from app.services import capacity
 from app.services.capacity import (
     DEFAULT_CACHE_LIMIT_GB,
     DEFAULT_DOWNLOAD_THREADS,
-    DEFAULT_MAX_JOBS,
     DEFAULT_MIN_FREE_GB,
     MAX_DOWNLOAD_THREADS,
     cache_limit_bytes_from_env,
     cpu_limit,
+    default_max_jobs,
     disk_is_low,
     download_threads_from_env,
     ffmpeg_threads,
@@ -55,14 +55,16 @@ def free(monkeypatch, gigabytes: float | None) -> None:
 
 
 def test_limits_have_sane_defaults():
-    assert max_jobs_from_env() == DEFAULT_MAX_JOBS == 1  # бот нарезает один ролик за раз
+    # Нарезок одновременно — по одной на разрешённое ядро, но не больше трёх: каждая получает свой поток ffmpeg.
+    assert max_jobs_from_env() == default_max_jobs()
+    assert 1 <= default_max_jobs() <= capacity.PARALLEL_CAP
     assert min_free_bytes_from_env() == int(DEFAULT_MIN_FREE_GB * GB)
     assert cache_limit_bytes_from_env() == int(DEFAULT_CACHE_LIMIT_GB * GB)
 
 
 @pytest.mark.parametrize(
     ("raw", "expected"),
-    [("3", 3), (" 10 ", 10), ("0", 0), ("-4", 0), ("много", DEFAULT_MAX_JOBS), ("", DEFAULT_MAX_JOBS), ("2,9", 2)],
+    [("3", 3), (" 10 ", 10), ("0", 0), ("-4", 0), ("много", default_max_jobs()), ("", default_max_jobs()), ("2,9", 2)],
 )
 def test_max_jobs_reads_the_environment(monkeypatch, raw, expected):
     monkeypatch.setenv("MAX_JOBS", raw)
@@ -110,10 +112,12 @@ def test_free_bytes_measures_a_real_folder_and_survives_a_missing_one(tmp_path):
 # ---------- можно ли принять ещё одну задачу ----------
 
 
-def test_one_job_at_a_time_by_default():
-    assert not jobs_limit_reached(0)
-    assert jobs_limit_reached(1)  # одна уже идёт — вторую не берём
-    assert jobs_limit_reached(5)
+def test_several_jobs_run_at_once_by_default():
+    slots = default_max_jobs()
+    assert slots >= 1
+    assert not jobs_limit_reached(slots - 1)  # есть свободное место — берём
+    assert jobs_limit_reached(slots)  # места кончились
+    assert jobs_limit_reached(slots + 3)
 
 
 def test_the_jobs_limit_follows_the_environment(monkeypatch):
@@ -144,12 +148,13 @@ def test_when_the_disk_cannot_be_measured_work_goes_on(monkeypatch, tmp_path):
 # ---------- учёт задач ----------
 
 
-def test_ahead_of_counts_the_running_job_and_those_who_came_earlier(manager):
+def test_ahead_of_counts_only_the_waiting_jobs(manager):
+    """Идущие задачи места уже заняли, но «впереди» для ждущего только те, кто раньше в очереди."""
     ids = [manager._create() for _ in range(4)]  # noqa: SLF001
     manager._update(ids[0], status=JobStatus.DONE)  # noqa: SLF001
     manager._update(ids[1], status=JobStatus.RUNNING)  # noqa: SLF001
 
-    assert [manager.ahead_of(job_id) for job_id in ids] == [0, 0, 1, 2]
+    assert [manager.ahead_of(job_id) for job_id in ids] == [0, 0, 0, 1]
     assert manager.ahead_of("нет такой") == 0
 
 

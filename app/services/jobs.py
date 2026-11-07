@@ -17,7 +17,9 @@ from typing import Callable
 from app.config import Settings
 from app.models import ClipResult, JobRequest, JobState, JobStatus, SlicingMode, SourceType, TrimInfo
 from app.services.auto_trim import analyze_trim
+from app.services.audio import normalize_file as normalize_loudness
 from app.services.banner_manager import BannerError, ensure_sfx, resolve_banner
+from app.services.capacity import ffmpeg_threads, max_jobs_from_env, normalize_audio_from_env
 from app.services.downloader import DownloadError, cached_source_path, download_video_cached, resolve_upload
 from app.services.highlights import edge_reserve, find_highlights
 from app.services.platforms import identify
@@ -48,16 +50,22 @@ class JobCancelled(Exception):
 
 
 class JobManager:
-    """Принимает задачи и выполняет их по одной (FFmpeg и так занимает все ядра)."""
+    """Принимает задачи и выполняет их параллельно — столько сразу, сколько разрешено в `MAX_JOBS`.
 
-    def __init__(self, settings: Settings, *, max_workers: int = 1) -> None:
+    Потоков ffmpeg каждой задаче достаётся `ядра / число идущих нарезок`, поэтому две нарезки на двух ядрах
+    не отнимают друг у друга процессор, а просто делят его.
+    """
+
+    def __init__(self, settings: Settings, *, max_workers: int | None = None) -> None:
         self._settings = settings
+        self._max_workers = max(1, max_workers if max_workers is not None else max_jobs_from_env())
         self._lock = threading.RLock()
         self._jobs: dict[str, JobState] = {}
         self._archives: dict[str, Path] = {}
         self._cancelled: set[str] = set()
+        self._normalize_audio = normalize_audio_from_env()
         self._stopping = threading.Event()
-        self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="clipper-job")
+        self._executor = ThreadPoolExecutor(max_workers=self._max_workers, thread_name_prefix="clipper-job")
 
     # ---------- публичный интерфейс ----------
 
@@ -111,15 +119,24 @@ class JobManager:
         return True
 
     def ahead_of(self, job_id: str) -> int:
-        """Сколько задач впереди этой: идущая сейчас и ждущие раньше неё. 0 — её очередь (или такой задачи нет)."""
+        """Сколько задач в очереди впереди этой: только ждущие, без идущих (они уже занимают свои места). 0 — её очередь."""
         with self._lock:
             ahead = 0
             for other_id, state in self._jobs.items():  # словарь хранит задачи в порядке создания
                 if other_id == job_id:
                     return ahead
-                if state.status in (JobStatus.QUEUED, JobStatus.RUNNING):
+                if state.status is JobStatus.QUEUED:
                     ahead += 1
             return 0
+
+    def running_count(self) -> int:
+        """Сколько нарезок идёт прямо сейчас: по нему делится процессор между задачами."""
+        with self._lock:
+            return sum(1 for state in self._jobs.values() if state.status is JobStatus.RUNNING)
+
+    def max_parallel(self) -> int:
+        """Сколько нарезок бот ведёт одновременно."""
+        return self._max_workers
 
     def clip_path(self, job_id: str, clip: ClipResult) -> Path | None:
         """Файл готового клипа на диске."""
@@ -422,10 +439,16 @@ class JobManager:
                 self._progress(job_id, render_start + (RENDER_END - render_start) * (position + fraction) / total)
                 notifier.touch()
 
+            started = time.monotonic()
             timeline = render_clip(
                 source, job_dir / filename, start, clip_duration, options,
                 info=info, banner=banner, sfx=sfx, on_progress=on_progress,
+                threads=ffmpeg_threads(self.running_count()),
             )  # fmt: skip
+            if self._normalize_audio:  # замерено: баннер громче контента на 2–8 дБ, а клип тише нормы платформ
+                self._check_not_stopping(job_id)
+                if normalize_loudness(job_dir / filename):
+                    self._log(job_id, f"Клип {number}: звук выровнен до −14 LUFS")
             clip = ClipResult(
                 index=number,
                 filename=filename,
@@ -434,6 +457,7 @@ class JobManager:
                 duration=round(timeline.total_duration, 3),
                 banner_points=[round(point, 3) for point in timeline.freeze_points],
                 banner_windows=[(round(begin, 3), round(end, 3)) for begin, end in timeline.windows],
+                render_seconds=round(time.monotonic() - started, 1),
             )
             clips.append(clip)
             with self._lock:  # клип виден сразу, не дожидаясь остальных

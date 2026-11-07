@@ -26,6 +26,7 @@ from app.bot.steppers import Stepper
 from app.models import ClipSettings, Draft, Goal
 from app.services.autoplan import GOALS
 from app.services.banner_manager import BannerInfo
+from app.services.history import Record
 from app.services.platforms import EVERYWHERE, PLATFORM_BY_ID, SEARCHABLE, TRENDING, Platform
 from app.services.trends import CATEGORIES
 
@@ -88,7 +89,7 @@ def main_menu(busy: Busy | None = None) -> InlineKeyboardMarkup:
     source("📁", "Загрузить файл", "ask:file")
     source("🔥", "В тренде", "screen:trends")
     _add(builder, "🎬 Баннеры", "screen:banners")
-    _add(builder, "📊 Статистика", "screen:stats")
+    _add(builder, "🕘 История", "screen:stats")
     _add(builder, "❓ Справка", "screen:help")
     builder.adjust(*rows, 1, 2, 2, 2)
     return builder.as_markup()
@@ -333,6 +334,21 @@ def trends_retry(choice: str, category_id: str) -> InlineKeyboardMarkup:
     _add(builder, "🔄 Повторить", f"trend:{choice}:{category_id}", PRIMARY)
     _add(builder, "⬅️ К жанрам", f"trends:{choice}")
     builder.adjust(1, 1)
+    return builder.as_markup()
+
+
+def history_screen(records: Sequence[Record]) -> InlineKeyboardMarkup:
+    """Оценка последних нарезок: по строке 👍/👎 на запись (callback_data укладывается в 64 байта)."""
+    builder = InlineKeyboardBuilder()
+    rows: list[int] = []
+    for record in records:
+        mark = "✅" if record.rating == "up" else ("❌" if record.rating == "down" else "🎞")
+        _add(builder, f"{mark} 👍", f"rate:up:{record.id}")
+        _add(builder, "👎", f"rate:down:{record.id}")
+        rows.append(2)
+    _add(builder, "🏠 В начало", MENU)
+    rows.append(1)
+    builder.adjust(*rows)
     return builder.as_markup()
 
 

@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from aiogram import F, Router
@@ -57,9 +58,30 @@ async def cb_help(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "screen:stats")
 async def cb_stats(callback: CallbackQuery, ctx: AppContext) -> None:
+    """«🕘 История»: последние нарезки и оценки к ним (callback остался прежним — на старых экранах он тот же)."""
     await safe_answer(callback)
-    clips, jobs = ctx.store.stats(callback.from_user.id)
-    await edit_or_send(callback, texts.stats_text(clips, jobs, callback.from_user.id), keyboards.back_to_menu())
+    await show_history(callback, ctx, callback.from_user.id)
+
+
+async def show_history(event: CallbackQuery | Message, ctx: AppContext, user_id: int) -> None:
+    """Экран истории: сводка, последние нарезки и кнопки оценки."""
+    history = ctx.history
+    records = await asyncio.to_thread(history.recent, 8, user_id=user_id)
+    html = texts.history_screen(records, history.summary(user_id), user_id)
+    await edit_or_send(event, html, keyboards.history_screen(records))
+
+
+@router.callback_query(F.data.startswith("rate:"))
+async def cb_rate(callback: CallbackQuery, ctx: AppContext) -> None:
+    """Оценка клипа: 👍 или 👎. Хранится в истории, по ней потом видно, какие моменты выбираются зря."""
+    parts = (callback.data or "").split(":", 2)
+    if len(parts) != 3 or parts[1] not in ("up", "down"):
+        await safe_answer(callback, "Кнопка устарела — откройте историю заново", alert=True)
+        return
+    rating, record_id = parts[1], parts[2]
+    saved = await asyncio.to_thread(ctx.history.rate, record_id, rating)
+    await safe_answer(callback, "Спасибо, запомнил 👍" if saved else "Эта нарезка уже не в истории")
+    await show_history(callback, ctx, callback.from_user.id)
 
 
 async def _ask(callback: CallbackQuery, state: FSMContext, ctx: AppContext, flow, html: str, markup=None) -> bool:
