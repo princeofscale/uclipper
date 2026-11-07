@@ -2494,3 +2494,24 @@ async def test_subtitles_toggle_lives_in_the_extra_settings(harness, monkeypatch
 
     settings = (await _fsm(harness).get_data())["draft"]["settings"]
     assert settings["subtitles"] is True and "Субтитры включены" in harness.session.last_alert()
+
+
+async def test_after_a_draft_the_final_button_rerenders_without_preview(harness, monkeypatch, tmp_path):
+    """Черновик показывают, чтобы проверить моменты; дальше одним нажатием — полное качество."""
+    source = make_video(tmp_path / "src.mp4", size="640x360", seconds=8)
+    harness.session.stream_bytes = source.read_bytes()
+    await harness.send("/start")
+    await harness.send_file(file_name="myvideo.mp4", file_size=Path(source).stat().st_size)
+    await harness.press("mode:manual")
+    await harness.press("screen:more")
+    await harness.press("toggle:preview:more")  # включаем черновик
+    await harness.press("screen:manual")
+
+    await harness.press("job:start")
+    await _wait_finished(harness)
+    assert "job:final" in harness.session.buttons(), "после черновика должна быть кнопка полного рендера"
+
+    await harness.press("job:final")
+    settings = (await _fsm(harness).get_data())["draft"]["settings"]
+    assert settings["preview"] is False
+    await _wait_finished(harness)

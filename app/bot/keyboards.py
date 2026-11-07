@@ -402,21 +402,24 @@ def running(job_id: str, *, soft: bool = False) -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
-def done(description: str | None = None) -> InlineKeyboardMarkup:
+def done(description: str | None = None, *, final_render: bool = False) -> InlineKeyboardMarkup:
     """Итог нарезки. `description` — готовый текст для кнопки «скопировать»: подпись к публикации.
 
     Кнопка копирования (`CopyTextButton`) есть в Bot API 10.3, а у нас aiogram 3.31 под этот API — то есть
     ничего обновлять не надо. Без текста кнопки нет: пустая подпись только путает.
     """
     builder = InlineKeyboardBuilder()
-    _add(builder, "🎬 Ещё ролик", "ask:link", PRIMARY)
+    if final_render:  # был черновик: главное действие — перерендерить те же моменты в полном качестве
+        _add(builder, "🎯 Перерендерить в 1080p", "job:final", SUCCESS)
+    _add(builder, "🎬 Ещё ролик", "ask:link", PRIMARY if not final_render else None)
     if description:
         builder.button(text="📋 Скопировать описание", copy_text=CopyTextButton(text=description[:256]))
     _add(builder, "🔁 Нарезать иначе", "screen:mode")
     _add(builder, "🔥 В тренде", "screen:trends")
     _add(builder, "🏠 В начало", MENU)
-    if description:
-        builder.adjust(1, 1, 2, 1)
-    else:
-        builder.adjust(1, 2, 1)
+    rows = [1] if final_render else []
+    rows += [1]  # «Ещё ролик»
+    rows += [1] if description else []
+    rows += [2, 1]
+    builder.adjust(*rows)
     return builder.as_markup()

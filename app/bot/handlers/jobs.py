@@ -12,10 +12,12 @@ from app.bot.context import (
     AppContext,
     menu_view,
     need_draft,
+    put_draft,
     replace,
     safe_answer,
     send_html,
     show,
+    update_settings,
 )
 from app.bot.states import Flow
 from app.services import publishing
@@ -91,6 +93,20 @@ async def cb_soft_stop(callback: CallbackQuery, ctx: AppContext) -> None:
     await safe_answer(
         callback, "Доделаю текущий клип и пришлю готовые" if ok else "Задача уже закончилась", alert=not ok
     )
+
+
+@router.callback_query(F.data == "job:final")
+async def cb_final(callback: CallbackQuery, state: FSMContext, ctx: AppContext) -> None:
+    """«🎯 Перерендерить в 1080p»: те же настройки и тот же ролик, только черновик выключен.
+
+    Ролик уже в кеше, поэтому это сразу рендер без скачивания.
+    """
+    draft = await need_draft(callback, state)
+    if draft is None:
+        return
+    draft.settings = update_settings(draft.settings, preview=False)
+    await put_draft(state, draft)
+    await start_cut(callback, state, ctx, draft)
 
 
 @router.callback_query(F.data.startswith("job:cancel:"))
