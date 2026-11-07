@@ -320,3 +320,12 @@ def test_ffmpeg_threads_can_be_set_by_hand(monkeypatch, raw, expected):
     monkeypatch.setattr(capacity, "cpu_limit", lambda *args, **kwargs: 1)  # ручная настройка важнее лимита
 
     assert ffmpeg_threads() == expected
+
+
+def test_продолжительность_в_логе_читается_как_время():
+    from app.services.jobs import _duration
+
+    assert _duration(0.4) == "0 с"
+    assert _duration(7.6) == "8 с"
+    assert _duration(200) == "3 мин 20 с"
+    assert _duration(3600) == "60 мин"

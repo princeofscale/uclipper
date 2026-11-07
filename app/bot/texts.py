@@ -653,6 +653,8 @@ def results_summary(state: JobState) -> str:
         f"<tr><td>🎞 Клипов</td><td><b>{len(state.clips)}</b></td></tr>",
         f"<tr><td>⏱ Общая длительность</td><td>{duration_text(total)}</td></tr>",
     ]
+    if state.timing:  # откуда взялось время: иначе «долго» — это только ощущение
+        rows.append(f"<tr><td>⚙️ Заняло</td><td>{esc(state.timing)}</td></tr>")
     if state.trim is not None and (state.trim.head or state.trim.tail):
         rows.append(f"<tr><td>✂️ Источник</td><td>{esc(_source_range(state))}</td></tr>")
     note = (

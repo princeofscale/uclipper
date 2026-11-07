@@ -45,6 +45,15 @@ NOTIFY_SECONDS = 1.0  # как часто дёргать колбэк прогр
 Notify = Callable[[JobState], None]
 
 
+def _duration(seconds: float) -> str:
+    """«7 с», «3 мин 20 с» — для строк лога задачи: секунды без десятых на длинных этапах не читаются."""
+    seconds = max(0.0, seconds)
+    if seconds < 60:
+        return f"{seconds:.0f} с"
+    minutes, rest = divmod(int(seconds), 60)
+    return f"{minutes} мин {rest} с" if rest else f"{minutes} мин"
+
+
 class JobCancelled(Exception):
     """Задачу отменил пользователь или бот выключается."""
 
@@ -265,7 +274,15 @@ class JobManager:
         banner = resolve_banner(request.banner_id or "", settings.banners_dir) if wants_banner else None
         sfx = ensure_sfx(settings.sfx_dir) if wants_banner and request.enable_sfx else None
 
+        started = time.monotonic()
         source, downloaded = self._obtain_source(request, job_id, notifier)
+        fetch_seconds = time.monotonic() - started
+        size_mb = source.stat().st_size / 1024 / 1024 if source.is_file() else 0.0
+        self._log(
+            job_id,
+            f"{'Скачивание' if downloaded else 'Источник'}: {size_mb:.1f} МБ за {_duration(fetch_seconds)}"
+            + ("" if downloaded else " (файл уже был на диске)"),
+        )
         render_start = DOWNLOAD_END if downloaded else LOCAL_SOURCE_START
         self._progress(job_id, render_start)
         notifier.touch()
@@ -301,6 +318,11 @@ class JobManager:
             banner, sfx, render_start, notifier, on_clip,
         )  # fmt: skip
 
+        render_seconds = time.monotonic() - started - fetch_seconds
+        self._log(
+            job_id,
+            f"Итого по задаче: источник {_duration(fetch_seconds)} + анализ и рендер {_duration(render_seconds)}",
+        )
         self._update(job_id, stage="Упаковка архива")
         self._progress(job_id, RENDER_END)
         notifier.touch()
@@ -310,7 +332,14 @@ class JobManager:
                 bundle.write(job_dir / clip.filename, arcname=clip.filename)
         with self._lock:
             self._archives[job_id] = archive
-        self._update(job_id, status=JobStatus.DONE, stage="Готово", progress=100.0, archive_name=archive.name)
+        self._update(
+            job_id,
+            status=JobStatus.DONE,
+            stage="Готово",
+            progress=100.0,
+            archive_name=archive.name,
+            timing=f"источник {_duration(fetch_seconds)} · анализ и рендер {_duration(render_seconds)}",
+        )
         self._log(job_id, f"Готово: роликов — {len(clips)}, архив {archive.name}")
         notifier.touch()
 
@@ -463,7 +492,12 @@ class JobManager:
             clips.append(clip)
             with self._lock:  # клип виден сразу, не дожидаясь остальных
                 self._jobs[job_id].clips.append(clip)
-            self._log(job_id, f"Клип {number} готов: {clip.duration:.1f} с")
+            speed = clip.duration / clip.render_seconds if clip.render_seconds else 0.0
+            self._log(
+                job_id,
+                f"Клип {number} готов: {clip.duration:.1f} с за {_duration(clip.render_seconds)}"
+                f" ({speed:.2f}× реального времени)",
+            )
             notifier.touch()
             if on_clip is not None:
                 on_clip(self.get(job_id))
