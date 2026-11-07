@@ -11,6 +11,7 @@ import subprocess
 import threading
 from collections import deque
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Callable, Literal
 
@@ -251,6 +252,7 @@ class RenderOptions:
     banner_sound: bool = True  # слышен ли звук видео-баннера
     enable_sfx: bool = False
     preview: bool = False  # черновик: кадр уменьшается до 540×960 и рендер идёт на ultrafast
+    subtitles: Path | None = None  # готовый .ass для этого клипа; вшивается до пауз и баннера
 
 
 # У анаморфных роликов и записей старого ТВ пиксель не квадратный (SAR ≠ 1:1): на экране кадр шире (или уже), чем
@@ -304,7 +306,7 @@ def _audio_prep_chain(has_audio: bool, read_seconds: float) -> str:
     return f"anullsrc=r={SAMPLE_RATE}:cl=stereo:d={read_seconds:.3f},{layout}[a_prep]"
 
 
-def _freeze_segments(timeline: BannerTimeline) -> list[str]:
+def _freeze_segments(timeline: BannerTimeline, source: str = "v_base") -> list[str]:
     """Режет клип на K+1 сегментов; первые K заканчиваются стоп-кадром и тишиной → `[v_cat]`, `[a_cat]`.
 
     Видео режется по номерам кадров (точки разреза уже на сетке 1/FPS), `tpad` клонирует последний кадр
@@ -315,7 +317,7 @@ def _freeze_segments(timeline: BannerTimeline) -> list[str]:
     pause_frames = round(timeline.banner_duration * FPS)
     pause_seconds = f"{timeline.banner_duration:.6f}"
     chains = [
-        f"[v_base]split={segments}" + "".join(f"[vs{i}]" for i in range(segments)),
+        f"[{source}]split={segments}" + "".join(f"[vs{i}]" for i in range(segments)),
         f"[a_prep]asplit={segments}" + "".join(f"[as{i}]" for i in range(segments)),
     ]
     for i in range(segments):
@@ -411,6 +413,27 @@ def _audio_mix(timeline: BannerTimeline, audio: str, *, sfx_idx: int | None, ban
     return chains
 
 
+def _ass_path(path: Path) -> str:
+    """Путь для `filter_complex`: двоеточие и обратный слэш ломают разбор, их экранируем.
+
+    В бою файл всегда лежит в папке задачи, и сюда попадает простое имя — но полагаться на это нельзя.
+    """
+    return str(path).replace("\\", "/").replace(":", "\\:").replace("'", "'\\''")
+
+
+@lru_cache(maxsize=1)
+def has_libass() -> bool:
+    """Есть ли в этой сборке FFmpeg фильтр `ass` (libass). В контейнере бота есть, в локальной сборке — нет.
+
+    Проверяется один раз за процесс: если фильтра нет, субтитры не вшиваются вообще, иначе рендер падал бы.
+    """
+    try:
+        done = subprocess.run(["ffmpeg", "-hide_banner", "-filters"], capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return " ass " in (done.stdout or "")
+
+
 def _preview_scaled(graph: str) -> str:
     """Добавляет в конец графа уменьшение до `PREVIEW_SIZE`. Вся геометрия (баннер, паузы, затемнение)
     считается как для боевого клипа — уменьшается только итоговый кадр, поэтому черновик показывает
@@ -438,12 +461,15 @@ def build_filter_graph(
     media = banner or BannerMedia()
     chains = [_base_video_chain(opts.frame_mode, face_cx), _audio_prep_chain(has_audio, _read_seconds(timeline))]
     video, audio = "v_base", "a_prep"
+    if opts.subtitles is not None:  # субтитры вшиваются до пауз: на паузе кадр замирает вместе с текстом
+        chains.append(f"[v_base]ass={_ass_path(opts.subtitles)}[v_subs]")
+        video = "v_subs"
     shown = bool(timeline.windows)
     if shown:
         if banner_idx is None:
             raise ValueError("banner_idx обязателен, когда есть окна показа баннера")
         if timeline.banner_mode is BannerMode.FREEZE:  # в overlay видео и звук идут без остановок и без затемнения
-            chains += _freeze_segments(timeline)
+            chains += _freeze_segments(timeline, video)
             chains += _dim_chain(timeline, "v_cat")
             video, audio = "v_dim", "a_cat"
     if not shown:

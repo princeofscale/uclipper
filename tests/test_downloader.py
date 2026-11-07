@@ -449,3 +449,101 @@ def test_resolve_upload_refuses_anything_that_is_not_a_known_upload(tmp_path, up
     (tmp_path / ("0" * 31 + "1.mp4")).write_bytes(b"other upload")
     with pytest.raises(DownloadError):
         resolve_upload(upload_id, tmp_path)
+
+
+# ---------- субтитры площадки ----------
+
+YT = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+
+
+class _FakeYdl:
+    """Подмена YoutubeDL: отдаёт заранее заданные сведения о ролике, ничего не скачивая."""
+
+    info: dict = {}
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def extract_info(self, url, download=False):
+        assert download is False, "субтитры не должны тянуть само видео"
+        return dict(self.info)
+
+
+def _fake_response(payload: dict):
+    import json as _json
+
+    class Answer:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self, limit):
+            return _json.dumps(payload).encode()
+
+    return Answer()
+
+
+def test_subtitles_are_taken_from_the_platform_when_json3_exists(monkeypatch):
+    from app.services import downloader
+
+    _FakeYdl.info = {"automatic_captions": {"ru": [{"ext": "json3", "url": "https://subs.example/ru.json3"}]}}
+    monkeypatch.setattr(downloader.yt_dlp, "YoutubeDL", _FakeYdl)
+    monkeypatch.setattr(
+        downloader.urllib.request, "urlopen", lambda *args, **kwargs: _fake_response({"events": [{"tStartMs": 0}]})
+    )
+
+    assert downloader.fetch_subtitles(YT) == {"events": [{"tStartMs": 0}]}
+
+
+def test_own_subtitles_win_over_automatic_ones(monkeypatch):
+    from app.services import downloader
+
+    _FakeYdl.info = {
+        "subtitles": {"ru": [{"ext": "vtt", "url": "https://subs.example/ru.vtt"}]},
+        "automatic_captions": {"ru": [{"ext": "json3", "url": "https://subs.example/auto.json3"}]},
+    }
+    asked: list[str] = []
+
+    def fake_urlopen(request, timeout=0):
+        asked.append(request.full_url)
+        return _fake_response({"events": []})
+
+    monkeypatch.setattr(downloader.yt_dlp, "YoutubeDL", _FakeYdl)
+    monkeypatch.setattr(downloader.urllib.request, "urlopen", fake_urlopen)
+
+    downloader.fetch_subtitles(YT)
+
+    # своих субтитров в json3 нет — берём автоматические, но не vtt: времени по словам там нет
+    assert asked == ["https://subs.example/auto.json3"]
+
+
+def test_without_subtitles_the_answer_is_none(monkeypatch):
+    from app.services import downloader
+
+    _FakeYdl.info = {"subtitles": {}, "automatic_captions": {}}
+    monkeypatch.setattr(downloader.yt_dlp, "YoutubeDL", _FakeYdl)
+    monkeypatch.setattr(
+        downloader.urllib.request, "urlopen", lambda *a, **k: pytest.fail("нечего скачивать")
+    )
+
+    assert downloader.fetch_subtitles(YT) is None
+
+
+def test_platform_failure_does_not_break_the_job(monkeypatch):
+    from app.services import downloader
+
+    class Broken(_FakeYdl):
+        def extract_info(self, url, download=False):
+            raise downloader.yt_dlp.utils.YoutubeDLError("площадка молчит")
+
+    monkeypatch.setattr(downloader.yt_dlp, "YoutubeDL", Broken)
+
+    assert downloader.fetch_subtitles(YT) is None  # клип просто выйдет без субтитров

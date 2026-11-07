@@ -2482,3 +2482,15 @@ async def test_preview_toggle_lives_in_the_extra_settings(harness, monkeypatch):
 
     settings = (await _fsm(harness).get_data())["draft"]["settings"]
     assert settings["preview"] is True and "Черновик" in harness.session.last_alert()
+
+
+async def test_subtitles_toggle_lives_in_the_extra_settings(harness, monkeypatch):
+    await _open_manual(harness, monkeypatch)
+
+    await harness.press("screen:more")
+    assert "Субтитры" in harness.session.last_text()
+
+    await harness.press("toggle:subtitles:more")
+
+    settings = (await _fsm(harness).get_data())["draft"]["settings"]
+    assert settings["subtitles"] is True and "Субтитры включены" in harness.session.last_alert()

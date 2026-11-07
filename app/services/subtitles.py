@@ -170,6 +170,22 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     return header + events
 
 
+def lines_in_window(payload: dict, start: float, end: float) -> list[Line]:
+    """Строки субтитров для окна клипа, со временем **от начала клипа**.
+
+    Слова за пределами окна отбрасываются, время сдвигается на `start`: в графе FFmpeg ролик читается
+    с `-ss start`, поэтому ноль клипа — это `start` источника.
+    """
+    words = [word for word in words_from_json3(payload, limit=end) if word.start >= start and word.end <= end]
+    shifted = [Word(word.text, round(word.start - start, 3), round(word.end - start, 3)) for word in words]
+    return lines_from_words(shifted, limit=end - start)
+
+
+def subtitles_for_window(payload: dict, start: float, end: float, *, font: str = "DejaVu Sans") -> str:
+    """Готовый `.ass` для окна клипа."""
+    return to_ass(lines_in_window(payload, start, end), font=font)
+
+
 def subtitles_for(payload: dict, *, limit: float | None = None, font: str = "DejaVu Sans") -> str:
     """Сразу готовый `.ass` из ответа площадки. Пустой список строк — пустой файл с одним заголовком."""
     return to_ass(lines_from_words(words_from_json3(payload, limit=limit), limit=limit), font=font)

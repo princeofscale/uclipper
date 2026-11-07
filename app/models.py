@@ -79,6 +79,7 @@ class ClipSettings(BaseModel):
 
     max_height: int = Field(1080, ge=144, le=2160)  # потолок качества при скачивании
     preview: bool = False  # черновик: рендер 540p на ultrafast — вчетверо быстрее, чтобы проверить моменты
+    subtitles: bool = False  # вшивать субтитры площадки (если они у ролика есть)
 
 
 class VideoInfo(BaseModel):

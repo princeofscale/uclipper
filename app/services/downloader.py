@@ -1,9 +1,12 @@
 """Загрузка видео: ссылки на площадки через yt-dlp (кеш по ключу ролика) и импорт локальных файлов."""
 from __future__ import annotations
 
+import json
+import logging
 import re
 import shutil
 import subprocess
+import urllib.request
 import uuid
 from pathlib import Path
 from typing import BinaryIO, Callable
@@ -15,6 +18,8 @@ from app.services import rutube
 from app.services.capacity import download_threads_from_env
 from app.services.platforms import RUTUBE, YOUTUBE, Platform, Source, identify, titles
 from app.services.youtube import js_runtimes
+
+log = logging.getLogger(__name__)
 
 _UPLOAD_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 _TEMP_SUFFIXES = frozenset({".part", ".ytdl", ".temp", ".tmp"})
@@ -142,6 +147,54 @@ def fetch_video_info(url: str) -> dict:
         "thumbnail": thumbnail,
         "uploader": info.get("uploader") or info.get("channel") or "",
     }
+
+
+SUBTITLE_LANGS = ("ru", "en")  # русский первым: клипы русскоязычные
+SUBTITLE_FORMAT = "json3"  # единственный формат с временем по словам
+
+
+def _subtitle_url(info: dict) -> str | None:
+    """Ссылка на годные субтитры: сначала свои, потом автоматические, языки — по порядку важности.
+
+    `json3` есть только у YouTube; у площадок без него ссылки не будет, и это нормально —
+    субтитров просто не будет.
+    """
+    for group in ("subtitles", "automatic_captions"):
+        tracks = info.get(group) or {}
+        for lang in SUBTITLE_LANGS:
+            for track in tracks.get(lang) or []:
+                if isinstance(track, dict) and track.get("ext") == SUBTITLE_FORMAT and track.get("url"):
+                    return str(track["url"])
+    return None
+
+
+def fetch_subtitles(url: str) -> dict | None:
+    """Субтитры ролика в формате `json3` — без скачивания видео и без распознавания.
+
+    `None` — субтитров нет, площадка их не отдала или файл не разобрался. Это не ошибка:
+    клип просто выйдет без текста.
+    """
+    source = require_source(url)
+    options = _base_options(source.platform) | {"quiet": True, "no_warnings": True, "skip_download": True}
+    try:
+        with yt_dlp.YoutubeDL(options) as ydl:
+            info = ydl.extract_info(source.url, download=False)
+    except yt_dlp.utils.YoutubeDLError:
+        log.warning("Не удалось узнать субтитры ролика %s", url, exc_info=True)
+        return None
+    if not isinstance(info, dict):
+        return None
+    track_url = _subtitle_url(info)
+    if track_url is None:
+        return None
+    request = urllib.request.Request(track_url, headers={"User-Agent": "Mozilla/5.0"})
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:  # noqa: S310 — адрес дал yt-dlp
+            payload = json.loads(response.read(8_000_000))
+    except (OSError, ValueError):
+        log.warning("Не удалось скачать субтитры ролика %s", url, exc_info=True)
+        return None
+    return payload if isinstance(payload, dict) else None
 
 
 def cached_source_path(key: str, cache_dir: Path) -> Path | None:

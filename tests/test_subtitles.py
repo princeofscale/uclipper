@@ -16,7 +16,9 @@ from app.services.subtitles import (
     ass_escape,
     ass_time,
     lines_from_words,
+    lines_in_window,
     subtitles_for,
+    subtitles_for_window,
     to_ass,
     words_from_json3,
 )
@@ -197,3 +199,28 @@ def test_generated_ass_is_rendered_by_ffmpeg(tmp_path, synthetic_video, ffmpeg_t
 
     assert done.returncode == 0, done.stderr[-800:]
     assert out.is_file() and out.stat().st_size > 0
+
+
+# ---------- окно клипа ----------
+
+
+def test_window_lines_are_shifted_to_the_clip_start():
+    payload = json3((10.0, 1.0, "до окна"), (20.0, 1.0, "в окне"), (40.0, 1.0, "после окна"))
+
+    lines = lines_in_window(payload, start=20.0, end=30.0)
+
+    assert [line.text for line in lines] == ["в окне"]
+    assert lines[0].start == 0.0  # в графе ролик читается с -ss 20, значит слово начинается с нуля клипа
+
+
+def test_window_subtitles_are_a_valid_ass_for_that_window():
+    text = subtitles_for_window(json3((20.0, 1.0, "привет")), start=20.0, end=30.0)
+
+    assert "Dialogue: 0,0:00:00.00" in text and "привет" in text
+
+
+def test_a_word_that_started_before_the_window_is_dropped():
+    """Слово, начавшееся до окна, в клип не попадает: иначе субтитр висит над уже другой речью."""
+    payload = json3((19.0, 3.0, "длинноеслово"))  # одно слово с 19.0 по 22.0
+
+    assert lines_in_window(payload, start=20.0, end=30.0) == []

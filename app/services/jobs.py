@@ -11,6 +11,7 @@ import time
 import uuid
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from pathlib import Path
 from typing import Callable
 
@@ -20,8 +21,15 @@ from app.services.auto_trim import analyze_trim
 from app.services.audio import normalize_file as normalize_loudness
 from app.services.banner_manager import BannerError, ensure_sfx, resolve_banner
 from app.services.capacity import ffmpeg_threads, max_jobs_from_env, normalize_audio_from_env
-from app.services.downloader import DownloadError, cached_source_path, download_video_cached, resolve_upload
+from app.services.downloader import (
+    DownloadError,
+    cached_source_path,
+    download_video_cached,
+    fetch_subtitles,
+    resolve_upload,
+)
 from app.services.highlights import edge_reserve, find_highlights
+from app.services.subtitles import subtitles_for_window
 from app.services.platforms import identify
 from app.services.video_processor import (
     ClipSchedule,
@@ -30,6 +38,7 @@ from app.services.video_processor import (
     RenderOptions,
     compute_clip_schedule,
     probe_media,
+    has_libass,
     render_clip,
     snap,
 )
@@ -302,6 +311,7 @@ class JobManager:
 
         job_dir = settings.outputs_dir / job_id
         job_dir.mkdir(parents=True, exist_ok=True)
+        captions = self._subtitles(request, job_id, source, notifier)
         options = RenderOptions(
             frame_mode=request.frame_mode,
             banner_mode=request.banner_mode,
@@ -315,7 +325,7 @@ class JobManager:
         )
         clips = self._render_all(
             job_id, job_dir, source, info, schedule.starts, schedule.clip_duration, options,
-            banner, sfx, render_start, notifier, on_clip,
+            banner, sfx, render_start, notifier, on_clip, captions=captions,
         )  # fmt: skip
 
         render_seconds = time.monotonic() - started - fetch_seconds
@@ -342,6 +352,30 @@ class JobManager:
         )
         self._log(job_id, f"Готово: роликов — {len(clips)}, архив {archive.name}")
         notifier.touch()
+
+    def _subtitles(self, request: JobRequest, job_id: str, source: Path, notifier: "_Notifier") -> dict | None:
+        """Субтитры площадки для этой задачи (или `None`): один запрос на задачу, а не на клип.
+
+        Берём только готовые субтитры — распознавание не делаем: модель не влезает в память бота.
+        Если фильтра `ass` в сборке FFmpeg нет или субтитров у ролика нет, тихо работаем без них.
+        """
+        if not request.subtitles:
+            return None
+        if request.source_type is SourceType.UPLOAD or not request.url:
+            self._log(job_id, "Субтитры: у присланного файла их нет — вшивать нечего")
+            return None
+        if not has_libass():
+            self._log(job_id, "Субтитры: в этой сборке FFmpeg нет libass — пропускаю")
+            return None
+        self._update(job_id, stage="Скачиваю субтитры")
+        notifier.touch()
+        self._check_not_stopping(job_id)
+        payload = fetch_subtitles(request.url)
+        if payload is None:
+            self._log(job_id, "Субтитры: у ролика их нет — клипы выйдут без текста")
+            return None
+        self._log(job_id, "Субтитры: нашёл, вшиваю караоке по словам")
+        return payload
 
     def _schedule(
         self, request: JobRequest, job_id: str, source: Path, info: MediaInfo, start_offset: float, end_offset: float
@@ -451,6 +485,7 @@ class JobManager:
         render_start: float,
         notifier: "_Notifier",
         on_clip: Notify | None,
+        captions: dict | None = None,
     ) -> list[ClipResult]:
         total = len(starts)
         self._update(job_id, total_clips=total)
@@ -470,8 +505,13 @@ class JobManager:
                 notifier.touch()
 
             started = time.monotonic()
+            clip_options = options
+            if captions is not None:
+                subs_file = job_dir / f"subs_{number:02d}.ass"
+                subs_file.write_text(subtitles_for_window(captions, start, start + clip_duration), encoding="utf-8")
+                clip_options = replace(options, subtitles=subs_file.name)  # имя без пути: файл рядом с клипом
             timeline = render_clip(
-                source, job_dir / filename, start, clip_duration, options,
+                source, job_dir / filename, start, clip_duration, clip_options,
                 info=info, banner=banner, sfx=sfx, on_progress=on_progress,
                 threads=ffmpeg_threads(self.running_count()),
             )  # fmt: skip

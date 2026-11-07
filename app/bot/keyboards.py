@@ -290,8 +290,14 @@ def more_settings(s: ClipSettings) -> InlineKeyboardMarkup:
         "toggle:preview:more",
         PRIMARY if s.preview else None,
     )
+    _add(
+        builder,
+        f"{'✅' if s.subtitles else '⬜'} Субтитры: {'вкл' if s.subtitles else 'выкл'}",
+        "toggle:subtitles:more",
+        SUCCESS if s.subtitles else None,
+    )
     _add(builder, "⬅️ Назад", "screen:manual")
-    builder.adjust(1, 1, 1, 1)
+    builder.adjust(1, 1, 1, 1, 1)
     return builder.as_markup()
 
 
