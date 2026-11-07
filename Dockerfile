@@ -9,7 +9,10 @@ COPY --from=node /usr/local/bin/node /usr/local/bin/node
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    # fontconfig (шрифты для субтитров и текста на видео) кэш пишет в $XDG_CACHE_HOME,
+    # а бот работает не от root: без этого каждая отрисовка начинается с «No writable cache directories».
+    XDG_CACHE_HOME=/tmp
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ffmpeg ca-certificates \

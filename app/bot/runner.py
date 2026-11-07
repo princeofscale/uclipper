@@ -277,7 +277,7 @@ class JobRunner:
             summary = texts.results_summary(state)
             if not report.archive_sent and len(state.clips) > 1:
                 summary += "<p><i>ZIP не отправлял: не влезает в лимит или ролики уже выше.</i></p>"
-            await self._show_final(running, summary, keyboards.done())
+            await self._show_final(running, summary, keyboards.done(texts.clip_description(request, state)))
 
             self._store.count_job(running.user_id, len(state.clips))
             self._store.remember_settings(running.user_id, request)

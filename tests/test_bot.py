@@ -2329,3 +2329,36 @@ async def test_the_progress_message_counts_time_and_warns_only_after_a_long_sile
     running.state = manager.get(job_id)
     await runner._edit_progress(running)  # noqa: SLF001
     assert "Рендер клипа 1 из 8" in shown[-1] and "Остановить" not in shown[-1]
+
+
+# ---------- готовый клип: подпись к публикации ----------
+
+
+def test_the_finished_clip_offers_a_copy_button_with_its_description():
+    """Кнопка «скопировать описание»: название ролика, таймкод окна и хештеги — без ссылки на источник."""
+    from app.models import ClipResult, JobRequest, JobState
+
+    request = JobRequest(source_type="upload", upload_id="demo", banner_count=0, title="  Тестовый   ролик ")
+    state = JobState(id="job", total_clips=1)
+    state.clips.append(
+        ClipResult(index=1, filename="clip_01.mp4", source_start=61.0, source_end=106.0, duration=45.0)
+    )
+
+    description = texts.clip_description(request, state)
+    assert "Тестовый ролик" in description  # лишние пробелы схлопнуты
+    assert "1:01" in description and "#shorts" in description
+    assert "http" not in description  # ссылку на чужой ролик не вставляем
+
+    copies = [
+        button.copy_text.text
+        for row in keyboards.done(description).inline_keyboard
+        for button in row
+        if button.copy_text is not None
+    ]
+    assert copies == [description]
+    assert not [
+        button
+        for row in keyboards.done().inline_keyboard
+        for button in row
+        if button.copy_text is not None
+    ], "без описания кнопки копирования быть не должно"

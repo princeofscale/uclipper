@@ -13,7 +13,7 @@ from app.bot.options import CHOICES
 from app.bot.rich import esc
 from app.bot.steppers import Stepper
 from app.config import MAX_SOURCE_SECONDS
-from app.models import ClipSettings, Draft, JobState, JobStatus
+from app.models import ClipSettings, Draft, JobRequest, JobState, JobStatus
 from app.services.autoplan import AutoPlan
 from app.services.banner_manager import BannerInfo
 from app.services.highlights import edge_reserve
@@ -633,6 +633,21 @@ def results_summary(state: JobState) -> str:
 
 
 CANCELLED = "<p>⏹ Нарезку остановил. Уже готовые ролики (если были) остались выше.</p>"
+
+
+def clip_description(request: JobRequest, state: JobState) -> str:
+    """Подпись к публикации, которую копирует кнопка: название, таймкод, хештеги.
+
+    Ровно то, что человек всё равно набирал бы руками. Ссылку на исходный ролик не вставляем: площадки
+    не любят перепост, а TikTok ещё и снижает показы за чужие ссылки и водяные знаки.
+    """
+    title = " ".join((request.title or "").split())
+    parts = [shorten(title, 80) if title else "Нарезка"]
+    first = state.clips[0] if state.clips else None
+    if first is not None:
+        parts.append(f"{duration_text(first.source_start)}–{duration_text(first.source_end)}")
+    parts.append("#shorts #tiktok #reels")
+    return " · ".join(parts)[:256]  # 256 — потолок текста кнопки копирования
 
 # ---------- баннеры ----------
 
