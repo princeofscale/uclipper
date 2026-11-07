@@ -318,3 +318,44 @@ def test_windowed_download_falls_back_to_the_whole_file_when_sections_are_missin
 
     assert state.status is JobStatus.DONE, state.error
     assert state.clips and any("полного файла" in line for line in state.log)
+
+
+def test_window_flag_does_not_touch_uploaded_files(monkeypatch, settings, banner_id, upload_id):
+    """Флаг включает окна только для ссылок: присланный файл качается из чата и живёт локально."""
+    import app.services.jobs as jobs_module
+
+    monkeypatch.setenv("WINDOW_DOWNLOAD", "1")
+    monkeypatch.setattr(jobs_module, "download_audio", pytest.fail)  # звук с площадки тут не нужен
+
+    jobs = JobManager(settings, max_workers=1)
+    try:
+        state = jobs.run_sync(request_for(upload_id, num_clips=1, clip_duration=3, banner_count=0))
+    finally:
+        jobs.shutdown()
+
+    assert state.status is JobStatus.DONE, state.error
+    assert state.timing is None or "только звук" not in state.timing  # шли обычным путём
+
+
+def test_when_the_audio_fails_the_whole_file_is_downloaded_as_before(
+    monkeypatch, settings, banner_id, synthetic_video
+):
+    """Звук не скачался — поведение откатывается к прежнему, а не падает."""
+    import app.services.jobs as jobs_module
+
+    monkeypatch.setenv("WINDOW_DOWNLOAD", "1")
+    monkeypatch.setattr(jobs_module, "download_audio", lambda *a, **k: None)
+    monkeypatch.setattr(jobs_module, "download_video_cached", lambda url, height, **k: synthetic_video)
+
+    jobs = JobManager(settings, max_workers=1)
+    try:
+        request = JobRequest(
+            source_type="link", url=RUTUBE_URL, num_clips=1, clip_duration=3.0,
+            start_offset=5.0, slicing_mode="sequential", banner_count=0,
+        )  # fmt: skip
+        state = jobs.run_sync(request)
+    finally:
+        jobs.shutdown()
+
+    assert state.status is JobStatus.DONE, state.error
+    assert any("Окна не получились" in line for line in state.log)
