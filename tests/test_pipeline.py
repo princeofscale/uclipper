@@ -243,3 +243,78 @@ def test_synthetic_source_is_20_seconds_720p_with_audio(synthetic_video):
     info = probe(synthetic_video)
     assert (info.width, info.height, info.vcodec, info.acodec) == (1280, 720, "h264", "aac")
     assert info.duration == pytest.approx(20, abs=0.2)
+
+
+# ---------- «только звук и нужные окна» (WINDOW_DOWNLOAD=1) ----------
+
+RUTUBE_URL = "https://rutube.ru/video/0123456789abcdef0123456789abcdef/"
+
+
+def _cut(source, target, start: float, duration: float):
+    """Вырезает кусок реальным ffmpeg — так тест повторяет то, что отдала бы площадка."""
+    import subprocess
+
+    subprocess.run(
+        ["ffmpeg", "-y", "-v", "error", "-ss", str(start), "-t", str(duration), "-i", str(source),
+         "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac", str(target)],
+        check=True, capture_output=True,
+    )  # fmt: skip
+    return target
+
+
+def test_windowed_download_renders_clips_from_sections(monkeypatch, tmp_path, settings, banner_id, synthetic_video):
+    """Флаг WINDOW_DOWNLOAD: анализ по звуку, рендер из скачанного окна, начало окна = запас вокруг него."""
+    import app.services.jobs as jobs_module
+
+    monkeypatch.setenv("WINDOW_DOWNLOAD", "1")
+    audio = _cut(synthetic_video, tmp_path / "audio.m4a", 0, 20)
+    asked: list[tuple[float, float]] = []
+
+    def fake_section(url, start, end, key, **kwargs):
+        asked.append((start, end))
+        return _cut(synthetic_video, tmp_path / f"sec_{start:.1f}.mp4", start, end - start)
+
+    monkeypatch.setattr(jobs_module, "download_audio", lambda url, key, cache_dir=None: audio)
+    monkeypatch.setattr(jobs_module, "download_section", fake_section)
+
+    jobs = JobManager(settings, max_workers=1)
+    try:
+        request = JobRequest(
+            source_type="link", url=RUTUBE_URL, num_clips=1, clip_duration=3.0,
+            start_offset=5.0, slicing_mode="sequential", banner_count=0,
+        )  # fmt: skip
+        state = jobs.run_sync(request)
+    finally:
+        jobs.shutdown()
+
+    assert state.status is JobStatus.DONE, state.error
+    assert len(state.clips) == 1
+    assert state.clips[0].source_start == pytest.approx(5.0, abs=0.2)
+    assert asked and asked[0][0] == pytest.approx(2.0, abs=0.1)  # окно с запасом 3 с перед началом
+    assert state.timing and "только звук" in state.timing
+
+
+def test_windowed_download_falls_back_to_the_whole_file_when_sections_are_missing(
+    monkeypatch, tmp_path, settings, banner_id, synthetic_video
+):
+    """Площадка не умеет секции — клип всё равно выходит: он берётся из полного файла."""
+    import app.services.jobs as jobs_module
+
+    monkeypatch.setenv("WINDOW_DOWNLOAD", "1")
+    audio = _cut(synthetic_video, tmp_path / "audio.m4a", 0, 20)
+    monkeypatch.setattr(jobs_module, "download_audio", lambda url, key, cache_dir=None: audio)
+    monkeypatch.setattr(jobs_module, "download_section", lambda *a, **k: None)
+    monkeypatch.setattr(jobs_module, "download_video_cached", lambda url, height, **k: synthetic_video)
+
+    jobs = JobManager(settings, max_workers=1)
+    try:
+        request = JobRequest(
+            source_type="link", url=RUTUBE_URL, num_clips=1, clip_duration=3.0,
+            start_offset=5.0, slicing_mode="sequential", banner_count=0,
+        )  # fmt: skip
+        state = jobs.run_sync(request)
+    finally:
+        jobs.shutdown()
+
+    assert state.status is JobStatus.DONE, state.error
+    assert state.clips and any("полного файла" in line for line in state.log)

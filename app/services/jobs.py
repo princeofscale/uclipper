@@ -20,11 +20,18 @@ from app.models import ClipResult, JobRequest, JobState, JobStatus, SlicingMode,
 from app.services.auto_trim import analyze_trim
 from app.services.audio import normalize_file as normalize_loudness
 from app.services.banner_manager import BannerError, ensure_sfx, resolve_banner
-from app.services.capacity import ffmpeg_threads, max_jobs_from_env, normalize_audio_from_env
+from app.services.capacity import (
+    ffmpeg_threads,
+    max_jobs_from_env,
+    normalize_audio_from_env,
+    window_download_from_env,
+)
 from app.services.downloader import (
     DownloadError,
     cached_source_path,
     download_video_cached,
+    download_audio,
+    download_section,
     fetch_subtitles,
     resolve_upload,
 )
@@ -39,6 +46,7 @@ from app.services.video_processor import (
     compute_clip_schedule,
     probe_media,
     has_libass,
+    probe_audio,
     render_clip,
     snap,
 )
@@ -50,6 +58,7 @@ LOCAL_SOURCE_START = 2.0  # файл уже на диске (кеш/загруз
 RENDER_END = 97.0  # рендер клипов — до 97%, остальное — упаковка в ZIP
 MAX_LOG_LINES = 500
 NOTIFY_SECONDS = 1.0  # как часто дёргать колбэк прогресса: чаще в Telegram всё равно не отправить
+SECTION_MARGIN = 3.0  # секунды запаса вокруг окна: резка по секциям выравнивается по ключевым кадрам
 
 Notify = Callable[[JobState], None]
 
@@ -304,6 +313,16 @@ class JobManager:
         sfx = ensure_sfx(settings.sfx_dir) if wants_banner and request.enable_sfx else None
 
         started = time.monotonic()
+        windowed = (
+            window_download_from_env() and request.source_type is SourceType.LINK and bool(request.url)
+        )
+        if windowed:
+            prepared = self._audio_only(request, job_id, notifier)
+            if prepared is not None:
+                self._run_windowed(request, job_id, notifier, on_clip, prepared, banner, sfx)
+                return
+            self._log(job_id, "Окна не получились — скачиваю ролик целиком, как обычно")
+
         source, downloaded = self._obtain_source(request, job_id, notifier)
         fetch_seconds = time.monotonic() - started
         size_mb = source.stat().st_size / 1024 / 1024 if source.is_file() else 0.0
@@ -369,6 +388,112 @@ class JobManager:
             progress=100.0,
             archive_name=archive.name,
             timing=f"источник {_duration(fetch_seconds)} · анализ и рендер {_duration(render_seconds)}",
+        )
+        self._log(job_id, f"Готово: роликов — {len(clips)}, архив {archive.name}")
+        notifier.touch()
+
+    def _audio_only(self, request: JobRequest, job_id: str, notifier: "_Notifier") -> tuple[Path, str] | None:
+        """Качает только звук ролика — для поиска окон. `None` — не вышло, пойдёт обычная загрузка."""
+        source = identify(request.url or "")
+        if source is None:
+            return None
+        self._update(job_id, stage="Скачиваю звук")
+        self._log(job_id, "Скачиваю только звук: окна клипов ищу по нему, видео целиком не нужно")
+        notifier.touch()
+        self._check_not_stopping(job_id)
+        audio = download_audio(request.url or "", source.key, cache_dir=self._settings.cache_dir)
+        if audio is None:
+            self._log(job_id, "Звук скачать не удалось")
+            return None
+        size_mb = audio.stat().st_size / 1024 / 1024
+        self._log(job_id, f"Звук: {size_mb:.1f} МБ")
+        return audio, source.key
+
+    def _run_windowed(
+        self,
+        request: JobRequest,
+        job_id: str,
+        notifier: "_Notifier",
+        on_clip: Notify | None,
+        prepared: tuple[Path, str],
+        banner: Path | None,
+        sfx: Path | None,
+    ) -> None:
+        """Путь «только звук и нужные окна»: анализ по звуку, потом по файлу на клип.
+
+        Экономит трафик и время на длинных роликах. Если конкретное окно скачать не вышло,
+        этот клип берётся из полного файла (он скачается один раз и закешируется).
+        """
+        audio, key = prepared
+        settings = self._settings
+        info = probe_audio(audio)
+        self._log(job_id, f"Длина по звуку: {info.duration:.1f} с")
+        if request.auto_trim:
+            self._log(job_id, "Автообрезку краёв пропускаю: для неё нужно видео, а скачан только звук")
+        start_offset, end_offset = request.start_offset, request.end_offset
+        self._progress(job_id, DOWNLOAD_END)
+        try:
+            schedule = self._schedule(request, job_id, audio, info, start_offset, end_offset)
+        except ValueError as error:
+            raise MediaError(str(error)) from error
+
+        job_dir = settings.outputs_dir / job_id
+        job_dir.mkdir(parents=True, exist_ok=True)
+        options = RenderOptions(
+            frame_mode=request.frame_mode,
+            banner_mode=request.banner_mode,
+            banner_count=request.banner_count,
+            banner_duration=request.banner_duration,
+            banner_position=request.banner_position,
+            banner_scale=request.banner_scale,
+            banner_sound=request.banner_sound,
+            enable_sfx=request.enable_sfx,
+            preview=request.preview,
+        )
+        captions = self._subtitles(request, job_id, audio, notifier)
+        full: list[Path] = []  # полный файл скачивается не больше одного раза за задачу
+
+        def section_for(start: float, duration: float) -> tuple[Path, float, MediaInfo] | None:
+            self._check_not_stopping(job_id)
+            self._update(job_id, stage="Скачиваю окно клипа")
+            notifier.touch()
+            section = download_section(
+                request.url or "",
+                max(0.0, start - SECTION_MARGIN),
+                start + duration + SECTION_MARGIN,
+                key,
+                max_height=request.max_height,
+                cache_dir=settings.cache_dir,
+            )
+            if section is not None:
+                return section, max(0.0, start - max(0.0, start - SECTION_MARGIN)), probe_media(section)
+            self._log(job_id, "Окно скачать не удалось — беру клип из полного файла")
+            if not full:
+                full.append(download_video_cached(request.url or "", request.max_height, cache_dir=settings.cache_dir))
+            path = full[0]
+            return path, start, probe_media(path)
+
+        clips = self._render_all(
+            job_id, job_dir, audio, info, schedule.starts, schedule.clip_duration, options,
+            banner, sfx, DOWNLOAD_END, notifier, on_clip, captions=captions, preview=request.preview,
+            section_for=section_for,
+        )  # fmt: skip
+
+        self._update(job_id, stage="Упаковка архива")
+        self._progress(job_id, RENDER_END)
+        archive = job_dir / f"clips_{job_id}.zip"
+        with zipfile.ZipFile(archive, "w", zipfile.ZIP_STORED) as bundle:
+            for clip in clips:
+                bundle.write(job_dir / clip.filename, arcname=clip.filename)
+        with self._lock:
+            self._archives[job_id] = archive
+        self._update(
+            job_id,
+            status=JobStatus.DONE,
+            stage="Готово",
+            progress=100.0,
+            archive_name=archive.name,
+            timing=f"источник: только звук · клипов {len(clips)}",
         )
         self._log(job_id, f"Готово: роликов — {len(clips)}, архив {archive.name}")
         notifier.touch()
@@ -507,6 +632,7 @@ class JobManager:
         on_clip: Notify | None,
         captions: dict | None = None,
         preview: bool = False,
+        section_for: Callable[[float, float], tuple[Path, float, MediaInfo] | None] | None = None,
     ) -> list[ClipResult]:
         total = len(starts)
         self._update(job_id, total_clips=total)
@@ -530,14 +656,19 @@ class JobManager:
                 notifier.touch()
 
             started = time.monotonic()
+            clip_source, clip_start, clip_info = source, start, info
+            if section_for is not None:
+                prepared_section = section_for(start, clip_duration)
+                if prepared_section is not None:  # окно скачано: рендерим из него, со сдвигом на запас
+                    clip_source, clip_start, clip_info = prepared_section
             clip_options = options
             if captions is not None:
                 subs_file = job_dir / f"subs_{number:02d}.ass"
                 subs_file.write_text(subtitles_for_window(captions, start, start + clip_duration), encoding="utf-8")
                 clip_options = replace(options, subtitles=subs_file.name)  # имя без пути: файл рядом с клипом
             timeline = render_clip(
-                source, job_dir / filename, start, clip_duration, clip_options,
-                info=info, banner=banner, sfx=sfx, on_progress=on_progress,
+                clip_source, job_dir / filename, clip_start, clip_duration, clip_options,
+                info=clip_info, banner=banner, sfx=sfx, on_progress=on_progress,
                 threads=ffmpeg_threads(self.running_count()),
             )  # fmt: skip
             # Черновик нормализацию пропускает: он для проверки моментов, а лишний проход по звуку — время.

@@ -24,6 +24,7 @@ CACHE_LIMIT_ENV = "CACHE_LIMIT_GB"
 DOWNLOAD_THREADS_ENV = "DOWNLOAD_THREADS"
 FFMPEG_THREADS_ENV = "FFMPEG_THREADS"
 AUDIO_NORMALIZE_ENV = "AUDIO_NORMALIZE"
+WINDOW_DOWNLOAD_ENV = "WINDOW_DOWNLOAD"
 CGROUP_DIR = Path("/sys/fs/cgroup")
 
 DEFAULT_MAX_JOBS = 1  # подставляется ниже: сколько нарезок бот ведёт одновременно
@@ -125,6 +126,18 @@ def disk_is_low(workspace: Path) -> bool:
     needed = min_free_bytes_from_env()
     free = free_bytes(workspace) if needed else None
     return free is not None and free < needed
+
+
+def window_download_from_env() -> bool:
+    """Качать ли только звук и нужные окна вместо всего ролика. По умолчанию выключено.
+
+    Экономия огромная на длинных роликах (двухчасовой подкаст: ~100 МБ звука + три минутных окна
+    вместо гигабайта видео), но у площадок без фрагментированных потоков секции не работают —
+    тогда идёт автоматический откат на полную загрузку. Включается `WINDOW_DOWNLOAD=1`, когда
+    на своей площадке убедились, что путь рабочий.
+    """
+    raw = (os.getenv(WINDOW_DOWNLOAD_ENV) or "").strip().lower()
+    return raw in ("1", "yes", "on", "true", "да")
 
 
 def normalize_audio_from_env() -> bool:

@@ -216,6 +216,35 @@ def probe_media(path: Path) -> MediaInfo:
     )
 
 
+def probe_audio(path: Path) -> MediaInfo:
+    """Длительность и наличие звука у одного аудиофайла: видео там нет и не будет.
+
+    `probe_media` на таком файле честно отказывается («нет видеодорожки»), а для анализа
+    «ярких моментов» нужна только длина и факт звука.
+    """
+    command = ["ffprobe", "-v", "error", "-print_format", "json", "-show_format", "-show_streams", str(path)]
+    try:
+        result = subprocess.run(command, capture_output=True, text=True)
+    except FileNotFoundError as error:
+        raise MediaError("Не найден ffprobe — установите FFmpeg и добавьте его в PATH.") from error
+    if result.returncode != 0:
+        raise MediaError("Не удалось прочитать звук ролика.")
+    try:
+        data = json.loads(result.stdout or "{}")
+    except json.JSONDecodeError as error:
+        raise MediaError("Не удалось прочитать звук ролика: ffprobe вернул непонятный ответ.") from error
+    audio = next((s for s in data.get("streams") or [] if s.get("codec_type") == "audio"), None)
+    if audio is None:
+        raise MediaError("В файле нет звука.")
+    try:
+        duration = float((data.get("format") or {}).get("duration") or 0)
+    except (TypeError, ValueError):
+        duration = 0.0
+    if duration <= 0:
+        raise MediaError("Не удалось определить длину ролика.")
+    return MediaInfo(duration=duration, width=0, height=0, has_audio=True)
+
+
 @dataclass(frozen=True)
 class BannerMedia:
     """Что за файл баннера: картинка (одна на всё время), GIF (петля на каждое окно) или видео (играет от начала в каждом окне)."""
