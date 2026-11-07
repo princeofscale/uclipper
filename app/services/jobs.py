@@ -67,6 +67,10 @@ class JobCancelled(Exception):
     """Задачу отменил пользователь или бот выключается."""
 
 
+class JobSoftStopped(Exception):
+    """Пользователь попросил «доделай этот клип и хватит»: готовые клипы остаются и уходят в чат."""
+
+
 class JobManager:
     """Принимает задачи и выполняет их параллельно — столько сразу, сколько разрешено в `MAX_JOBS`.
 
@@ -81,6 +85,7 @@ class JobManager:
         self._jobs: dict[str, JobState] = {}
         self._archives: dict[str, Path] = {}
         self._cancelled: set[str] = set()
+        self._soft_stopped: set[str] = set()
         self._normalize_audio = normalize_audio_from_env()
         self._stopping = threading.Event()
         self._executor = ThreadPoolExecutor(max_workers=self._max_workers, thread_name_prefix="clipper-job")
@@ -119,22 +124,33 @@ class JobManager:
             state = self._jobs.get(job_id)
             return state.model_copy(deep=True) if state else None
 
-    def cancel(self, job_id: str) -> bool:
+    def cancel(self, job_id: str, *, after_current: bool = False) -> bool:
         """Отменяет задачу. True — задача была и ещё не закончилась.
 
-        Ждущая в очереди отменяется сразу и до выполнения не доходит; идущая останавливается на ближайшей проверке.
+        `after_current` — мягкая остановка: текущий клип доделывается, готовые отправляются в чат,
+        новые не начинаются. Так не теряется работа, которую уже оплатили минутами рендера.
+        Ждущая в очереди отменяется сразу и до выполнения не доходит.
         """
         with self._lock:
             state = self._jobs.get(job_id)
             if state is None or state.status in (JobStatus.DONE, JobStatus.ERROR, JobStatus.CANCELLED):
                 return False
-            self._cancelled.add(job_id)
-            if state.status is JobStatus.QUEUED:
-                self._update(job_id, status=JobStatus.CANCELLED, stage="Отменено")
+            if after_current and state.status is JobStatus.RUNNING:
+                self._soft_stopped.add(job_id)
+                self._update(job_id, stage="Доделываю текущий клип")
             else:
-                self._update(job_id, stage="Останавливаю")
-        self._log(job_id, "Пользователь отменил задачу")
+                self._cancelled.add(job_id)
+                if state.status is JobStatus.QUEUED:
+                    self._update(job_id, status=JobStatus.CANCELLED, stage="Отменено")
+                else:
+                    self._update(job_id, stage="Останавливаю")
+        self._log(job_id, "Пользователь попросил остановиться после текущего клипа" if after_current else "Пользователь отменил задачу")
         return True
+
+    def soft_stopped(self, job_id: str) -> bool:
+        """Просили ли остановиться после текущего клипа."""
+        with self._lock:
+            return job_id in self._soft_stopped
 
     def ahead_of(self, job_id: str) -> int:
         """Сколько задач в очереди впереди этой: только ждущие, без идущих (они уже занимают свои места). 0 — её очередь."""
@@ -177,6 +193,7 @@ class JobManager:
         with self._lock:
             self._archives.pop(job_id, None)
             self._cancelled.discard(job_id)
+            self._soft_stopped.discard(job_id)
             self._jobs.pop(job_id, None)  # иначе у бота, открытого для всех, память росла бы с каждой задачей
         if directory.is_dir():
             for path in sorted(directory.rglob("*"), reverse=True):  # сначала файлы, потом папки
@@ -250,6 +267,9 @@ class JobManager:
         notifier = _Notifier(self, job_id, on_update)
         try:
             self._run(request, job_id, notifier, on_clip)
+        except JobSoftStopped:
+            self._update(job_id, status=JobStatus.CANCELLED, stage="Остановлено после клипа", soft_stop=True)
+            self._log(job_id, "Остановлено по просьбе, готовые клипы остаются")
         except JobCancelled:
             if self._stopping.is_set():
                 self._update(job_id, status=JobStatus.ERROR, stage="Ошибка", error="Задача остановлена: бот выключается.")
@@ -493,6 +513,10 @@ class JobManager:
         clips: list[ClipResult] = []
         for position, start in enumerate(starts):
             self._check_not_stopping(job_id)
+            if position and self.soft_stopped(job_id):
+                # Просили «доделай текущий и хватит»: клипы уже готовы, они уйдут в чат.
+                self._log(job_id, f"Остановился по просьбе: готово клипов — {len(clips)}")
+                raise JobSoftStopped
             number = position + 1
             filename = f"clip_{number:02d}.mp4"
             self._update(job_id, stage=f"Рендер клипа {number} из {total}")

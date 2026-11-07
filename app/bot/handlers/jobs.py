@@ -83,6 +83,16 @@ async def cb_start(callback: CallbackQuery, state: FSMContext, ctx: AppContext) 
     await start_cut(callback, state, ctx, draft)
 
 
+@router.callback_query(F.data.startswith("job:soft:"))
+async def cb_soft_stop(callback: CallbackQuery, ctx: AppContext) -> None:
+    """«⏹ Доделать клип и хватит»: текущий клип домалывается, готовые уходят в чат, новые не начинаются."""
+    job_id = (callback.data or "job:soft:").split(":", 2)[2]
+    ok = await ctx.runner.cancel(job_id, after_current=True)
+    await safe_answer(
+        callback, "Доделаю текущий клип и пришлю готовые" if ok else "Задача уже закончилась", alert=not ok
+    )
+
+
 @router.callback_query(F.data.startswith("job:cancel:"))
 async def cb_cancel(callback: CallbackQuery, ctx: AppContext) -> None:
     job_id = (callback.data or "job:cancel:").split(":", 2)[2]

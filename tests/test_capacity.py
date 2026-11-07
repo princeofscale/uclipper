@@ -329,3 +329,27 @@ def test_продолжительность_в_логе_читается_как_
     assert _duration(7.6) == "8 с"
     assert _duration(200) == "3 мин 20 с"
     assert _duration(3600) == "60 мин"
+
+
+def test_soft_stop_keeps_the_finished_clips(manager, tmp_path):
+    """«Доделать клип и хватит»: файлы готовых клипов не удаляются, статус — остановлено, но не «отменено начисто»."""
+    job = manager._create()  # noqa: SLF001
+    manager._update(job, status=JobStatus.RUNNING, stage="Рендер клипа 2 из 4")  # noqa: SLF001
+
+    assert manager.cancel(job, after_current=True) is True
+
+    state = manager.get(job)
+    assert state.status is JobStatus.RUNNING, "задача ещё доделывает текущий клип"
+    assert state.stage == "Доделываю текущий клип"
+    assert manager.soft_stopped(job) is True
+    assert manager.get(job).soft_stop is False  # флаг появится, когда задача реально остановится
+
+
+def test_soft_stop_of_a_waiting_job_cancels_it_outright(manager):
+    """Ждущей задаче доделывать нечего — мягкая остановка для неё то же самое, что обычная."""
+    job = manager._create()  # noqa: SLF001
+
+    assert manager.cancel(job, after_current=True) is True
+
+    state = manager.get(job)
+    assert state.status is JobStatus.CANCELLED and manager.soft_stopped(job) is False

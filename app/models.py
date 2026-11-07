@@ -205,6 +205,7 @@ class JobState(BaseModel):
     total_clips: int = 0  # сколько клипов решено сделать (известно после расчёта плана; 0 — ещё считаем)
     preview: bool = False  # клипы этой задачи — черновик 540p (предупредим в итоге)
     timing: str | None = None  # «источник 3 мин · анализ и рендер 9 мин» — только у завершённой задачи
+    soft_stop: bool = False  # остановили после клипа: готовые клипы нужно доставить, а не выбрасывать
     trim: TrimInfo | None = None  # None, если начало и конец не обрезались
     archive_name: str | None = None  # имя ZIP-архива в папке задачи
     error: str | None = None

@@ -387,9 +387,18 @@ def history_screen(records: Sequence[Record]) -> InlineKeyboardMarkup:
 # ---------- нарезка ----------
 
 
-def running(job_id: str) -> InlineKeyboardMarkup:
+def running(job_id: str, *, soft: bool = False) -> InlineKeyboardMarkup:
+    """Кнопки задачи. `soft` — задача уже рендерит: можно доделать текущий клип и отдать готовое.
+
+    Пока задача ждёт в очереди, доделывать нечего — там только остановка.
+    """
     builder = InlineKeyboardBuilder()
-    _add(builder, "⏹ Остановить", f"job:cancel:{job_id}", DANGER)
+    if soft:
+        _add(builder, "⏹ Доделать клип и хватит", f"job:soft:{job_id}")
+        _add(builder, "✖️ Остановить сразу", f"job:cancel:{job_id}", DANGER)
+        builder.adjust(1, 1)
+    else:
+        _add(builder, "⏹ Остановить", f"job:cancel:{job_id}", DANGER)
     return builder.as_markup()
 
 

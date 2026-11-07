@@ -85,11 +85,12 @@ class JobRunner:
         asyncio.create_task(self._watch(running, request))
         return job_id
 
-    async def cancel(self, job_id: str) -> bool:
+    async def cancel(self, job_id: str, *, after_current: bool = False) -> bool:
+        """Остановить задачу. `after_current` — доделать текущий клип и отдать готовые."""
         running = self._jobs.get(job_id)
         if running is None or running.finished:
             return False
-        return self._manager.cancel(job_id)
+        return self._manager.cancel(job_id, after_current=after_current)
 
     def active_for_user(self, user_id: int) -> str | None:
         """id нарезки человека, которая ещё не закончена: идёт сейчас или бот досылает ему готовые клипы."""
@@ -198,7 +199,11 @@ class JobRunner:
             return  # тот же процент и та же стадия — лишний запрос к Telegram не нужен
         running.last_progress_text = text
         # Уйти можно и из очереди: ждать чужие задачи никто не обязан.
-        markup = keyboards.running(state.id) if waiting or state.status is JobStatus.RUNNING else None
+        markup = (
+            keyboards.running(state.id, soft=state.status is JobStatus.RUNNING)
+            if waiting or state.status is JobStatus.RUNNING
+            else None
+        )
         try:
             await edit_html(running.message, text, markup)
         except Exception:  # noqa: BLE001 — сообщение могли удалить или текст не изменился
@@ -256,6 +261,19 @@ class JobRunner:
             if state.status is JobStatus.ERROR:
                 await self._show_final(
                     running, texts.error_text(state.error or "Не удалось выполнить задачу."), keyboards.back_to_menu()
+                )
+                return
+
+            if state.status is JobStatus.CANCELLED and state.soft_stop and state.clips:
+                # Остановились «после клипа»: готовое не выбрасываем — досылаем и подводим итог.
+                await deliver_results(
+                    self._bot, running.chat_id, state, self._manager, already_sent=running.sent_clips
+                )
+                running.sent_clips.update(clip.index for clip in state.clips)
+                await self._show_final(
+                    running,
+                    texts.soft_stopped(len(state.clips)),
+                    keyboards.done(texts.clip_description(request, state)),
                 )
                 return
 

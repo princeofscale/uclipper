@@ -675,6 +675,16 @@ def results_summary(state: JobState) -> str:
 CANCELLED = "<p>⏹ Нарезку остановил. Уже готовые ролики (если были) остались выше.</p>"
 
 
+def soft_stopped(clips: int) -> str:
+    """Итог мягкой остановки: клипы целы и ушли в чат, остальные просто не делались."""
+    word = "клип" if clips == 1 else "клипа" if 2 <= clips % 10 <= 4 and clips % 100 not in range(11, 15) else "клипов"
+    return (
+        f"<h2>⏹ Остановился после клипа</h2>"
+        f"<p>Готово: <b>{clips}</b> {word} — они выше. Остальные не делал.</p>"
+        "<footer>Если понадобятся — пришлите тот же ролик: он в кеше, скачивать заново не придётся.</footer>"
+    )
+
+
 def clip_description(request: JobRequest, state: JobState) -> str:
     """Подпись к публикации, которую копирует кнопка: название, таймкод, хештеги.
 
