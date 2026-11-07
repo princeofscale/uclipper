@@ -152,10 +152,16 @@ def search_results(entries: list[dict], choice: str = EVERYWHERE) -> InlineKeybo
 # ---------- режим нарезки ----------
 
 
-def mode_picker() -> InlineKeyboardMarkup:
+def mode_picker(*, repeat: bool = False) -> InlineKeyboardMarkup:
+    """Выбор режима. `repeat` — есть прошлая нарезка, и её числа можно взять одной кнопкой."""
     builder = InlineKeyboardBuilder()
     _add(builder, "🤖 Авто — подберу сам", "mode:auto", PRIMARY)
     _add(builder, "🛠 Вручную — настрою сам", "mode:manual")
+    if repeat:
+        _add(builder, "🔁 Как в прошлый раз", "mode:repeat")
+        _add(builder, "🏠 В начало", MENU)
+        builder.adjust(1, 1, 1, 1)
+        return builder.as_markup()
     _add(builder, "🏠 В начало", MENU)
     builder.adjust(1, 1, 1)
     return builder.as_markup()

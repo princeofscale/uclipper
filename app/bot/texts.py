@@ -348,8 +348,18 @@ def _card(draft: Draft) -> str:
     return video_card(draft.title, draft.uploader, draft.duration, draft.platform)
 
 
-def mode_screen(draft: Draft) -> str:
-    """Первый экран после выбора ролика: как будем нарезать."""
+def mode_screen(draft: Draft, *, repeat: bool = False) -> str:
+    """Первый экран после выбора ролика: как будем нарезать.
+
+    `repeat` — у человека уже есть прошлая нарезка, и её числа можно взять одной кнопкой вместо
+    повторной настройки всех полей.
+    """
+    repeat_line = (
+        "<p>🔁 <b>Как в прошлый раз</b> — возьму число клипов и длину из прошлой нарезки; "
+        "поправить их потом можно вручную.</p>"
+        if repeat
+        else ""
+    )
     return f"""\
 <h2>🎬 Ролик принят</h2>
 {_card(draft)}
@@ -357,7 +367,7 @@ def mode_screen(draft: Draft) -> str:
 <ul>
 <li>🤖 <b>Авто</b> — подберу число клипов, длину и яркие моменты под этот ролик. <i>Быстрее всего.</i></li>
 <li>🛠 <b>Вручную</b> — вы сами решаете всё: сколько клипов, какой длины, какой кадр и баннер.</li>
-</ul>"""
+</ul>{repeat_line}"""
 
 
 def clip_total(settings: ClipSettings, banner_seconds: float | None) -> float:

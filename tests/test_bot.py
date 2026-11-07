@@ -2377,3 +2377,38 @@ def test_the_finished_clip_offers_a_copy_button_with_its_description():
         for button in row
         if button.copy_text is not None
     ], "без описания кнопки копирования быть не должно"
+
+
+# ---------- «как в прошлый раз» ----------
+
+
+async def test_repeat_offered_only_after_a_finished_cut(harness, monkeypatch):
+    await _open_video(harness, monkeypatch)
+
+    assert "Как в прошлый раз" not in harness.session.last_text()
+    assert "mode:repeat" not in harness.session.buttons()
+
+
+async def test_repeat_takes_the_numbers_from_the_last_cut(harness, monkeypatch):
+    from app.services.history import Record
+
+    harness.ctx.history.append(
+        Record(
+            ts="2026-11-07T20:00", user_id=1, job_id="prev", index=1, of=3, platform="youtube",
+            source="dQw4w9WgXcQ", title="Прошлый ролик", mode="auto", start=10.0, end=85.0,
+            clip_len=75.0, banner="TGrader-banner-7s.mp4", banner_count=1, render_s=30.0, size_mb=5.0,
+        )
+    )  # fmt: skip
+    await _open_video(harness, monkeypatch)
+    assert "Как в прошлый раз" in harness.session.last_text()
+
+    await harness.press("mode:repeat")
+
+    text = harness.session.last_text()
+    assert "Ручная настройка" in text
+    assert "3" in text  # столько клипов было в прошлый раз
+    assert "67" in text  # 75 с с баннером минус 7,5 с паузы — уже без баннера
+
+    settings = (await _fsm(harness).get_data())["draft"]["settings"]
+    assert settings["num_clips"] == 3 and settings["banner_count"] == 1
+    assert 66.0 < settings["clip_duration"] < 68.0

@@ -62,10 +62,10 @@ def _base_settings(ctx: AppContext, user_id: int) -> ClipSettings:
 
 
 async def open_draft(
-    state: FSMContext, ctx: AppContext, draft: Draft, *, auto: bool = False
+    state: FSMContext, ctx: AppContext, draft: Draft, *, auto: bool = False, user_id: int | None = None
 ) -> tuple[str, InlineKeyboardMarkup]:
     """Начинает диалог с этим роликом и возвращает первый экран: выбор режима или (`auto`) готовый план."""
-    html, markup = auto_view(draft, ctx) if auto else mode_view(draft)
+    html, markup = auto_view(draft, ctx) if auto else mode_view(draft, ctx, user_id=user_id)
     await state.set_data({})  # всё прежнее в этом диалоге — черновик, ввод, списки — больше не нужно
     await put_draft(state, draft)
     await state.set_state(Flow.editing)
@@ -84,7 +84,9 @@ async def open_video(
         uploader=info.get("uploader") or None,
         thumbnail=info.get("thumbnail") or None,
     )
-    return await open_draft(state, ctx, Draft.from_video(video, _base_settings(ctx, user_id)), auto=auto)
+    return await open_draft(
+        state, ctx, Draft.from_video(video, _base_settings(ctx, user_id)), auto=auto, user_id=user_id
+    )
 
 
 # ---------- ссылка или название ----------
@@ -302,7 +304,7 @@ async def on_file(message: Message, state: FSMContext, ctx: AppContext) -> None:
     draft = Draft.from_upload(
         upload_id, Path(name).stem or "Видео", info.duration, _base_settings(ctx, message.from_user.id)
     )
-    html, markup = await open_draft(state, ctx, draft)
+    html, markup = await open_draft(state, ctx, draft, user_id=message.from_user.id)
     await replace(status, html, markup)
 
 

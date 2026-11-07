@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from aiogram import F, Router
@@ -24,7 +25,7 @@ from app.bot.context import (
 )
 from app.bot.handlers.settings_screen import render_manual
 from app.bot.states import Flow
-from app.models import CutMode, Draft, Goal
+from app.models import ClipSettings, CutMode, Draft, Goal
 from app.services.autoplan import AutoPlan, plan_auto
 
 log = logging.getLogger(__name__)
@@ -42,9 +43,10 @@ def draft_banner(draft: Draft, ctx: AppContext):
     return ctx.banner(draft.settings.banner_id) or ctx.banner()
 
 
-def mode_view(draft: Draft):
-    """Экран выбора режима: текст и кнопки."""
-    return texts.mode_screen(draft), keyboards.mode_picker()
+def mode_view(draft: Draft, ctx: AppContext, *, user_id: int | None = None):
+    """Экран выбора режима: текст и кнопки. Прошлую нарезку предлагаем, только если она была."""
+    repeat = bool(user_id is not None and ctx.history.remembered(user_id))
+    return texts.mode_screen(draft, repeat=repeat), keyboards.mode_picker(repeat=repeat)
 
 
 def auto_view(draft: Draft, ctx: AppContext):
@@ -67,7 +69,7 @@ async def render_mode(event: Message | CallbackQuery, state: FSMContext, ctx: Ap
         return
     await clear_input(state)
     await state.set_state(Flow.editing)
-    html, markup = mode_view(draft)
+    html, markup = mode_view(draft, ctx, user_id=getattr(event.from_user, "id", None))
     await edit_or_send(event, html, markup)
 
 
@@ -99,6 +101,42 @@ async def cb_auto(callback: CallbackQuery, state: FSMContext, ctx: AppContext) -
         return
     await safe_answer(callback)
     await render_auto(callback, state, ctx)
+
+
+@router.callback_query(F.data == "mode:repeat")
+async def cb_repeat(callback: CallbackQuery, state: FSMContext, ctx: AppContext) -> None:
+    """«🔁 Как в прошлый раз»: берём число клипов и длину из истории и показываем ручную настройку.
+
+    В историю пишется длина готового клипа (вместе с паузами под баннер), поэтому паузы вычитаем:
+    иначе каждый повтор удлинял бы клип на длину баннера.
+    """
+    draft = await need_draft(callback, state)
+    if draft is None:
+        return
+    remembered = await asyncio.to_thread(ctx.history.remembered, callback.from_user.id)
+    if not remembered:
+        await safe_answer(callback, "Прошлых нарезок ещё нет — это первая", alert=True)
+        return
+    banner_id = remembered.get("banner") or draft.settings.banner_id
+    banners = int(remembered.get("banner_count") or 0)
+    pause = ctx.banner_seconds(banner_id) or 0.0
+    clean = float(remembered.get("clip_len") or 0) - (banners * pause if banners else 0.0)
+    try:
+        draft.settings = ClipSettings(
+            **{
+                **draft.settings.model_dump(),
+                "num_clips": int(remembered.get("of") or draft.settings.num_clips),
+                "clip_duration": max(2.0, min(180.0, round(clean, 2))) if clean > 0 else draft.settings.clip_duration,
+                "banner_id": banner_id if ctx.banner(banner_id) else draft.settings.banner_id,
+                "banner_count": banners,
+            }
+        )
+    except ValueError:  # данные истории не подошли (старый формат) — просто показываем ручную настройку
+        log.warning("Не удалось применить прошлые настройки из истории", exc_info=True)
+    draft.mode = CutMode.MANUAL
+    await put_draft(state, draft)
+    await safe_answer(callback, "Взял числа из прошлой нарезки")
+    await render_manual(callback, state, ctx)
 
 
 @router.callback_query(F.data == "mode:manual")
