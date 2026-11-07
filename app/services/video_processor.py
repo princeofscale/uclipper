@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Literal
 
-from app.config import BANNER_VIDEO_EXTS, FPS
+from app.config import BANNER_VIDEO_EXTS, FPS, TELEGRAM_MAX_DOWNLOAD_MB
 from app.services.capacity import ffmpeg_threads
 from app.models import BannerMode, BannerPosition, FrameMode, SlicingMode
 from app.services.face_center import detect_face_center_x
@@ -445,6 +445,19 @@ def build_filter_graph(
     return ";".join(chains)
 
 
+def _bitrate_cap(total_seconds: float) -> int | None:
+    """Потолок битрейта, чтобы клип влез в лимит Telegram без второго перекодирования.
+
+    Клип тяжелее 50 МБ бот сжимает отдельным проходом (`delivery.shrink_clip`) — это ещё один полный
+    энкод и потеря качества. Дешевле сразу ограничить битрейт: для клипа 59 с лимит не срабатывает
+    вообще (там и так меньше), а для длинного 200-секундного — встаёт на ~2 Мбит/с и клип уходит как есть.
+    """
+    if total_seconds <= 0:
+        return None
+    budget = TELEGRAM_MAX_DOWNLOAD_MB * 1024 * 1024 * 8 / total_seconds * 0.9  # 10% запаса на контейнер
+    return int(budget) if budget < 8_000_000 else None  # до 8 Мбит/с CRF и так справляется
+
+
 def build_ffmpeg_command(
     source: Path,
     output: Path,
@@ -497,10 +510,19 @@ def build_ffmpeg_command(
         *limit,
         # superfast вместо veryfast: на замере 1080p60 в 1 ядро x264 ест больше половины времени рендера, а superfast
         # на crf 24 даёт то же качество (SSIM ≈ 0,994) при файле на 15% больше и быстрее на четверть.
-        "-c:v", "libx264", "-preset", "superfast", "-crf", "24", "-pix_fmt", "yuv420p", "-r", str(FPS),
+        # `-r` не задаём: частоту кадров уже выставил фильтр `fps` в начале графа, а второй пересчёт только
+        # пересобирает кадры и добавляет дрожание на стыках сегментов.
+        "-c:v", "libx264", "-preset", "superfast", "-crf", "24", "-pix_fmt", "yuv420p",
+        # Ключевой кадр каждые 2 секунды: платформа и плеер нормально перематывают и режут клип,
+        # цена — 2–5% битрейта.
+        "-g", str(FPS * 2), "-keyint_min", str(FPS),
         "-c:a", "aac", "-b:a", "160k", "-ar", str(SAMPLE_RATE), "-ac", "2",
-        "-movflags", "+faststart", "-t", f"{timeline.total_duration:.3f}", str(output),
+        "-movflags", "+faststart", "-t", f"{timeline.total_duration:.3f}",
     ]  # fmt: skip
+    cap = _bitrate_cap(timeline.total_duration)
+    if cap:  # длинный клип: ограничиваем битрейт, чтобы он влез в лимит Telegram без второго энкода
+        command += ["-maxrate", str(cap), "-bufsize", str(cap * 2)]
+    command.append(str(output))
     return command
 
 

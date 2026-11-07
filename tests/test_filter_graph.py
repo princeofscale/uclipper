@@ -99,3 +99,32 @@ def test_clips_are_encoded_with_the_fast_x264_preset():
 
     assert command[command.index("-preset") + 1] == "superfast"
     assert command[command.index("-crf") + 1] == "24"
+
+
+def test_keyframes_stand_every_two_seconds_and_the_frame_rate_is_set_once():
+    """Частоту кадров задаёт фильтр `fps`; `-r` на выходе только пересобирал кадры. Ключевые кадры — каждые 2 с:
+    так платформа и плеер нормально перематывают клип, цена — 2–5% битрейта.
+    """
+    command = _command()
+
+    assert "-r" not in command, "частоту кадров уже выставил фильтр fps"
+    assert command[command.index("-g") + 1] == "60"
+    assert command[command.index("-keyint_min") + 1] == "30"
+
+
+def _command_of(seconds: float) -> list[str]:
+    """Команда для клипа нужной длины: битрейт-потолок зависит от того, сколько идёт клип."""
+    timeline = plan_banner_timeline(seconds, 0, 2.5, BannerMode.FREEZE)
+    return build_ffmpeg_command(Path("in.mp4"), Path("out.mp4"), 0.0, timeline, RenderOptions(banner_count=0))
+
+
+def test_long_clips_get_a_bitrate_cap_so_they_fit_telegram_without_a_second_encode():
+    """Клип длиннее минуты бот иначе сжимал бы ещё раз (720p) — это второй полный энкод."""
+    short = _command_of(45.0)
+    long = _command_of(200.0)
+
+    assert "-maxrate" not in short, "короткий клип и так влезает в 50 МБ"
+    cap = int(long[long.index("-maxrate") + 1])
+    assert 1_000_000 < cap < 3_000_000  # 200 с: около 2 Мбит/с
+    assert long[long.index("-bufsize") + 1] == str(cap * 2)
+    assert 200 * cap / 8 / 1024 / 1024 < 50, "с таким потолком файл обязан влезть в лимит"
