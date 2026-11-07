@@ -1,4 +1,8 @@
-"""Баннер проекта и звук его появления: копирование главного баннера, описание, выдача по id и SFX."""
+"""Баннеры проекта и звук их появления: копирование баннеров, описание, выдача по id и SFX.
+
+Баннеров два (см. `app.config.BANNERS`): старый `TGrader` и новый `TgRader v2`. Оба лежат в образе
+рядом с ботом и при первом запуске копируются в рабочую папку, откуда их берут задачи и экран «Баннеры».
+"""
 from __future__ import annotations
 
 import logging
@@ -11,7 +15,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
-from app.config import ASSETS_DIR, BANNER_EXTS, DEFAULT_BANNER_FILE, DEFAULT_BANNER_LABEL
+from app.config import ASSETS_DIR, BANNER_EXTS, BANNERS, BannerSpec
 from app.services.video_processor import MediaError, probe_media
 
 log = logging.getLogger(__name__)
@@ -29,6 +33,7 @@ class BannerError(ValueError):
 class BannerInfo:
     id: str  # имя файла в папке баннеров — им баннер выбирается в задаче
     name: str  # как показывать в интерфейсе
+    hint: str  # чем этот баннер отличается от другого
     path: Path  # сам файл баннера
     width: int
     height: int
@@ -36,29 +41,39 @@ class BannerInfo:
     has_audio: bool
 
 
-def ensure_default_banner(banners_dir: Path, asset: Path | None = None) -> Path | None:
-    """Кладёт главный видео-баннер проекта (TGrader, 7.5 с, со звуком) в папку баннеров.
+# ---------------------------------------------------------------------------
+# Файлы баннеров
+# ---------------------------------------------------------------------------
 
-    Берётся из `assets/banners/`; если файла там нет — ничего не делает и возвращает None.
-    Уже существующий файл не перезаписывается: владелец мог заменить его своим.
-    """
-    if asset is None:
-        asset = ASSETS_DIR / "banners" / DEFAULT_BANNER_FILE
-    target = banners_dir / DEFAULT_BANNER_FILE
+
+def _copy_if_missing(banners_dir: Path, asset: Path, name: str) -> Path | None:
+    """Копирует файл баннера в рабочую папку, если его там нет. Чужой (заменённый) файл не трогает."""
+    target = banners_dir / name
     if target.is_file() and target.stat().st_size > 0:
         return target
     if not asset.is_file() or asset.stat().st_size == 0:
-        log.warning("Главный баннер %s не найден в %s — бот запустится без него.", DEFAULT_BANNER_FILE, asset.parent)
+        log.warning("Баннер %s не найден в %s — бот запустится без него.", name, asset.parent)
         return None
     banners_dir.mkdir(parents=True, exist_ok=True)
-    staging = banners_dir / f".default_{uuid.uuid4().hex}.mp4"
+    staging = banners_dir / f".{uuid.uuid4().hex}{target.suffix}"
     shutil.copyfile(asset, staging)
     staging.replace(target)
     return target
 
 
-@lru_cache(maxsize=4)
-def _describe_cached(path_text: str, mtime_ns: int, size: int) -> BannerInfo | None:
+def ensure_banners(banners_dir: Path, assets_dir: Path | None = None) -> list[Path]:
+    """Кладёт все баннеры проекта в папку баннеров и возвращает те файлы, что там в итоге лежат."""
+    source = assets_dir if assets_dir is not None else ASSETS_DIR / "banners"
+    ready: list[Path] = []
+    for spec in BANNERS:
+        path = _copy_if_missing(banners_dir, source / spec.file, spec.file)
+        if path is not None:
+            ready.append(path)
+    return ready
+
+
+@lru_cache(maxsize=8)
+def _describe_cached(path_text: str, mtime_ns: int, size: int, name: str, hint: str) -> BannerInfo | None:
     """Описание баннера по ffprobe. `mtime_ns` и `size` — часть ключа кеша: заменили файл — описание обновится."""
     path = Path(path_text)
     try:
@@ -67,7 +82,8 @@ def _describe_cached(path_text: str, mtime_ns: int, size: int) -> BannerInfo | N
         return None
     return BannerInfo(
         id=path.name,
-        name=DEFAULT_BANNER_LABEL,
+        name=name,
+        hint=hint,
         path=path,
         width=media.width,
         height=media.height,
@@ -76,17 +92,34 @@ def _describe_cached(path_text: str, mtime_ns: int, size: int) -> BannerInfo | N
     )
 
 
-def default_banner(banners_dir: Path) -> BannerInfo | None:
-    """Главный баннер проекта (TGrader) или `None`, если файла нет или он не читается как видео.
-
-    Описание берётся из кеша: бот спрашивает его на каждом экране, а ffprobe файла, который не меняется, дорог.
-    """
-    path = banners_dir / DEFAULT_BANNER_FILE
+def _describe(path: Path, spec: BannerSpec) -> BannerInfo | None:
     try:
         stat = path.stat()
     except OSError:
         return None
-    return _describe_cached(str(path), stat.st_mtime_ns, stat.st_size)
+    return _describe_cached(str(path), stat.st_mtime_ns, stat.st_size, spec.name, spec.hint)
+
+
+def catalog_banners(banners_dir: Path) -> list[BannerInfo]:
+    """Баннеры проекта, которые сейчас лежат в папке: в порядке каталога, с параметрами из ffprobe.
+
+    Описание берётся из кеша: бот спрашивает его на каждом экране, а ffprobe файла, который не меняется, дорог.
+    """
+    described = (_describe(banners_dir / spec.file, spec) for spec in BANNERS)
+    return [banner for banner in described if banner is not None]
+
+
+def default_banner(banners_dir: Path) -> BannerInfo | None:
+    """Главный баннер проекта (первый в каталоге) или `None`, если файла нет или он не читается как видео."""
+    banners = catalog_banners(banners_dir)
+    return banners[0] if banners else None
+
+
+def find_banner(banner_id: str | None, banners_dir: Path) -> BannerInfo | None:
+    """Баннер по id (имени файла) или `None`, если такого в каталоге нет."""
+    if not banner_id:
+        return None
+    return next((banner for banner in catalog_banners(banners_dir) if banner.id == banner_id), None)
 
 
 def resolve_banner(banner_id: str, banners_dir: Path) -> Path:

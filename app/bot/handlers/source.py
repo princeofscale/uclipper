@@ -49,13 +49,13 @@ _URL_HINT = re.compile(r"^(https?://|www\.)|\.[a-z]{2,}/", re.IGNORECASE)
 
 
 def _base_settings(ctx: AppContext, user_id: int) -> ClipSettings:
-    """Прежние настройки человека. Баннер в боте один (TGrader), постоянного баннера нет совсем.
+    """Прежние настройки человека вместе с его баннером.
 
-    Если в сохранённых настройках остался баннер из старой версии, он заменяется главным; если файла
-    главного баннера нет, клипы идут без вставки — иначе задача не запустилась бы.
+    Баннер — тот, что человек выбрал на экране «🎬 Баннеры», если такой файл ещё на месте; иначе главный.
+    Если файлов нет вовсе, клипы идут без вставки — иначе задача не запустилась бы.
     """
     settings = ctx.store.settings(user_id)
-    banner = ctx.banner()
+    banner = ctx.banner(settings.banner_id) or ctx.banner()
     if banner is None:
         return update_settings(settings, banner_id=None, banner_count=0)
     return update_settings(settings, banner_id=banner.id)

@@ -32,7 +32,14 @@ router = Router(name="modes")
 
 
 def make_plan(draft: Draft, ctx: AppContext) -> AutoPlan:
-    return plan_auto(draft.duration, draft.goal, draft.settings, banner_seconds=ctx.banner_seconds())
+    return plan_auto(
+        draft.duration, draft.goal, draft.settings, banner_seconds=ctx.banner_seconds(draft.settings.banner_id)
+    )
+
+
+def draft_banner(draft: Draft, ctx: AppContext):
+    """Баннер этого черновика: выбранный в нём, а если файл пропал — главный."""
+    return ctx.banner(draft.settings.banner_id) or ctx.banner()
 
 
 def mode_view(draft: Draft):
@@ -46,7 +53,7 @@ def auto_view(draft: Draft, ctx: AppContext):
     draft.settings = plan.settings
     draft.mode = CutMode.AUTO
     return (
-        texts.auto_screen(draft, plan, ctx.banner_seconds()),
+        texts.auto_screen(draft, plan, draft_banner(draft, ctx)),
         keyboards.auto_screen(draft.goal, plan.settings.num_clips),
     )
 

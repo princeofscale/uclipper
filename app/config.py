@@ -22,9 +22,22 @@ REENCODE_HEIGHT = 1280  # если клип не влезает в лимит, �
 REENCODE_CRF = 26
 REENCODE_AUDIO_BITRATE = "128k"
 
-# Главный рекламный баннер проекта: приходит вместе с ботом, копируется в папку баннеров.
-DEFAULT_BANNER_FILE = "TGrader-banner-7s.mp4"
-DEFAULT_BANNER_LABEL = "TGrader (7 с, со звуком)"
+
+@dataclass(frozen=True)
+class BannerSpec:
+    """Баннер проекта из `assets/banners/`: приходит вместе с ботом и копируется в папку баннеров."""
+
+    file: str  # имя файла — им же баннер выбирается в задаче
+    name: str  # как называть баннер в интерфейсе
+    hint: str  # одна строка, чем один баннер отличается от другого
+
+
+# Первый в списке — главный баннер: его бот ставит новым задачам, если человек ещё не выбрал свой.
+BANNERS: tuple[BannerSpec, ...] = (
+    BannerSpec("TGrader-banner-7s.mp4", "TGrader", "классический ролик-заставка"),
+    BannerSpec("TgRader-v2-16x9-vo.mp4", "TgRader v2", "новый ролик с озвучкой, широкий кадр"),
+)
+DEFAULT_BANNER_FILE = BANNERS[0].file
 
 PACKAGE_DIR = Path(__file__).resolve().parent  # .../app
 PROJECT_DIR = PACKAGE_DIR.parent

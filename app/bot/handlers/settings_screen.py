@@ -45,10 +45,13 @@ async def render_manual(event: Message | CallbackQuery, state: FSMContext, ctx: 
         return
     await clear_input(state)
     await state.set_state(Flow.editing)
+    banner = ctx.banner(draft.settings.banner_id) or ctx.banner()
     await edit_or_send(
         event,
-        texts.manual_screen(draft, ctx.banner_seconds()),
-        keyboards.manual_screen(draft, banner_available=ctx.banner() is not None),
+        texts.manual_screen(draft, banner),
+        keyboards.manual_screen(
+            draft, banner_available=banner is not None, banner_name=banner.name if banner is not None else None
+        ),
     )
 
 
@@ -179,12 +182,15 @@ async def cb_toggle(callback: CallbackQuery, state: FSMContext, ctx: AppContext)
     if draft is None:
         return
     if field == "banner":  # баннер — это «ноль показов» или больше; включаем с одним показом на клип
-        if ctx.banner() is None:
-            await safe_answer(callback, "Файла баннера нет", alert=True)
+        banner = ctx.banner(draft.settings.banner_id) or ctx.banner()
+        if banner is None:
+            await safe_answer(callback, texts.BANNER_MISSING, alert=True)
             return
         enable = draft.settings.banner_count == 0
-        draft.settings = update_settings(draft.settings, banner_count=1 if enable else 0)
-        toast = "Баннер включён" if enable else "Баннер выключен"
+        draft.settings = update_settings(
+            draft.settings, banner_id=banner.id, banner_count=1 if enable else 0
+        )
+        toast = f"Баннер включён: {banner.name}" if enable else "Баннер выключен"
     else:
         value = not getattr(draft.settings, field)
         draft.settings = update_settings(draft.settings, **{field: value})

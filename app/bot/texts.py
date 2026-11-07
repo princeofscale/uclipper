@@ -15,6 +15,7 @@ from app.bot.steppers import Stepper
 from app.config import MAX_SOURCE_SECONDS
 from app.models import ClipSettings, Draft, JobState, JobStatus
 from app.services.autoplan import AutoPlan
+from app.services.banner_manager import BannerInfo
 from app.services.highlights import edge_reserve
 from app.services.platforms import EVERYWHERE, PLATFORM_BY_ID, PLATFORMS, SEARCHABLE, TRENDING, Platform
 from app.services.search import RESULTS
@@ -175,7 +176,7 @@ HELP = f"""\
 <p><i>Данные обновляются раз в полчаса.</i></p>
 </details>
 <details><summary>🎬 Как работает баннер</summary>
-<p>В нужный момент клип замирает, играет баннер <b>TGrader</b> (7 секунд, со звуком), и ролик продолжается с того же места. В ручном режиме баннер можно выключить, показать несколько раз, сдвинуть или уменьшить.</p>
+<p>В нужный момент клип замирает, играет рекламный баннер проекта (7–10 секунд, со звуком), и ролик продолжается с того же места. В разделе «🎬 Баннеры» выбирают, какой баннер вклеивать; в ручном режиме его можно выключить, показать несколько раз, сдвинуть или уменьшить.</p>
 </details>
 <details><summary>✂️ Обрезка краёв</summary>
 <p>Автообрезка убирает заставку, титры и пустые края по звуку и яркости. Если она не нужна — задайте секунды вручную или оставьте ролик целиком.</p>
@@ -388,12 +389,14 @@ def _frame_text(s: ClipSettings) -> str:
     return CHOICES["frame_mode"].option(s.frame_mode).short
 
 
-def auto_screen(draft: Draft, plan: AutoPlan, banner_seconds: float | None) -> str:
+def auto_screen(draft: Draft, plan: AutoPlan, banner: BannerInfo | None) -> str:
     """План автоподбора: что бот собирается сделать и почему так."""
     s = plan.settings
-    banner = (
-        f"TGrader · {s.banner_count} × {seconds_text(banner_seconds or 0)}, со звуком"
-        if s.banner_count and banner_seconds
+    seconds = banner.duration if banner is not None and banner.duration else None
+    sound = ", со звуком" if banner is not None and banner.has_audio and s.banner_sound else ""
+    banner_text = (
+        f"{esc(banner.name)} · {s.banner_count} × {seconds_text(seconds or 0)}{sound}"
+        if s.banner_count and seconds and banner is not None
         else "выключен"
     )
     short_note = "<p>ℹ️ Ролик короткий — беру его целиком.</p>" if plan.shortened else ""
@@ -410,23 +413,25 @@ def auto_screen(draft: Draft, plan: AutoPlan, banner_seconds: float | None) -> s
 <h3>План нарезки</h3>
 <table bordered>
 <tr><td>🎞 Клипов</td><td><b>{s.num_clips}</b> по <b>{seconds_text(s.clip_duration)}</b></td></tr>
-<tr><td>⏱ Итог на клип</td><td>{_total_line(s, banner_seconds)}</td></tr>
+<tr><td>⏱ Итог на клип</td><td>{_total_line(s, seconds)}</td></tr>
 <tr><td>✨ Моменты</td><td>самые яркие, по звуку</td></tr>
 {skipped}<tr><td>🖼 Кадр</td><td>{esc(_frame_text(s))}</td></tr>
 <tr><td>✂️ Края</td><td>уберу чёрный экран и титры</td></tr>
-<tr><td>🎬 Баннер</td><td>{banner}</td></tr>
+<tr><td>🎬 Баннер</td><td>{banner_text}</td></tr>
 </table>
 {short_note}<blockquote>{plan.spec.emoji} <b>{plan.spec.label}</b> — {plan.spec.blurb}</blockquote>
 <footer>Цель можно сменить кнопками ниже, а любую мелочь — поправить вручную.</footer>"""
 
 
-def manual_screen(draft: Draft, banner_seconds: float | None) -> str:
+def manual_screen(draft: Draft, banner: BannerInfo | None) -> str:
     """Ручная настройка: сводка всех значений. Кнопки под текстом меняют их по одной."""
     s = draft.settings
+    seconds = banner.duration if banner is not None and banner.duration else None
+    title = f"🎬 Баннер {esc(banner.name)}" if banner is not None else "🎬 Баннер"
     cut = CHOICES["slicing_mode"].option(s.slicing_mode).short
     if s.banner_count:
-        banner = f"""\
-<h3>🎬 Баннер TGrader</h3>
+        banner_block = f"""\
+<h3>{title}</h3>
 <table compact>
 <tr><td>Показов</td><td><b>{s.banner_count}</b> за клип</td></tr>
 <tr><td>Показ</td><td>{CHOICES["banner_mode"].option(s.banner_mode).short}</td></tr>
@@ -435,7 +440,7 @@ def manual_screen(draft: Draft, banner_seconds: float | None) -> str:
 <tr><td>Звук</td><td>{"включён" if s.banner_sound else "выключен"}</td></tr>
 </table>"""
     else:
-        banner = "<h3>🎬 Баннер</h3><p>Выключен — клипы пойдут без рекламной вставки.</p>"
+        banner_block = "<h3>🎬 Баннер</h3><p>Выключен — клипы пойдут без рекламной вставки.</p>"
     return f"""\
 <h2>🛠 Ручная настройка</h2>
 {_card(draft)}
@@ -446,8 +451,8 @@ def manual_screen(draft: Draft, banner_seconds: float | None) -> str:
 <tr><td>Кадр</td><td>{esc(_frame_text(s))}</td></tr>
 <tr><td>Края ролика</td><td>{trim_text(s)}</td></tr>
 </table>
-{banner}
-<footer>⏱ Каждый клип выйдет {_total_line(s, banner_seconds)} · качество скачивания до {s.max_height}p</footer>"""
+{banner_block}
+<footer>⏱ Каждый клип выйдет {_total_line(s, seconds)} · качество скачивания до {s.max_height}p</footer>"""
 
 
 def choice_screen(field: str, current: object) -> str:
@@ -600,30 +605,56 @@ CANCELLED = "<p>⏹ Нарезку остановил. Уже готовые р�
 
 # ---------- баннеры ----------
 
-BANNER_EMPTY = "<h2>🎬 Баннеры</h2><p>Баннера пока нет — положите файл <code>TGrader-banner-7s.mp4</code> в <code>assets/banners</code>.</p>"
+BANNER_MISSING = "Файла баннера нет"
+
+BANNER_EMPTY = (
+    "<h2>🎬 Баннеры</h2>"
+    "<p>Баннеров пока нет — положите файлы <code>TGrader-banner-7s.mp4</code> и "
+    "<code>TgRader-v2-16x9-vo.mp4</code> в <code>assets/banners</code>.</p>"
+)
 
 
-def banners_screen(banner) -> str:
-    """Экран «Баннеры»: единственный баннер проекта и как он вставляется."""
-    if banner is None:
-        return BANNER_EMPTY
+def banner_label(banner: BannerInfo) -> str:
+    """Короткое имя баннера с длительностью: «TGrader · 7,5 с»."""
+    if not banner.duration:
+        return esc(banner.name)
+    return f"{esc(banner.name)} · {seconds_text(round(banner.duration, 1))}"
+
+
+def _banner_card(banner: BannerInfo, *, chosen: bool) -> str:
     seconds = seconds_text(round(banner.duration or 0, 1))
     sound = "есть 🔊" if banner.has_audio else "нет 🔇"
+    mark = "✅ " if chosen else ""
     return f"""\
-<h1>🎬 Баннеры</h1>
-<p>Рекламная вставка, которую я вклеиваю в ваши клипы.</p>
-<hr/>
-<h3>📺 TGrader</h3>
+<h3>{mark}📺 {esc(banner.name)}</h3>
 <table bordered>
 <tr><td>⏱ Длительность</td><td><b>{seconds}</b></td></tr>
 <tr><td>🔊 Звук</td><td>{sound}</td></tr>
 <tr><td>🎞 Формат</td><td>видео {banner.width}×{banner.height}</td></tr>
-</table>
-<blockquote>Как это работает: в нужный момент клип замирает, играет баннер ({seconds}, со звуком) — и ролик продолжается с того же места.</blockquote>
-<footer>Баннер подключён автоматически. В ручном режиме его можно выключить, показать несколько раз или сдвинуть.</footer>"""
+<tr><td>💡 Что это</td><td>{esc(banner.hint)}</td></tr>
+</table>"""
 
 
-BANNER_PREVIEW_CAPTION = "<b>TGrader</b> · {seconds} · со звуком"
+def banners_screen(banners: Sequence[BannerInfo], selected_id: str | None) -> str:
+    """Экран «Баннеры»: все баннеры проекта, выбранный отмечен галочкой."""
+    if not banners:
+        return BANNER_EMPTY
+    cards = "".join(_banner_card(banner, chosen=banner.id == selected_id) for banner in banners)
+    current = next((banner for banner in banners if banner.id == selected_id), banners[0])
+    seconds = seconds_text(round(current.duration or 0, 1))
+    return f"""\
+<h1>🎬 Баннеры</h1>
+<p>Рекламная вставка, которую я вклеиваю в ваши клипы. Выберите один — он поедет в следующие нарезки.</p>
+<hr/>
+{cards}<blockquote>Как это работает: в нужный момент клип замирает, играет баннер ({seconds}) — и ролик продолжается с того же места.</blockquote>
+<footer>Сейчас выбран <b>{esc(current.name)}</b>. В ручном режиме баннер можно выключить, показать несколько раз или сдвинуть.</footer>"""
+
+
+def banner_caption(banner: BannerInfo) -> str:
+    """Подпись к отправленному превью баннера."""
+    sound = "со звуком" if banner.has_audio else "без звука"
+    return f"<b>{esc(banner.name)}</b> · {seconds_text(round(banner.duration or 0, 1))} · {sound}"
+
 
 # ---------- тренды ----------
 

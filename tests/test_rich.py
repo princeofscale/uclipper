@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import re
 from html.parser import HTMLParser
+from pathlib import Path
 
 import pytest
 
@@ -18,6 +19,7 @@ from app.bot.rich import (
 )
 from app.models import ClipSettings, Draft, Goal, JobState, JobStatus
 from app.services.autoplan import GOALS, plan_auto
+from app.services.banner_manager import BannerInfo
 from app.services.platforms import EVERYWHERE, PLATFORMS, SEARCHABLE, TRENDING, YOUTUBE
 from app.services.trends import CATEGORIES
 from tests.rich_check import assert_valid_rich, rich_problems
@@ -150,12 +152,25 @@ SEARCH_CHOICES = [EVERYWHERE, *(platform.id for platform in SEARCHABLE)]
 TREND_CHOICES = [EVERYWHERE, *(platform.id for platform in TRENDING)]
 
 
+def _banner(name: str = "TGrader", *, duration: float = 7.5, audio: bool = True) -> BannerInfo:
+    """Баннер для проверок текста: настоящий `BannerInfo`, но без файла на диске."""
+    return BannerInfo(
+        id="banner.mp4",
+        name=name,
+        hint="классический ролик-заставка",
+        path=Path("banner.mp4"),
+        width=720,
+        height=1280,
+        duration=duration,
+        has_audio=audio,
+    )
+
+
 def _all_static_screens() -> list[str]:
     draft = Draft(title="Тест <b>", uploader="Автор & Ко", duration=3725)
     plan = plan_auto(3725, Goal.TIKTOK, ClipSettings(), banner_seconds=7.5)
-
-    class Banner:
-        duration, has_audio, width, height = 7.5, True, 720, 1280
+    banner = _banner()
+    second = _banner("TgRader v2", duration=10.0, audio=False)
 
     done = JobState(id="x", status=JobStatus.DONE, archive_name="clips.zip")
     running = JobState(id="y", status=JobStatus.RUNNING, stage="Рендер <1>", progress=42, log=["a < b", "c"])
@@ -170,9 +185,11 @@ def _all_static_screens() -> list[str]:
             {"platform": "нет такой", "title": "Три", "duration": 5},
         ]),
         texts.mode_screen(Draft(title="Ролик", uploader="Автор", duration=600, platform="rutube")),
-        texts.mode_screen(draft), texts.auto_screen(draft, plan, 7.5), texts.manual_screen(draft, 7.5),
+        texts.mode_screen(draft), texts.auto_screen(draft, plan, banner), texts.manual_screen(draft, banner),
         texts.manual_screen(Draft(settings=ClipSettings(banner_count=0)), None), texts.more_screen(draft.settings),
-        texts.trim_screen(draft.settings), texts.banners_screen(Banner()), texts.banners_screen(None),
+        texts.trim_screen(draft.settings), texts.banners_screen([banner, second], banner.id),
+        texts.banners_screen([banner, second], second.id), texts.banners_screen([], None),
+        texts.banner_caption(banner), texts.banner_caption(second),
         texts.stats_text(3, 2, 99), texts.progress_text(running), texts.results_summary(done),
         texts.progress_text(JobState(id="q")), texts.progress_text(JobState(id="q"), ahead=2),
         texts.video_card("T < 1", None, 0), texts.video_card("T", "U", 60, "vk"),

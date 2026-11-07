@@ -25,6 +25,7 @@ from app.bot.options import CHOICES
 from app.bot.steppers import Stepper
 from app.models import ClipSettings, Draft, Goal
 from app.services.autoplan import GOALS
+from app.services.banner_manager import BannerInfo
 from app.services.platforms import EVERYWHERE, PLATFORM_BY_ID, SEARCHABLE, TRENDING, Platform
 from app.services.trends import CATEGORIES
 
@@ -190,7 +191,7 @@ def _trim_caption(s: ClipSettings) -> str:
     return "✂️ Края ролика: целиком"
 
 
-def manual_screen(draft: Draft, *, banner_available: bool) -> InlineKeyboardMarkup:
+def manual_screen(draft: Draft, *, banner_available: bool, banner_name: str | None = None) -> InlineKeyboardMarkup:
     """Ручная настройка: каждая кнопка называет настройку и показывает её значение; нажатие открывает выбор."""
     s = draft.settings
     builder = InlineKeyboardBuilder()
@@ -205,7 +206,8 @@ def manual_screen(draft: Draft, *, banner_available: bool) -> InlineKeyboardMark
 
     if banner_available:
         enabled = s.banner_count > 0
-        _add(builder, f"{'✅' if enabled else '⬜'} Баннер TGrader: {'вкл' if enabled else 'выкл'}", "toggle:banner", SUCCESS if enabled else None)
+        title = f"Баннер {banner_name}" if banner_name else "Баннер"
+        _add(builder, f"{'✅' if enabled else '⬜'} {title}: {'вкл' if enabled else 'выкл'}", "toggle:banner", SUCCESS if enabled else None)
         rows.append(1)
         if enabled:
             _add(builder, f"🔁 Показов: {s.banner_count}", "edit:banner_count")
@@ -284,13 +286,22 @@ def trim_screen(s: ClipSettings) -> InlineKeyboardMarkup:
 # ---------- баннеры и тренды ----------
 
 
-def banners_screen(banner_name: str | None) -> InlineKeyboardMarkup:
+def banners_screen(banners: Sequence[BannerInfo], selected_id: str | None) -> InlineKeyboardMarkup:
+    """Баннеры проекта: выбранный отмечен ✅ и подсвечен, «▶️» присылает сам ролик."""
     builder = InlineKeyboardBuilder()
     rows: list[int] = []
-    if banner_name:
-        _add(builder, f"✅ {banner_name}", "banner:select", PRIMARY)
-        _add(builder, "▶️ Посмотреть баннер", "banner:preview")
-        rows += [1, 1]
+    for banner in banners:
+        chosen = banner.id == selected_id
+        _add(
+            builder,
+            f"{'✅' if chosen else '⬜'} {texts.banner_label(banner)}",
+            f"banner:pick:{banner.id}",
+            PRIMARY if chosen else None,
+        )
+        rows.append(1)
+    for banner in banners:
+        _add(builder, f"▶️ {banner.name}", f"banner:preview:{banner.id}")
+        rows.append(len(banners))
     _add(builder, "⬅️ Назад", MENU)
     rows.append(1)
     builder.adjust(*rows)

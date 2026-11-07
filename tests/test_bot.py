@@ -24,7 +24,7 @@ from app.bot.handlers import trends as trend_handlers
 from app.bot.rich import plain_text
 from app.bot.runner import RunningJob
 from app.bot.states import Flow
-from app.config import Settings
+from app.config import BANNERS, Settings
 from app.models import CutMode, FrameMode, Goal, JobState, JobStatus, SlicingMode
 from app.services import capacity
 from app.services.platforms import EVERYWHERE, SEARCHABLE
@@ -322,20 +322,22 @@ async def test_text_on_the_cutting_screen_nudges_to_the_buttons(harness, monkeyp
 # ---------- баннеры ----------
 
 
-async def test_banners_screen_lists_only_the_tgrader_banner(harness):
+async def test_banners_screen_lists_both_banners_and_marks_the_default(harness):
     await harness.press("screen:banners")
 
     text = harness.session.last_text()
-    assert "Баннеры" in text and "TGrader" in text
-    assert "7" in text and "звук" in text.lower()
-    assert harness.session.buttons() == ["banner:select", "banner:preview", "screen:menu"]
+    assert "Баннеры" in text and "TGrader" in text and "TgRader v2" in text
+    assert "звук" in text.lower() and "7" in text
     labels = harness.session.button_texts()
-    assert any("TGrader" in label for label in labels) and len(labels) == 3
-    assert harness.ctx.banner().id == "TGrader-banner-7s.mp4"
+    assert any(label.startswith("✅") and "TGrader" in label for label in labels)
+    assert any(label.startswith("⬜") and "TgRader v2" in label for label in labels)
+    assert harness.session.buttons()[:2] == ["banner:pick:TGrader-banner-7s.mp4", "banner:pick:TgRader-v2-16x9-vo.mp4"]
+    assert harness.session.buttons()[-1] == "screen:menu"
+    assert harness.ctx.banner().id == "TGrader-banner-7s.mp4"  # главный — первый в каталоге
     assert_valid_rich(harness.session.htmls()[-1])
 
 
-async def test_only_one_banner_is_ever_offered_even_if_other_files_lie_around(harness, bot_settings):
+async def test_files_outside_the_catalog_are_never_offered_as_banners(harness, bot_settings):
     from PIL import Image
 
     Image.new("RGBA", (920, 360), (255, 0, 0, 255)).save(bot_settings.banners_dir / "old_preset.png")
@@ -346,10 +348,38 @@ async def test_only_one_banner_is_ever_offered_even_if_other_files_lie_around(ha
     assert "old_preset" not in " ".join(harness.session.button_texts() + harness.session.texts())
 
 
+async def test_the_chosen_banner_goes_into_the_next_video(harness, monkeypatch):
+    await harness.press("screen:banners")
+    await harness.press("banner:pick:TgRader-v2-16x9-vo.mp4")
+
+    assert "TgRader v2" in harness.session.last_alert()
+    labels = harness.session.button_texts()
+    assert any(label.startswith("✅") and "TgRader v2" in label for label in labels)
+    assert any(label.startswith("⬜") and "TGrader" in label for label in labels)
+
+    await _open_manual(harness, monkeypatch)
+
+    draft = await _draft(harness)
+    assert draft.settings.banner_id == "TgRader-v2-16x9-vo.mp4"
+    text = harness.session.last_text()
+    assert "Баннер TgRader v2" in text and "10 с" in text  # длительность второго баннера в итоге клипа
+    assert "Баннер TgRader v2:" in " | ".join(harness.session.button_texts())
+
+
+async def test_a_picked_banner_survives_a_restart(harness, bot_settings):
+    from app.services.user_store import UserStore
+
+    await harness.press("screen:banners")
+    await harness.press("banner:pick:TgRader-v2-16x9-vo.mp4")
+
+    assert UserStore(bot_settings.workspace_dir).settings(1).banner_id == "TgRader-v2-16x9-vo.mp4"
+
+
 async def test_banner_select_button_only_confirms(harness):
-    await harness.press("banner:select")
+    await harness.press("banner:select")  # кнопка из старых сообщений — выбирает главный баннер
 
     assert "TGrader" in harness.session.last_alert()
+    assert harness.ctx.store.settings(1).banner_id == "TGrader-banner-7s.mp4"
 
 
 async def test_banner_preview_sends_the_video_once_then_reuses_the_file_id(harness):
@@ -369,6 +399,24 @@ async def test_banner_preview_sends_the_video_once_then_reuses_the_file_id(harne
     assert len(sent) == 2
     assert sent[1].video == "FILE-ID-1"  # второй раз файл не грузим
     assert "TGrader" in sent[0].caption
+
+
+async def test_banner_preview_sends_the_banner_from_the_button(harness):
+    def with_video(method, bot):
+        return _message(
+            bot,
+            getattr(method, "chat_id", 1),
+            None,
+            video={"file_id": "FILE-ID-2", "file_unique_id": "u", "width": 1920, "height": 1080, "duration": 10},
+        )
+
+    harness.session.handlers["sendVideo"] = with_video
+    await harness.press("banner:preview:TgRader-v2-16x9-vo.mp4")
+
+    sent = harness.session.calls("sendVideo")
+    assert len(sent) == 1
+    assert sent[0].caption.startswith("<b>TgRader v2</b>")
+    assert sent[0].width == 1920 and sent[0].height == 1080
 
 
 # ---------- приём источника ----------
@@ -1101,8 +1149,9 @@ async def test_stored_settings_with_an_old_banner_are_replaced_by_tgrader(harnes
     assert s.banner_id == "TGrader-banner-7s.mp4" and s.banner_count == 3
 
 
-async def test_without_the_banner_file_clips_go_without_a_banner(harness, monkeypatch, bot_settings):
-    (bot_settings.banners_dir / "TGrader-banner-7s.mp4").unlink()
+async def test_without_banner_files_clips_go_without_a_banner(harness, monkeypatch, bot_settings):
+    for spec in BANNERS:
+        (bot_settings.banners_dir / spec.file).unlink()
     await _open_manual(harness, monkeypatch)
 
     s = (await _draft(harness)).settings
@@ -1111,7 +1160,7 @@ async def test_without_the_banner_file_clips_go_without_a_banner(harness, monkey
     await harness.press("mode:auto")
     assert (await _draft(harness)).settings.banner_count == 0
     await harness.press("screen:banners")
-    assert "Баннера пока нет" in harness.session.last_text()
+    assert "Баннеров пока нет" in harness.session.last_text()
 
 
 # ---------- тренды ----------
@@ -2031,12 +2080,12 @@ def _all_keyboards(harness):
     yield keyboards.mode_picker()
     for goal in Goal:
         yield keyboards.auto_screen(goal, 7)
-    yield keyboards.manual_screen(draft, banner_available=True)
+    yield keyboards.manual_screen(draft, banner_available=True, banner_name=banner.name)
     yield keyboards.manual_screen(draft, banner_available=False)
     yield keyboards.more_settings(draft.settings)
     yield keyboards.trim_screen(draft.settings)
-    yield keyboards.banners_screen(banner.name)
-    yield keyboards.banners_screen(None)
+    yield keyboards.banners_screen(harness.ctx.banners(), harness.ctx.banner().id)
+    yield keyboards.banners_screen([], None)
     for choice in (EVERYWHERE, *(platform.id for platform in TREND_PLATFORMS)):
         yield keyboards.trends_home(choice)
         yield keyboards.trend_results(TRENDING, choice, "podcast")

@@ -1,18 +1,23 @@
-"""Баннер проекта и SFX: копирование главного баннера, его описание и защита путей."""
+"""Баннеры проекта и SFX: копирование баннеров, их описание, выбор по id и защита путей."""
 import struct
 import wave
+from pathlib import Path
 
 import pytest
 
-from app.config import DEFAULT_BANNER_FILE, DEFAULT_BANNER_LABEL
+from app.config import ASSETS_DIR, BANNERS
 from app.services.banner_manager import (
     BannerError,
+    catalog_banners,
     default_banner,
-    ensure_default_banner,
+    ensure_banners,
     ensure_sfx,
+    find_banner,
     resolve_banner,
 )
 from tests.media_utils import make_video
+
+TG_GRADER, TG_GRADER_V2 = BANNERS[0], BANNERS[1]
 
 
 @pytest.fixture(scope="module")
@@ -26,57 +31,118 @@ def promo_silent(media_dir):
     return make_video(media_dir / "promo_silent_2s.mp4", size="640x360", seconds=2, audio=False)
 
 
-# ---------- главный баннер ----------
+@pytest.fixture(scope="module")
+def assets(media_dir, promo, promo_silent):
+    """Папка-образ `assets/banners`: оба баннера каталога, но маленькие — чтобы тесты шли быстро."""
+    folder = media_dir / "banner_assets"
+    folder.mkdir(exist_ok=True)
+    for spec, source in ((TG_GRADER, promo), (TG_GRADER_V2, promo_silent)):
+        (folder / spec.file).write_bytes(source.read_bytes())
+    return folder
 
 
-def test_the_default_banner_is_copied_from_the_assets(tmp_path, promo):
-    banners = tmp_path / "banners"
-    target = ensure_default_banner(banners, asset=promo)
-    assert target == banners / DEFAULT_BANNER_FILE
-    assert target.read_bytes() == promo.read_bytes()
-    assert [path.name for path in banners.iterdir()] == [DEFAULT_BANNER_FILE]  # временных файлов не осталось
+@pytest.fixture(scope="module")
+def assets_real() -> Path:
+    """Настоящая папка `assets/banners` репозитория — та, что копируется в образ."""
+    return ASSETS_DIR / "banners"
 
 
-def test_the_default_banner_keeps_a_file_the_owner_replaced(tmp_path, promo, promo_silent):
-    banners = tmp_path / "banners"
-    ensure_default_banner(banners, asset=promo)
-    (banners / DEFAULT_BANNER_FILE).write_bytes(promo_silent.read_bytes())
-    ensure_default_banner(banners, asset=promo)  # повторный запуск бота
-    assert (banners / DEFAULT_BANNER_FILE).read_bytes() == promo_silent.read_bytes()
+# ---------- баннеры проекта ----------
 
 
-def test_a_missing_asset_means_no_banner_instead_of_a_crash(tmp_path, caplog):
-    assert ensure_default_banner(tmp_path / "banners", asset=tmp_path / "nope.mp4") is None
-    assert default_banner(tmp_path / "banners") is None
+def test_both_banners_are_copied_from_the_assets(tmp_path, assets):
+    target = tmp_path / "banners"
+    copied = ensure_banners(target, assets_dir=assets)
+
+    assert [path.name for path in copied] == [spec.file for spec in BANNERS]
+    assert (target / TG_GRADER_V2.file).read_bytes() == (assets / TG_GRADER_V2.file).read_bytes()
+    assert sorted(path.name for path in target.iterdir()) == sorted(spec.file for spec in BANNERS)  # временных нет
+
+
+def test_a_banner_the_owner_replaced_is_kept(tmp_path, assets, promo_silent):
+    ensure_banners(tmp_path, assets_dir=assets)
+    replaced = tmp_path / TG_GRADER.file
+    replaced.write_bytes(promo_silent.read_bytes())
+
+    ensure_banners(tmp_path, assets_dir=assets)  # повторный запуск бота
+
+    assert replaced.read_bytes() == promo_silent.read_bytes()
+
+
+def test_a_missing_asset_is_skipped_instead_of_a_crash(tmp_path, assets, caplog):
+    only_second = tmp_path / "assets"
+    only_second.mkdir()
+    (only_second / TG_GRADER_V2.file).write_bytes((assets / TG_GRADER_V2.file).read_bytes())
+
+    copied = ensure_banners(tmp_path / "banners", assets_dir=only_second)
+
+    assert [path.name for path in copied] == [TG_GRADER_V2.file]
     assert "не найден" in caplog.text
 
 
-def test_the_banner_is_described_by_its_own_facts(tmp_path, promo):
-    ensure_default_banner(tmp_path, asset=promo)
-    banner = default_banner(tmp_path)
-    assert banner.id == DEFAULT_BANNER_FILE
-    assert banner.name == DEFAULT_BANNER_LABEL
-    assert banner.path == tmp_path / DEFAULT_BANNER_FILE
-    assert (banner.width, banner.height) == (320, 180)
-    assert banner.duration == pytest.approx(3.0, abs=0.15)
-    assert banner.has_audio is True
+def test_banners_without_assets_at_all_leave_the_bot_without_them(tmp_path):
+    assert ensure_banners(tmp_path / "banners", assets_dir=tmp_path / "nope") == []
+    assert catalog_banners(tmp_path / "banners") == []
+    assert default_banner(tmp_path / "banners") is None
 
 
-def test_a_silent_banner_says_it_has_no_sound(tmp_path, promo_silent):
-    ensure_default_banner(tmp_path, asset=promo_silent)
-    assert default_banner(tmp_path).has_audio is False
+def test_every_copied_banner_is_described_by_its_own_facts(tmp_path, assets):
+    ensure_banners(tmp_path, assets_dir=assets)
+    banners = catalog_banners(tmp_path)
+
+    assert [banner.id for banner in banners] == [spec.file for spec in BANNERS]  # порядок каталога
+    first, second = banners
+    assert (first.name, first.hint) == (TG_GRADER.name, TG_GRADER.hint)
+    assert (second.name, second.hint) == (TG_GRADER_V2.name, TG_GRADER_V2.hint)
+    assert first.path == tmp_path / TG_GRADER.file
+    assert (first.width, first.height) == (320, 180)
+    assert first.duration == pytest.approx(3.0, abs=0.15)
+    assert first.has_audio is True
+    assert second.has_audio is False
+
+
+def test_the_real_banners_in_the_repository_are_readable(assets_real):
+    """`assets/banners/` — то, что уедет в образ: оба баннера каталога на месте и читаются как видео."""
+    banners = catalog_banners(assets_real)
+
+    assert [banner.id for banner in banners] == [spec.file for spec in BANNERS]
+    assert all(banner.duration > 0 and banner.width > 0 and banner.height > 0 for banner in banners)
+    assert all(banner.has_audio for banner in banners)
+
+
+def test_the_default_banner_is_the_first_in_the_catalog(tmp_path, assets):
+    ensure_banners(tmp_path, assets_dir=assets)
+
+    assert default_banner(tmp_path).id == TG_GRADER.file
+
+
+def test_a_silent_banner_says_it_has_no_sound(tmp_path, assets):
+    ensure_banners(tmp_path, assets_dir=assets)
+
+    assert find_banner(TG_GRADER_V2.file, tmp_path).has_audio is False
 
 
 def test_a_file_that_is_not_a_video_is_not_a_banner(tmp_path):
-    (tmp_path / DEFAULT_BANNER_FILE).write_bytes(b"this is not a video")
+    (tmp_path / TG_GRADER.file).write_bytes(b"this is not a video")
+
     assert default_banner(tmp_path) is None
 
 
-def test_replacing_the_banner_file_refreshes_its_description(tmp_path, promo, promo_silent):
-    ensure_default_banner(tmp_path, asset=promo)
+def test_replacing_the_banner_file_refreshes_its_description(tmp_path, assets):
+    ensure_banners(tmp_path, assets_dir=assets)
     assert default_banner(tmp_path).has_audio is True  # описание попало в кеш
-    (tmp_path / DEFAULT_BANNER_FILE).write_bytes(promo_silent.read_bytes())
+    (tmp_path / TG_GRADER.file).write_bytes((assets / TG_GRADER_V2.file).read_bytes())
     assert default_banner(tmp_path).has_audio is False  # файл другой — описание обновилось
+
+
+def test_find_banner_knows_only_the_catalog(tmp_path, assets, promo):
+    ensure_banners(tmp_path, assets_dir=assets)
+    (tmp_path / "owner_extra.mp4").write_bytes(promo.read_bytes())
+
+    assert find_banner(TG_GRADER_V2.file, tmp_path).name == TG_GRADER_V2.name
+    assert find_banner("owner_extra.mp4", tmp_path) is None  # не из каталога — экран его не предлагает
+    assert find_banner(None, tmp_path) is None
+    assert find_banner("", tmp_path) is None
 
 
 # ---------- SFX ----------

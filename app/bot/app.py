@@ -27,7 +27,7 @@ from app.bot.handlers import (
 )
 from app.bot.runner import JobRunner
 from app.config import Settings
-from app.services.banner_manager import ensure_default_banner, ensure_sfx
+from app.services.banner_manager import ensure_banners, ensure_sfx
 from app.services.janitor import max_age_days_from_env, sweep_forever
 from app.services.jobs import JobManager
 from app.services.user_store import UserStore
@@ -140,7 +140,7 @@ def build_app(
     """
     settings = settings or Settings.default()
     settings.ensure_dirs()
-    ensure_default_banner(settings.banners_dir)
+    ensure_banners(settings.banners_dir)
     ensure_sfx(settings.sfx_dir)
 
     manager = JobManager(settings)

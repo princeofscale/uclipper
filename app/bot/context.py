@@ -25,7 +25,7 @@ from app.bot.runner import JobRunner
 from app.bot.states import Flow
 from app.config import Settings
 from app.models import ClipSettings, Draft, JobStatus
-from app.services.banner_manager import BannerInfo, default_banner
+from app.services.banner_manager import BannerInfo, catalog_banners, default_banner, find_banner
 from app.services.capacity import disk_is_low, jobs_limit_reached
 from app.services.jobs import JobManager
 from app.services.trends import TrendCache
@@ -52,15 +52,21 @@ class AppContext:
     store: UserStore
     runner: JobRunner
     trends: TrendCache = field(default_factory=TrendCache)
-    banner_preview_id: str | None = None  # file_id уже отправленного превью баннера: повторно файл не грузим
+    banner_previews: dict[str, str] = field(default_factory=dict)  # file_id отправленных превью по id баннера
 
-    def banner(self) -> BannerInfo | None:
-        """Главный баннер проекта — единственный, который показывает бот (`None`, если файла нет)."""
+    def banners(self) -> list[BannerInfo]:
+        """Баннеры проекта, которые сейчас лежат в папке (TGrader и TgRader v2)."""
+        return catalog_banners(self.settings.banners_dir)
+
+    def banner(self, banner_id: str | None = None) -> BannerInfo | None:
+        """Баннер по id, а без id — главный (`None`, если такого файла нет)."""
+        if banner_id:
+            return find_banner(banner_id, self.settings.banners_dir)
         return default_banner(self.settings.banners_dir)
 
-    def banner_seconds(self) -> float | None:
+    def banner_seconds(self, banner_id: str | None = None) -> float | None:
         """Сколько играет баннер (`None`, если баннера нет)."""
-        banner = self.banner()
+        banner = self.banner(banner_id)
         return banner.duration if banner is not None and banner.duration else None
 
     def busy_for(self, user_id: int) -> Busy | None:
